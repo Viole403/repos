@@ -12,7 +12,7 @@ import type { CartLine } from "@/app/cart";
 import { decCompare, decIsPositive, decStep, decSub } from "@/app/decimal";
 import { formatMoney, formatQuantity, toDecimal } from "@/app/format";
 import type { CheckoutInput, Decimal, SaleView } from "@/app/ipc";
-import { checkout, listItems, stockOnHand } from "@/app/ipc";
+import { checkout, listCustomers, listItems, stockOnHand } from "@/app/ipc";
 
 const PAYMENT_METHODS: SelectItemType[] = [
     { id: "Cash", label: "Cash" },
@@ -70,6 +70,25 @@ const RegisterScreen = () => {
     const [lookup, setLookup] = useState<Lookup>({ kind: "idle" });
     const [sale, setSale] = useState<SaleState>({ kind: "idle" });
     const [paymentMethod, setPaymentMethod] = useState("Cash");
+    // "" is a walk-in, which is what most of a counter's sales are.
+    const [customerKey, setCustomerKey] = useState("");
+    const [customers, setCustomers] = useState<SelectItemType[]>([]);
+
+    // Searched rather than listed: the till needs a handful of regulars, not every
+    // customer in the database, and the list is fetched on focus.
+    const findCustomers = useCallback(async (term: string) => {
+        try {
+            const found = await listCustomers({ page: 1, perPage: 20, search: term || undefined });
+            setCustomers([
+                { id: "", label: "Walk-in" },
+                ...found.rows.map((row) => ({ id: String(row.id), label: row.name })),
+            ]);
+        } catch {
+            // A till must still take cash with no customer list. The backend rejects a
+            // sale that names an unknown customer either way.
+            setCustomers([{ id: "", label: "Walk-in" }]);
+        }
+    }, []);
     const [paid, setPaid] = useState("");
     const [note, setNote] = useState("");
     const [onHand, setOnHand] = useState<Record<number, Decimal>>({});
@@ -214,6 +233,7 @@ const RegisterScreen = () => {
             note: note.trim() === "" ? null : note.trim(),
             // Always promote. A draft that moves no stock is a separate flow.
             promote: true,
+            customerId: customerKey === "" ? null : Number(customerKey),
         };
 
         setSale({ kind: "saving" });
@@ -520,6 +540,20 @@ const RegisterScreen = () => {
                                 : `On account ${formatMoney(decSub("0", change))}`}
                         </p>
                     )}
+
+                    <Select
+                        label="Customer"
+                        items={customers}
+                        selectedKey={customerKey}
+                        onOpenChange={(open) => open && void findCustomers("")}
+                        onSelectionChange={(key) => setCustomerKey(String(key ?? ""))}
+                    >
+                        {(row) => (
+                            <Select.Item id={row.id} textValue={row.label}>
+                                {row.label}
+                            </Select.Item>
+                        )}
+                    </Select>
 
                     <Input label="Note" value={note} onChange={setNote} />
 
