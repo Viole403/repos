@@ -1386,6 +1386,10 @@ pub struct CheckoutInput {
     /// `false` leaves the sale as a `Draft` and writes no stock movements: an
     /// unpaid draft must not shrink the shelf. Defaults to `true`.
     pub promote: Option<bool>,
+    /// Who the sale is to. `None` is a walk-in, which is the common case at a
+    /// counter and must not be forced through a customer row.
+    #[serde(default)]
+    pub customer_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1590,6 +1594,21 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
         Some(raw) => required(raw, "payment method")?,
     };
 
+    // Resolved inside the transaction so a customer deleted between the check and the
+    // insert cannot end up named on a sale. `None` stays `None` — a walk-in sale is the
+    // common case and must not be forced through a customer row.
+    let customer_id = match input.customer_id {
+        None => None,
+        Some(id) => {
+            customer::Entity::find_by_id(id)
+                .filter(customer::Column::DelStatus.eq(LIVE))
+                .one(&txn)
+                .await?
+                .ok_or_else(|| CmdError::NotFound("customer".into()))?;
+            Some(id)
+        }
+    };
+
     // Insert first with a provisional invoice number, because the real one is
     // derived from the primary key this insert produces.
     let header = sale::ActiveModel {
@@ -1607,7 +1626,7 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
         grand_total: Set(Decimal::ZERO),
         paid_total: Set(Decimal::ZERO),
         payment_method: Set(payment_method),
-        customer_id: Set(None),
+        customer_id: Set(customer_id),
         note: Set(input.note),
         created_at: Set(now),
         updated_at: Set(now),
@@ -1873,6 +1892,7 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
         payment_method: Some(method.clone()),
         note: header.note.clone(),
         promote: None,
+        customer_id: None,
     })?;
     guard_discount_within_subtotal(discount_total, subtotal)?;
 

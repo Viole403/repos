@@ -313,6 +313,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: Some(false),
+                customer_id: None,
             },
         )
         .await
@@ -358,6 +359,7 @@ mod tests {
                 payment_method: Some("Qris".into()),
                 note: None,
                 promote: None,
+                customer_id: None,
             },
         )
         .await
@@ -443,6 +445,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: None,
+                customer_id: None,
             },
         )
         .await;
@@ -488,6 +491,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: None,
+                customer_id: None,
             },
         )
         .await
@@ -532,6 +536,7 @@ mod tests {
                     payment_method: None,
                     note: None,
                     promote: None,
+                    customer_id: None,
                 },
             )
             .await
@@ -553,6 +558,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: None,
+                customer_id: None,
             }
         )
         .await
@@ -577,6 +583,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: None,
+                customer_id: None,
             },
         )
         .await
@@ -611,6 +618,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: Some(false),
+                customer_id: None,
             },
         )
         .await
@@ -649,6 +657,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: Some(false),
+                customer_id: None,
             },
         )
         .await
@@ -676,6 +685,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: None,
+                customer_id: None,
             },
         )
         .await
@@ -738,6 +748,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: None,
+                customer_id: None,
             },
         )
         .await
@@ -888,6 +899,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: None,
+                customer_id: None,
             },
         )
         .await
@@ -929,6 +941,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: None,
+                customer_id: None,
             },
         )
         .await
@@ -1100,6 +1113,7 @@ mod tests {
                 payment_method: None,
                 note: None,
                 promote: None,
+                customer_id: None,
             },
         )
         .await
@@ -1325,6 +1339,110 @@ mod tests {
                 Err(commands::CmdError::Conflict(_))
             ),
             "two customers sharing a member number makes receipts ambiguous"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sale_can_name_a_customer_and_move_their_balance() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let quantity = Decimal::new(2_000, 3);
+
+        commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![commands::CheckoutLine {
+                    item_id: item,
+                    quantity,
+                    unit_price: Decimal::new(25_000, 3),
+                    discount: None,
+                }],
+                discount_total: Some(Decimal::ZERO),
+                tax_total: Some(Decimal::ZERO),
+                paid_total: None,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: Some(true),
+                customer_id: Some(customer),
+            },
+        )
+        .await
+        .expect("checkout against a customer");
+
+        assert_eq!(
+            commands::customer_balance_in(&db, customer).await.unwrap(),
+            Decimal::new(50_000, 3),
+            "a sale that names a customer does not move what they owe"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sale_against_an_unknown_customer_is_refused() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+
+        let err = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![commands::CheckoutLine {
+                    item_id: item,
+                    quantity: Decimal::new(1_000, 3),
+                    unit_price: Decimal::new(5_000, 3),
+                    discount: None,
+                }],
+                discount_total: Some(Decimal::ZERO),
+                tax_total: Some(Decimal::ZERO),
+                paid_total: None,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: Some(true),
+                customer_id: Some(4242),
+            },
+        )
+        .await
+        .expect_err("no such customer");
+
+        assert!(matches!(err, commands::CmdError::NotFound(_)), "unexpected error: {err}");
+        assert_eq!(
+            sale::Entity::find().count(&db).await.unwrap(),
+            0,
+            "a refused checkout left a sale behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_walk_in_sale_names_no_customer() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+
+        let view = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![commands::CheckoutLine {
+                    item_id: item,
+                    quantity: Decimal::new(1_000, 3),
+                    unit_price: Decimal::new(5_000, 3),
+                    discount: None,
+                }],
+                discount_total: Some(Decimal::ZERO),
+                tax_total: Some(Decimal::ZERO),
+                paid_total: None,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: Some(true),
+                customer_id: None,
+            },
+        )
+        .await
+        .expect("a walk-in sale");
+
+        assert!(
+            view.sale.customer_id.is_none(),
+            "a walk-in sale must not be pinned to a placeholder customer"
         );
     }
 }
