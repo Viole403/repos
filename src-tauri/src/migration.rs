@@ -146,7 +146,6 @@ async fn auth_and_roles(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(Permissions::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
                 .col(ColumnDef::new(Permissions::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
                 // reference: unique(['name', 'guard_name', 'group_name'])
-                .index(&mut Index::create().name("idx_permissions_unique").col(Permissions::Name).col(Permissions::GuardName).col(Permissions::GroupName).unique().to_owned())
                 .to_owned(),
         )
         .await?;
@@ -164,7 +163,6 @@ async fn auth_and_roles(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(Roles::DelStatus).string().not_null().default(DEL_LIVE))
                 .col(ColumnDef::new(Roles::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
                 .col(ColumnDef::new(Roles::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .index(&mut Index::create().name("idx_roles_unique").col(Roles::Name).col(Roles::GuardName).unique().to_owned())
                 .to_owned(),
         )
         .await?;
@@ -248,7 +246,19 @@ async fn master_data(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(ItemCategories::DelStatus).string().not_null().default(DEL_LIVE))
                 .col(ColumnDef::new(ItemCategories::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
                 .col(ColumnDef::new(ItemCategories::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .index(&mut Index::create().name("idx_item_categories_sort").col(ItemCategories::SortId).to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    // Non-unique indexes cannot be inlined into CREATE TABLE — `CONSTRAINT "x" ("c")`
+    // is rejected by both SQLite and Postgres. Each one is its own statement.
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_item_categories_sort")
+                .table(ItemCategories::Table)
+                .col(ItemCategories::SortId)
                 .to_owned(),
         )
         .await?;
@@ -290,7 +300,17 @@ async fn items(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .foreign_key(&mut ForeignKey::create().name("fk_items_brand").from(Items::Table, Items::BrandId).to(Brands::Table, Brands::Id).on_delete(ForeignKeyAction::SetNull).to_owned())
                 .foreign_key(&mut ForeignKey::create().name("fk_items_purchase_unit").from(Items::Table, Items::PurchaseUnitId).to(Units::Table, Units::Id).on_delete(ForeignKeyAction::SetNull).to_owned())
                 .foreign_key(&mut ForeignKey::create().name("fk_items_sale_unit").from(Items::Table, Items::SaleUnitId).to(Units::Table, Units::Id).on_delete(ForeignKeyAction::SetNull).to_owned())
-                .index(&mut Index::create().name("idx_items_name").col(Items::Name).to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_items_name")
+                .table(Items::Table)
+                .col(Items::Name)
                 .to_owned(),
         )
         .await?;
@@ -411,32 +431,5 @@ enum Items {
     UpdatedAt,
 }
 
-#[cfg(test)]
-mod sql_dump {
-    use super::*;
-    use sea_orm::sea_query::{SqliteQueryBuilder, Table};
 
-    /// Prints each generated CREATE TABLE without executing it, so a malformed
-    /// column definition is visible as SQL rather than as an opaque driver error.
-    #[test]
-    fn dump() {
-        let b = SqliteQueryBuilder;
-        for stmt in [
-            Table::create().table(Units::Table).if_not_exists()
-                .col(ColumnDef::new(Units::Id).integer().not_null().auto_increment().primary_key())
-                .col(ColumnDef::new(Units::UnitName).string().not_null())
-                .col(ColumnDef::new(Units::Description).string().null())
-                .to_owned(),
-            Table::create().table(ItemCategories::Table).if_not_exists()
-                .col(ColumnDef::new(ItemCategories::Id).integer().not_null().auto_increment().primary_key())
-                .col(ColumnDef::new(ItemCategories::SortId).integer().not_null().default(0))
-                .to_owned(),
-            Table::create().table(Users::Table).if_not_exists()
-                .col(ColumnDef::new(Users::Id).integer().not_null().auto_increment().primary_key())
-                .col(ColumnDef::new(Users::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .to_owned(),
-        ] {
-            println!("SQL>> {}", stmt.to_string(SqliteQueryBuilder));
-        }
-    }
-}
+

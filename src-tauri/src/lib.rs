@@ -101,26 +101,36 @@ mod tests {
         assert_eq!(unit::Entity::find().count(&db).await.unwrap(), 1);
     }
 
-    #[tokio::test]
-    async fn dump_schema_sql() {
-        use sea_orm_migration::prelude::SchemaManager;
-        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-        let sm = SchemaManager::new(&db);
-        for name in ["auth_and_roles", "master_data", "items"] {
-            let m: &dyn sea_orm_migration::MigrationTrait = match name {
-                "auth_and_roles" => &migration::Migrations::AuthAndRoles,
-                "master_data" => &migration::Migrations::MasterData,
-                _ => &migration::Migrations::Items,
-            };
-            if let Err(e) = m.up(&sm).await {
-                panic!("{name}: {e}");
-            }
-        }
-    }
 
     #[tokio::test]
     async fn item_table_exists() {
         let db = db::init_for_tests().await;
+        assert_eq!(item::Entity::find().count(&db).await.unwrap(), 0);
+    }
+
+    /// Postgres is the default backend, so the schema has to apply there too — not
+    /// just to SQLite. This is the check that backs the portability claim: a column
+    /// type SQLite tolerates can still be rejected by Postgres, and `cargo check`
+    /// would never see it.
+    ///
+    /// Set `REPOS_TEST_POSTGRES_URL` to run it, e.g.
+    ///   REPOS_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost/repos_test \
+    ///     cargo test
+    /// Skipped (not failed) when the variable is unset, so the default suite needs no
+    /// database server.
+    #[tokio::test]
+    async fn migrations_apply_to_postgres() {
+        let Ok(url) = std::env::var("REPOS_TEST_POSTGRES_URL") else {
+            eprintln!("skipping: REPOS_TEST_POSTGRES_URL not set");
+            return;
+        };
+
+        let db = db::connect_to(&url)
+            .await
+            .expect("connect to the test Postgres");
+
+        // Both tables exist and are queryable, which means the DDL was accepted.
+        assert_eq!(unit::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(item::Entity::find().count(&db).await.unwrap(), 0);
     }
 }
