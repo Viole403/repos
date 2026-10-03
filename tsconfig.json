@@ -20,6 +20,9 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
 
+    /* For bun:test only. The app itself never touches a Bun global. */
+    "types": ["bun"],
+
     /* Path aliases — mirrored in vite.config.ts.
        `baseUrl` is intentionally absent: TypeScript 6 deprecates it, and `paths`
        resolves relative to this file without it. */
