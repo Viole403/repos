@@ -223,6 +223,8 @@ export interface CheckoutInput {
     note?: string | null;
     /** `false` leaves the sale as a `Draft` and writes no stock movements. Defaults `true`. */
     promote?: boolean | null;
+    /** Who the sale is to. Omit for a walk-in, which is the common case. */
+    customerId?: number | null;
 }
 
 /** Closed vocabulary, stored and sent in PascalCase so raw SQL stays readable. */
