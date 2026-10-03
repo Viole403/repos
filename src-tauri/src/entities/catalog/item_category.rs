@@ -13,8 +13,8 @@ pub struct Model {
     pub description: Option<String>,
     pub sort_id: i32,
     pub del_status: String,
-    pub created_at: DateTimeUtc,
-    pub updated_at: DateTimeUtc,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

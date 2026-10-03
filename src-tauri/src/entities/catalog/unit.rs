@@ -12,8 +12,8 @@ pub struct Model {
     pub unit_name: String,
     pub description: Option<String>,
     pub del_status: String,
-    pub created_at: DateTimeUtc,
-    pub updated_at: DateTimeUtc,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

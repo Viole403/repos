@@ -3,7 +3,6 @@
 
 // Schema is in place ahead of the commands that use it; until then the
 // derive output looks unused to rustc.
-#![allow(dead_code)]
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +15,8 @@ pub struct Model {
     pub group_name: String,
     pub guard_name: String,
     pub del_status: String,
-    pub created_at: DateTimeUtc,
-    pub updated_at: DateTimeUtc,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

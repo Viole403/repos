@@ -7,6 +7,7 @@
 //! Money is `Decimal` (three decimal places) and quantities are `Decimal` too —
 //! the reference casts both to `decimal:3`, and fractional quantities are real.
 
+use chrono::NaiveDateTime;
 use sea_orm_migration::prelude::*;
 
 // Schema builder types re-exported by sea-orm-migration's prelude.
@@ -54,6 +55,16 @@ const DEL_LIVE: &str = "Live";
 /// migration fails with `near "(": syntax error`. `custom("timestamp")` is portable
 /// across SQLite, Postgres, and MySQL, so all three stay on the same schema.
 const TIMESTAMP: &str = "timestamp";
+
+/// A UTC timestamp as `NaiveDateTime`, because that is what a `timestamp` column is.
+///
+/// `DateTimeUtc` would be the obvious type, and it is wrong: sqlx maps it to
+/// `TIMESTAMPTZ`, so reading a `TIMESTAMP` column into it fails at runtime on
+/// Postgres — `mismatched types` during the migration's own `SELECT`. `NaiveDateTime`
+/// maps to `TIMESTAMP`, which is exactly what the column is.
+pub fn now() -> NaiveDateTime {
+    chrono::Utc::now().naive_utc()
+}
 
 /// Money/quantity precision: 18 total digits, 3 after the point.
 ///
@@ -671,7 +682,7 @@ const PERMISSION_CATALOG: &[(&str, &[&str])] = &[
 /// soft-deleted permission is not silently resurrected by re-running.
 async fn permission_catalog(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let conn = manager.get_connection();
-    let now = chrono::Utc::now();
+    let now = now();
 
     for (group, actions) in PERMISSION_CATALOG {
         for action in *actions {

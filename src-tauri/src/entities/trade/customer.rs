@@ -23,8 +23,8 @@ pub struct Model {
     pub note: Option<String>,
     pub photo: Option<String>,
     pub del_status: String,
-    pub created_at: DateTimeUtc,
-    pub updated_at: DateTimeUtc,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 // No relations declared until something joins to this table; `DeriveRelation` still

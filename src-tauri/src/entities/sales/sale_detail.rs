@@ -23,7 +23,7 @@ pub struct Model {
     /// discount, which is only reflected on the sale header.
     pub line_total: Decimal,
     pub tax_amount: Decimal,
-    pub created_at: DateTimeUtc,
+    pub created_at: chrono::NaiveDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

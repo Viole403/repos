@@ -80,6 +80,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
     use crate::entities::sales::stock_movement::MovementType;
     use crate::entities::sales::{sale, sale_detail, stock_movement};
+    use crate::entities::trade::{customer, supplier};
     use sea_orm::prelude::Decimal;
     use sea_orm::ActiveValue::Set;
     use sea_orm::{
@@ -95,7 +96,7 @@ mod tests {
         assert_eq!(unit::Entity::find().count(&db).await.unwrap(), 0);
 
         // Insert, then confirm the soft-delete filter hides it.
-        let now = chrono::Utc::now();
+        let now = migration::now();
         unit::ActiveModel {
             unit_name: Set("Piece".into()),
             description: Set(None),
@@ -192,7 +193,7 @@ mod tests {
 
     /// An item with a code, since `items.code` is the only unique column.
     async fn seed_item(db: &DatabaseConnection, name: &str) -> i32 {
-        let now = chrono::Utc::now();
+        let now = migration::now();
         item::ActiveModel {
             name: Set(name.to_owned()),
             code: Set(format!("code-{name}")),
@@ -222,7 +223,7 @@ mod tests {
             quantity: Set(quantity),
             reference: Set(Some("opening".into())),
             balance_after: Set(quantity),
-            created_at: Set(chrono::Utc::now()),
+            created_at: Set(migration::now()),
             ..Default::default()
         }
         .insert(db)
@@ -958,7 +959,7 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        let now = chrono::Utc::now();
+        let now = migration::now();
         let empty = sale::ActiveModel {
             invoice_no: Set("PENDING-empty".into()),
             status: Set("Draft".into()),
@@ -1102,5 +1103,11 @@ mod tests {
         assert_eq!(sale::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(sale_detail::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(stock_movement::Entity::find().count(&db).await.unwrap(), 0);
+
+        // The Stage 3 tables, which is what this leg was run for: `timestamp` columns
+        // only decode into `NaiveDateTime`, so a `DateTimeUtc` field fails here and
+        // nowhere else.
+        assert_eq!(customer::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(supplier::Entity::find().count(&db).await.unwrap(), 0);
     }
 }

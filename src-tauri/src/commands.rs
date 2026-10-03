@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sea_orm::prelude::{DateTimeUtc, Decimal};
+use chrono::NaiveDateTime;
+use sea_orm::prelude::Decimal;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionSession, TransactionTrait,
@@ -182,7 +183,7 @@ pub async fn create_unit(input: UnitInput) -> CmdResult<unit::Model> {
         return Err(CmdError::Conflict(format!("unit '{name}' already exists")));
     }
 
-    let now = chrono::Utc::now();
+    let now = crate::migration::now();
     Ok(unit::ActiveModel {
         unit_name: Set(name),
         description: Set(input.description),
@@ -218,7 +219,7 @@ pub async fn delete_unit(id: i32) -> CmdResult<()> {
     };
     let mut model: unit::ActiveModel = found.into();
     model.del_status = Set(DELETED.to_owned());
-    model.updated_at = Set(chrono::Utc::now());
+    model.updated_at = Set(crate::migration::now());
     model.update(db).await?;
     Ok(())
 }
@@ -265,7 +266,7 @@ pub async fn create_brand(input: BrandInput) -> CmdResult<brand::Model> {
         return Err(CmdError::Conflict(format!("brand '{name}' already exists")));
     }
 
-    let now = chrono::Utc::now();
+    let now = crate::migration::now();
     Ok(brand::ActiveModel {
         name: Set(name),
         description: Set(input.description),
@@ -303,7 +304,7 @@ pub async fn delete_brand(id: i32) -> CmdResult<()> {
     };
     let mut model: brand::ActiveModel = found.into();
     model.del_status = Set(DELETED.to_owned());
-    model.updated_at = Set(chrono::Utc::now());
+    model.updated_at = Set(crate::migration::now());
     model.update(db).await?;
     Ok(())
 }
@@ -352,7 +353,7 @@ pub async fn create_item_category(input: CategoryInput) -> CmdResult<item_catego
         return Err(CmdError::Conflict(format!("item category '{name}' already exists")));
     }
 
-    let now = chrono::Utc::now();
+    let now = crate::migration::now();
     Ok(item_category::ActiveModel {
         name: Set(name),
         description: Set(input.description),
@@ -378,7 +379,7 @@ pub async fn delete_item_category(id: i32) -> CmdResult<()> {
     };
     let mut model: item_category::ActiveModel = found.into();
     model.del_status = Set(DELETED.to_owned());
-    model.updated_at = Set(chrono::Utc::now());
+    model.updated_at = Set(crate::migration::now());
     model.update(db).await?;
     Ok(())
 }
@@ -562,7 +563,7 @@ pub async fn create_item(input: ItemInput) -> CmdResult<item::Model> {
         return Err(CmdError::Conflict(format!("item code '{code}' already exists")));
     }
 
-    let now = chrono::Utc::now();
+    let now = crate::migration::now();
     Ok(item::ActiveModel {
         name: Set(required(&input.name, "item name")?),
         code: Set(code),
@@ -628,7 +629,7 @@ pub async fn update_item(id: i32, input: ItemInput) -> CmdResult<item::Model> {
     model.whole_sale_price = Set(input.whole_sale_price);
     model.alert_quantity = Set(input.alert_quantity);
     model.loyalty_point = Set(input.loyalty_point);
-    model.updated_at = Set(chrono::Utc::now());
+    model.updated_at = Set(crate::migration::now());
 
     Ok(model.update(db).await?)
 }
@@ -646,7 +647,7 @@ pub async fn delete_item(id: i32) -> CmdResult<()> {
 
     let mut model: item::ActiveModel = found.into();
     model.del_status = Set(DELETED.to_owned());
-    model.updated_at = Set(chrono::Utc::now());
+    model.updated_at = Set(crate::migration::now());
     model.update(db).await?;
     Ok(())
 }
@@ -705,7 +706,7 @@ fn provisional_invoice_no() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     format!(
         "PENDING-{}-{}",
-        chrono::Utc::now().timestamp_micros(),
+        crate::migration::now().timestamp_micros(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     )
 }
@@ -906,7 +907,7 @@ async fn record_sale_movement<C: ConnectionTrait>(
     invoice_no: &str,
     quantity: Decimal,
     balance_after: Decimal,
-    now: DateTimeUtc,
+    now: NaiveDateTime,
 ) -> CmdResult<()> {
     // Signed: negative leaves the shelf. `balance_after` is the running on-hand for
     // this item as of this row.
@@ -981,7 +982,7 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     validate_checkout(&input)?;
 
     let promoted = input.promote.unwrap_or(true);
-    let now = chrono::Utc::now();
+    let now = crate::migration::now();
 
     // TODO(stock): gate the oversell rejection below on an `allow_negative_stock`
     // setting instead. It needs the settings table from the stock stage; until that
@@ -1208,7 +1209,7 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
     paid_total: Option<Decimal>,
     payment_method: Option<String>,
 ) -> CmdResult<SaleView> {
-    let now = chrono::Utc::now();
+    let now = crate::migration::now();
     let txn = conn.begin().await?;
 
     let Some(header) = sale::Entity::find_by_id(sale_id).one(&txn).await? else {

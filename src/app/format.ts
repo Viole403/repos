@@ -28,8 +28,14 @@ export const formatQuantity = (value: Decimal | null | undefined): string => {
 
 const dateTime = new Intl.DateTimeFormat(LOCALE, { dateStyle: "medium", timeStyle: "short" });
 
+/**
+ * Timestamps arrive as `NaiveDateTime`, which serializes without a zone — `"2026-10-03T09:12:00"`.
+ * `new Date` reads that as *local* time, so a UTC value would display shifted by the
+ * offset. The server stores UTC; the `Z` restores it.
+ */
 export const formatTimestamp = (value: string): string => {
-    const parsed = new Date(value);
+    const zoned = /(Z|[+-]\d{2}:?\d{2})$/.test(value) ? value : `${value}Z`;
+    const parsed = new Date(zoned);
     return Number.isNaN(parsed.getTime()) ? "—" : dateTime.format(parsed);
 };
 

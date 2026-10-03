@@ -35,7 +35,7 @@ pub struct Model {
     pub reference: Option<String>,
     /// On-hand immediately after this row landed.
     pub balance_after: Decimal,
-    pub created_at: DateTimeUtc,
+    pub created_at: chrono::NaiveDateTime,
 }
 
 /// Why a ledger row exists. A closed vocabulary rather than free text, so a

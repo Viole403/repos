@@ -33,8 +33,8 @@ pub struct Model {
     /// No foreign key yet — the customers table arrives with the customer stage.
     pub customer_id: Option<i32>,
     pub note: Option<String>,
-    pub created_at: DateTimeUtc,
-    pub updated_at: DateTimeUtc,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

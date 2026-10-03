@@ -21,8 +21,8 @@ pub struct Model {
     pub photo: Option<String>,
     pub del_status: String,
     pub two_factor_enabled: bool,
-    pub created_at: DateTimeUtc,
-    pub updated_at: DateTimeUtc,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 /// Safe projection for the frontend. Omits `password_hash` so it cannot leak

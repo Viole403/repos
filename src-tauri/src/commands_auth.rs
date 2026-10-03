@@ -219,7 +219,7 @@ pub async fn create_user_in<C: sea_orm::ConnectionTrait>(conn: &C, input: UserIn
         .map_err(|err| CmdError::Validation(format!("could not hash the password: {err}")))?
         .map_err(CmdError::Validation)?;
 
-    let now = chrono::Utc::now();
+    let now = crate::migration::now();
     let model = users::ActiveModel {
         name: Set(name),
         email: Set(email.clone()),
@@ -338,8 +338,8 @@ async fn attach_role<C: sea_orm::ConnectionTrait>(
             guard_name: Set(label.to_owned()),
             role_type: Set(role_type.to_owned()),
             del_status: Set("Live".into()),
-            created_at: Set(chrono::Utc::now()),
-            updated_at: Set(chrono::Utc::now()),
+            created_at: Set(crate::migration::now()),
+            updated_at: Set(crate::migration::now()),
             ..Default::default()
         }
         .insert(conn)
@@ -391,7 +391,7 @@ pub async fn delete_user_in<C: sea_orm::ConnectionTrait>(conn: &C, id: i32) -> C
 
     let mut am: users::ActiveModel = row.into();
     am.del_status = Set("Deleted".into());
-    am.updated_at = Set(chrono::Utc::now());
+    am.updated_at = Set(crate::migration::now());
     am.update(conn).await?;
 
     if auth::current_user_id() == Some(id) {
@@ -567,7 +567,7 @@ pub async fn set_user_role_in<C: sea_orm::ConnectionTrait>(
     // `users.role` is the label the sidebar shows, so it follows the pivot.
     let mut am: users::ActiveModel = target.into();
     am.role = Set(Some(role.name));
-    am.updated_at = Set(chrono::Utc::now());
+    am.updated_at = Set(crate::migration::now());
     am.update(conn).await?;
 
     Ok(())
@@ -611,7 +611,7 @@ pub async fn create_role_in<C: sea_orm::ConnectionTrait>(conn: &C, input: RoleIn
     // Always Staff. The owner role is not creatable here — it belongs to the first
     // account, and a command that mints one on demand is the door `create_user`
     // and `set_user_role` both refuse to open.
-    let now = chrono::Utc::now();
+    let now = crate::migration::now();
     let row = roles::ActiveModel {
         name: Set(name.clone()),
         guard_name: Set(name.clone()),
@@ -716,7 +716,7 @@ pub async fn delete_role_in<C: sea_orm::ConnectionTrait>(conn: &C, id: i32) -> C
 
     let mut am: roles::ActiveModel = role.into();
     am.del_status = Set("Deleted".into());
-    am.updated_at = Set(chrono::Utc::now());
+    am.updated_at = Set(crate::migration::now());
     am.update(conn).await?;
 
     Ok(())
@@ -894,7 +894,7 @@ mod tests {
     /// need a *known* password do not pay Argon2's cost twice or depend on the
     /// validator's rules.
     async fn seed_user(conn: &DatabaseConnection, email: &str) -> i32 {
-        let now = chrono::Utc::now();
+        let now = crate::migration::now();
         let model = users::ActiveModel {
             name: Set("Cashier".into()),
             email: Set(email.into()),
@@ -908,7 +908,7 @@ mod tests {
     }
 
     async fn seed_role(conn: &DatabaseConnection, name: &str, role_type: &str) -> i32 {
-        let now = chrono::Utc::now();
+        let now = crate::migration::now();
         let model = roles::ActiveModel {
             name: Set(name.into()),
             guard_name: Set(name.into()),
@@ -953,7 +953,7 @@ mod tests {
     }
 
     async fn seed_permission(conn: &DatabaseConnection, name: &str) -> i32 {
-        let now = chrono::Utc::now();
+        let now = crate::migration::now();
         let model = permissions::ActiveModel {
             name: Set(name.into()),
             group_name: Set("sales".into()),

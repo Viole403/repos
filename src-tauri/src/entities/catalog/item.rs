@@ -30,8 +30,8 @@ pub struct Model {
     pub loyalty_point: Decimal,
     pub photo: Option<String>,
     pub del_status: String,
-    pub created_at: DateTimeUtc,
-    pub updated_at: DateTimeUtc,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 /// Item plus joined display names, so the list screen doesn't issue three extra
