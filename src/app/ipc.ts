@@ -246,6 +246,12 @@ export interface StockMovement {
     createdAt: Timestamp;
 }
 
+/** A draft and its lines: everything needed to put the cashier back where they were. */
+export interface DraftSale {
+    sale: Sale;
+    lines: SaleDetail[];
+}
+
 export class IpcError extends Error {
     constructor(message: string) {
         super(message);
@@ -284,6 +290,14 @@ export const listItems = (query: PageQuery = {}) => call<Page<ItemView>>("list_i
 export const createItem = (input: ItemInput) => call<Item>("create_item", { input });
 export const updateItem = (id: number, input: ItemInput) => call<Item>("update_item", { id, input });
 export const deleteItem = (id: number) => call<void>("delete_item", { id });
+
+export const listDraftSales = () => call<DraftSale[]>("list_draft_sales");
+
+/** Completes a draft. Omitting `paidTotal` means paid in full. */
+export const promoteDraft = (saleId: number, paidTotal?: Decimal, paymentMethod?: string) =>
+    call<SaleView>("promote_draft", { saleId, paidTotal: paidTotal ?? null, paymentMethod: paymentMethod ?? null });
+
+export const discardDraft = (saleId: number) => call<void>("discard_draft", { saleId });
 
 export const listStockMovements = (itemId: number, query: PageQuery = {}) => call<Page<StockMovement>>("list_stock_movements", { itemId, query });
 export const stockOnHand = (itemId: number) => call<Decimal>("stock_on_hand", { itemId });
