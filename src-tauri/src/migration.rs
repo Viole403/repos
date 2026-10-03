@@ -12,6 +12,10 @@ use sea_orm_migration::prelude::*;
 // Schema builder types re-exported by sea-orm-migration's prelude.
 use sea_orm::sea_query::{ColumnDef, ForeignKey, ForeignKeyAction, Index, Table};
 
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+
+use crate::entities::auth::permissions;
+
 /// The migration registry. `db::init` runs this before the window opens.
 #[derive(Debug)]
 pub struct Migrator;
@@ -24,6 +28,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::MasterData),
             Box::new(Migrations::Items),
             Box::new(Migrations::SalesAndStock),
+            Box::new(Migrations::PermissionCatalog),
         ]
     }
 }
@@ -34,6 +39,7 @@ pub enum Migrations {
     MasterData,
     Items,
     SalesAndStock,
+    PermissionCatalog,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -64,6 +70,7 @@ impl MigrationName for Migrations {
             Migrations::MasterData => "master_data",
             Migrations::Items => "items",
             Migrations::SalesAndStock => "sales_and_stock",
+            Migrations::PermissionCatalog => "permission_catalog",
         }
     }
 }
@@ -76,6 +83,7 @@ impl MigrationTrait for Migrations {
             Migrations::MasterData => master_data(manager).await?,
             Migrations::Items => items(manager).await?,
             Migrations::SalesAndStock => sales_and_stock(manager).await?,
+            Migrations::PermissionCatalog => permission_catalog(manager).await?,
         }
         Ok(())
     }
@@ -83,6 +91,22 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::PermissionCatalog => {
+                // Data, not schema: reverse it by deleting the rows this migration
+                // owns, which is exactly the seeded catalog. Scoped by name so a
+                // permission an operator added by hand survives a rollback. The
+                // `role_permissions` foreign key cascades.
+                let conn = manager.get_connection();
+                for (group, actions) in PERMISSION_CATALOG {
+                    for action in *actions {
+                        let name = format!("{group}-{action}");
+                        permissions::Entity::delete_many()
+                            .filter(permissions::Column::Name.eq(name))
+                            .exec(conn)
+                            .await?;
+                    }
+                }
+            }
             Migrations::SalesAndStock => {
                 for t in [
                     StockMovements::Table.into_iden(),
@@ -502,6 +526,84 @@ async fn sales_and_stock(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .to_owned(),
         )
         .await?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Permission catalog
+// ---------------------------------------------------------------------------
+
+/// Every permission this app guards, as `group` -> actions.
+///
+/// Names are `group-action` (`item-create`, `sale-pos`), which is what the
+/// reference's seeder writes into `permissions.name` and what the command guards
+/// compare against. `group_name` is the second column, so the settings UI can
+/// group them without parsing the name.
+///
+/// The catalog is seeded rather than left empty because `permission_names_in`
+/// resolves against these rows: an empty table means every user holds nothing,
+/// so a guard would lock out every operator — including one holding a `Master`
+/// role, which bypasses the pivot but not this query.
+const PERMISSION_CATALOG: &[(&str, &[&str])] = &[
+    ("item", &["list", "create", "edit", "show", "destroy", "import"]),
+    ("item_category", &["list", "create", "edit", "show", "destroy"]),
+    ("brand", &["list", "create", "edit", "show", "destroy"]),
+    ("unit", &["list", "create", "edit", "show", "destroy"]),
+    ("sale", &["list", "create", "edit", "show", "destroy", "pos", "show_purchase_price"]),
+    ("sale_return", &["list", "create", "edit", "show", "destroy"]),
+    ("customer", &["list", "create", "edit", "show", "destroy"]),
+    ("supplier", &["list", "create", "edit", "show", "destroy"]),
+    ("stock", &["stock", "low_stock"]),
+    ("user", &["list", "create", "edit", "show", "destroy"]),
+    ("role", &["list", "create", "edit", "show", "destroy"]),
+    ("setting", &["list", "create", "edit", "show", "destroy"]),
+    (
+        "report",
+        &[
+            "sale_report", "stock_report", "low_stock_report", "purchase_report",
+            "expense_report", "income_report", "profit_loss_report", "tax_report",
+            "customer_balance_report", "supplier_balance_report", "cash_flow_report",
+        ],
+    ),
+];
+
+/// Insert the catalog, skipping names that already exist.
+///
+/// Idempotent by design: migrations run once per database, but a name can also
+/// arrive from a later migration or an operator's own setup, and `firstOrCreate`
+/// in the reference behaves the same way. Existing rows are left untouched so a
+/// soft-deleted permission is not silently resurrected by re-running.
+async fn permission_catalog(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let conn = manager.get_connection();
+    let now = chrono::Utc::now();
+
+    for (group, actions) in PERMISSION_CATALOG {
+        for action in *actions {
+            let name = format!("{group}-{action}");
+            let exists = permissions::Entity::find()
+                .filter(permissions::Column::Name.eq(&name))
+                .one(conn)
+                .await?;
+            if exists.is_some() {
+                continue;
+            }
+
+            permissions::ActiveModel {
+                name: Set(name),
+                group_name: Set((*group).to_owned()),
+                // Single guard — this app has no API surface separate from the
+                // desktop window, so the reference's parity column is a constant.
+                guard_name: Set("web".to_owned()),
+                del_status: Set(DEL_LIVE.to_owned()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(conn)
+            .await?;
+        }
+    }
 
     Ok(())
 }
