@@ -6,8 +6,8 @@
 //! throwaway in-memory database in tests.
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter,
-    QueryOrder,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder,
 };
 use serde::Deserialize;
 
@@ -208,6 +208,21 @@ const STAFF_ROLE_NAME: &str = "Staff";
 const MASTER_ROLE_TYPE: &str = "Master";
 const STAFF_ROLE_TYPE: &str = "Staff";
 
+/// Live accounts, which is what "does this install have an owner" means.
+///
+/// Soft-deleted rows are excluded for the same reason every other read here
+/// excludes them: a deleted account cannot sign in, so it grants nothing and is
+/// not evidence that anybody holds the owner role. Counting them instead meant an
+/// owner who deleted their own account left an install with zero usable accounts
+/// that no longer recognised itself as unclaimed — the one state where creating an
+/// account was the only way forward.
+async fn live_user_count<C: sea_orm::ConnectionTrait>(conn: &C) -> CmdResult<u64> {
+    Ok(users::Entity::find()
+        .filter(users::Column::DelStatus.eq("Live"))
+        .count(conn)
+        .await?)
+}
+
 /// Decide which role a new account gets, or refuse the request.
 ///
 /// The `role` field on a user is free text, so an unknown name would otherwise
@@ -217,8 +232,8 @@ async fn resolve_role_label<C: sea_orm::ConnectionTrait>(
     conn: &C,
     label: Option<&str>,
 ) -> CmdResult<(String, &'static str)> {
-    // Counted before this account's own row exists, so empty means this is the first.
-    let first = users::Entity::find().all(conn).await?.is_empty();
+    // Counted before this account's own row exists, so zero means this is the first.
+    let first = live_user_count(conn).await? == 0;
     let requested = label
         .map(str::trim)
         .filter(|raw| !raw.is_empty())
@@ -301,15 +316,20 @@ pub async fn create_user(input: UserInput) -> CmdResult<UserView> {
 /// a session pointing at a row that no longer passes the `Live` filter.
 #[tauri::command]
 pub async fn delete_user(id: i32) -> CmdResult<()> {
+    let conn = db();
+    delete_user_in(conn, id).await
+}
+
+pub async fn delete_user_in<C: sea_orm::ConnectionTrait>(conn: &C, id: i32) -> CmdResult<()> {
     let row = users::Entity::find_by_id(id)
-        .one(db())
+        .one(conn)
         .await?
         .ok_or_else(|| CmdError::NotFound("user".into()))?;
 
     let mut am: users::ActiveModel = row.into();
     am.del_status = Set("Deleted".into());
     am.updated_at = Set(chrono::Utc::now());
-    am.update(db()).await?;
+    am.update(conn).await?;
 
     if auth::current_user_id() == Some(id) {
         auth::sign_out();
@@ -989,6 +1009,58 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a refused account must not be left behind"
+        );
+    }
+
+    /// Deleting the only account has to leave the install recoverable.
+    ///
+    /// Counting every account rather than the live ones made this a dead end: the
+    /// owner soft-deleted themselves, so `live_user_count` was zero — nothing could
+    /// sign in and nothing could be created — yet the row still existed, so the
+    /// replacement was treated as a later account and given no permissions. The
+    /// install could never be signed into again.
+    #[tokio::test]
+    async fn deleting_the_only_account_leaves_the_install_claimable() {
+        let conn = init_for_tests().await;
+        let owner = create_user_in(
+            &conn,
+            UserInput {
+                name: "Owner".into(),
+                email: "owner@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("first");
+
+        delete_user_in(&conn, owner.id).await.expect("delete the only account");
+        assert_eq!(
+            live_user_count(&conn).await.unwrap(),
+            0,
+            "a soft-deleted account is not a usable account"
+        );
+
+        // The replacement has to arrive owner-level, or it can sign in and then be
+        // rejected by every guarded command — which is the same lockout with an
+        // extra sign-in step in front of it.
+        let replacement = create_user_in(
+            &conn,
+            UserInput {
+                name: "New Owner".into(),
+                email: "new@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("an install with no live accounts is unclaimed again");
+
+        assert!(
+            require(&conn, replacement.id, "sale-pos").await.is_ok(),
+            "the replacement owner holds no permissions, so the install is unusable"
         );
     }
 }
