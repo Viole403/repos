@@ -301,6 +301,14 @@ export interface InstallStatus {
     accountCount: number;
 }
 
+export interface RoleView {
+    id: number;
+    name: string;
+    /** "Master" bypasses the permission pivot, so `permissions` lists everything. */
+    roleType: string;
+    permissions: string[];
+}
+
 export interface UserInput {
     name: string;
     email: string;
@@ -315,8 +323,10 @@ export const logout = () => call<void>("logout");
 export const listUsers = () => call<UserView[]>("list_users");
 export const createUser = (input: UserInput) => call<UserView>("create_user", { input });
 export const deleteUser = (id: number) => call<void>("delete_user", { id });
-/** The signed-in user's permissions, for hiding what the operator cannot do. */
 export const myPermissions = () => call<string[]>("my_permissions");
+export const listRoles = () => call<RoleView[]>("list_roles");
+export const setUserRole = (userId: number, roleId: number) =>
+    call<void>("set_user_role", { userId, roleId });
 /**
  * The signed-in user. The session lives in a process-wide cell, so this is the
  * restore — but note it *rejects* with `NotFound("session")` when nobody is
