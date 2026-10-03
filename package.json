@@ -10,14 +10,18 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@react-stately/utils": "^3.12.1",
     "@tailwindcss/typography": "^0.5.20",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "@untitledui/icons": "^0.0.23",
+    "input-otp": "^1.5.0",
     "react": "^19.1.0",
+    "react-aria": "^3.52.1",
     "react-aria-components": "^1.21.1",
     "react-dom": "^19.1.0",
     "react-router-dom": "^7.18.4",
+    "react-stately": "^3.50.0",
     "tailwind-merge": "^3.7.0",
     "tailwindcss": "^4.3.3",
     "tailwindcss-animate": "^1.0.7",
