@@ -1,9 +1,6 @@
 //! A login identity. `password_hash` never leaves the backend.
 
 
-// Schema is in place ahead of the commands that use it; until then the
-// derive output looks unused to rustc.
-#![allow(dead_code)]
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +11,10 @@ pub struct Model {
     pub id: i32,
     pub name: String,
     pub email: String,
+    /// Skipped on the way out. `Model` needs `Serialize` for Tauri's `#[tauri::command]`
+    /// derive, but the hash must never reach the wire even if a command returns the
+    /// raw row. `UserView` remains the shape callers are meant to use.
+    #[serde(skip_serializing)]
     pub password_hash: String,
     pub phone: Option<String>,
     pub role: Option<String>,
