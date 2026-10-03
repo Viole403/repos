@@ -252,6 +252,22 @@ export interface DraftSale {
     lines: SaleDetail[];
 }
 
+/** `users::UserView` — the safe projection, so `passwordHash` never crosses the wire. */
+export interface UserView {
+    id: number;
+    name: string;
+    email: string;
+    phone: string | null;
+    role: string | null;
+    /** URL or data URI; null falls back to the avatar's own initials. */
+    photo: string | null;
+}
+
+export interface LoginInput {
+    email: string;
+    password: string;
+}
+
 export class IpcError extends Error {
     constructor(message: string) {
         super(message);
@@ -273,6 +289,23 @@ const call = async <T>(command: string, args?: Record<string, unknown>): Promise
 };
 
 export const healthCheck = () => call<number>("health_check");
+
+// ---------------------------------------------------------------- auth
+//
+// ponytail: these four are the only auth surface the frontend needs. Role-based
+// permission checks belong on the Rust side — a client-side guard is UI, not a
+// boundary. Add wrappers here only when a command actually exists.
+
+export const login = (input: LoginInput) => call<UserView>("login", { input });
+export const logout = () => call<void>("logout");
+/**
+ * The signed-in user. The session lives in a process-wide cell, so this is the
+ * restore — but note it *rejects* with `NotFound("session")` when nobody is
+ * signed in rather than returning null, so callers must treat a throw as "no
+ * session". There is no way to tell that apart from any other rejection, since
+ * `CmdError` arrives as a bare string.
+ */
+export const currentUser = () => call<UserView>("current_user");
 
 export const listUnits = (query: PageQuery = {}) => call<Page<Unit>>("list_units", { query });
 export const createUnit = (input: UnitInput) => call<Unit>("create_unit", { input });
