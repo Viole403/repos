@@ -68,7 +68,10 @@ mod tests {
     //! atomicity of checkout — neither of which a mock would exercise.
     use super::*;
     use crate::commands::{CheckoutInput, CheckoutLine, PageQuery};
+    use crate::entities::auth::permissions;
     use crate::entities::catalog::{item, unit};
+    use crate::migration::Migrator;
+    use sea_orm_migration::MigratorTrait;
     use crate::entities::sales::stock_movement::MovementType;
     use crate::entities::sales::{sale, sale_detail, stock_movement};
     use sea_orm::prelude::Decimal;
@@ -127,6 +130,49 @@ mod tests {
     async fn item_table_exists() {
         let db = db::init_for_tests().await;
         assert_eq!(item::Entity::find().count(&db).await.unwrap(), 0);
+    }
+
+    /// The permission catalog is seeded by migration, and `permission_names_in`
+    /// resolves against these rows — so an empty table means every user holds no
+    /// permissions and a guard locks out every operator, Master included.
+    #[tokio::test]
+    async fn the_permission_catalog_is_seeded() {
+        let db = db::init_for_tests().await;
+
+        let all = permissions::Entity::find().all(&db).await.unwrap();
+        assert!(!all.is_empty(), "the catalog must not be empty");
+
+        // Every row is `group-action` and `group_name` matches the name's prefix,
+        // which is what the settings UI groups on.
+        for row in &all {
+            let (group, action) = row
+                .name
+                .split_once('-')
+                .unwrap_or_else(|| panic!("permission {} is not group-action", row.name));
+            assert!(!action.is_empty(), "permission {} has no action", row.name);
+            assert_eq!(
+                &row.group_name, group,
+                "permission {} disagrees with its group_name",
+                row.name
+            );
+            assert_eq!(row.del_status, "Live");
+            assert_eq!(row.guard_name, "web");
+        }
+
+        // The permissions the command guards compare against, by name.
+        let names: Vec<&str> = all.iter().map(|p| p.name.as_str()).collect();
+        for wanted in ["item-list", "item-create", "sale-create", "sale-pos", "stock-stock"] {
+            assert!(names.contains(&wanted), "missing seeded permission {wanted}");
+        }
+
+        // Seeding is idempotent: a second run must not duplicate rows.
+        let before = all.len() as u64;
+        Migrator::up(&db, None).await.unwrap();
+        assert_eq!(
+            permissions::Entity::find().count(&db).await.unwrap(),
+            before,
+            "re-running the migration duplicated permissions"
+        );
     }
 
     // -----------------------------------------------------------------------
