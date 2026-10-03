@@ -342,6 +342,31 @@ export const deleteRole = (id: number) => call<void>("delete_role", { id });
  */
 export const currentUser = () => call<UserView>("current_user");
 
+export interface SaleSummary {
+    id: number;
+    invoiceNo: string;
+    status: string;
+    grandTotal: Decimal;
+    paidTotal: Decimal;
+    paymentMethod: string;
+    customerId: number | null;
+    /** Null for a walk-in sale, which is not a missing value — it is the common case. */
+    customerName: string | null;
+    note: string | null;
+    createdAt: string;
+}
+
+export interface SaleFilter {
+    status?: string | null;
+    customerId?: number | null;
+    /** `YYYY-MM-DD`, inclusive. An unparseable value narrows nothing. */
+    from?: string | null;
+    to?: string | null;
+}
+
+export const listSales = (filter: SaleFilter = {}, query: PageQuery = {}) =>
+    call<Page<SaleSummary>>("list_sales", { filter, query });
+
 // ---------------------------------------------------------------- trade
 export interface CustomerView {
     id: number;
