@@ -327,6 +327,10 @@ export const myPermissions = () => call<string[]>("my_permissions");
 export const listRoles = () => call<RoleView[]>("list_roles");
 export const setUserRole = (userId: number, roleId: number) =>
     call<void>("set_user_role", { userId, roleId });
+export const createRole = (name: string) => call<RoleView>("create_role", { input: { name } });
+export const setRolePermissions = (roleId: number, permissions: string[]) =>
+    call<void>("set_role_permissions", { roleId, permissions });
+export const deleteRole = (id: number) => call<void>("delete_role", { id });
 /**
  * The signed-in user. The session lives in a process-wide cell, so this is the
  * restore — but note it *rejects* with `NotFound("session")` when nobody is
