@@ -14,8 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use chrono::NaiveDateTime;
 use sea_orm::prelude::Decimal;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionSession, TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DbErr,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionSession,
+    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,7 @@ use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
 use crate::entities::sales::{sale, sale_detail, stock_movement};
+use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
 const DELETED: &str = "Deleted";
@@ -128,6 +130,596 @@ impl<T> Page<T> {
             per_page: q.per_page(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Customers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerInput {
+    pub name: String,
+    pub code: Option<String>,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub zip: Option<String>,
+    pub tax_number: Option<String>,
+    pub credit_limit: Decimal,
+    pub loyalty_points: Decimal,
+    pub note: Option<String>,
+}
+
+fn validate_customer(input: &CustomerInput) -> CmdResult<()> {
+    required(&input.name, "customer name")?;
+    if input.credit_limit < Decimal::ZERO {
+        return Err(CmdError::Validation("credit limit cannot be negative".into()));
+    }
+    if input.loyalty_points < Decimal::ZERO {
+        return Err(CmdError::Validation("loyalty points cannot be negative".into()));
+    }
+    Ok(())
+}
+
+/// Blank text becomes null rather than an empty string the server re-trims on write.
+fn text(raw: Option<String>) -> Option<String> {
+    raw.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+#[tauri::command]
+pub async fn list_customers(query: PageQuery) -> CmdResult<Page<CustomerView>> {
+    crate::commands_auth::require_permission(db(), "customer-list").await?;
+    let db = db();
+    let mut q = customer::Entity::find().filter(customer::Column::DelStatus.eq(LIVE));
+
+    if let Some(term) = query.term() {
+        let like = like_term(&term);
+        q = q.filter(
+            Condition::any()
+                .add(customer::Column::Name.contains(like.clone()))
+                .add(customer::Column::Code.contains(like.clone()))
+                .add(customer::Column::Phone.contains(like.clone()))
+                .add(customer::Column::Email.contains(like)),
+        );
+    }
+
+    let total = q.clone().count(db).await?;
+    let rows = q
+        .order_by_asc(customer::Column::Name)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(db)
+        .await?;
+
+    // The balance is summed per row rather than joined, so a page of 20 costs 20
+    // aggregates rather than a correlated subquery per column of every row.
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let balance = customer_balance_in(db, row.id).await?;
+        views.push(CustomerView::from_row(row, balance));
+    }
+    Ok(Page::new(views, total, &query))
+}
+
+#[tauri::command]
+pub async fn create_customer(input: CustomerInput) -> CmdResult<CustomerView> {
+    crate::commands_auth::require_permission(db(), "customer-create").await?;
+    create_customer_in(db(), input).await
+}
+
+pub async fn create_customer_in<C: ConnectionTrait>(conn: &C, input: CustomerInput) -> CmdResult<CustomerView> {
+    validate_customer(&input)?;
+    let name = required(&input.name, "customer name")?;
+
+    let code = text(input.code.clone());
+    if let Some(ref code) = code {
+        if customer::Entity::find()
+            .filter(customer::Column::Code.eq(code))
+            .filter(customer::Column::DelStatus.eq(LIVE))
+            .one(conn)
+            .await?
+            .is_some()
+        {
+            return Err(CmdError::Conflict(format!("customer code {code} is already used")));
+        }
+    }
+
+    let row = customer::ActiveModel {
+        name: Set(name),
+        code: Set(code),
+        email: Set(text(input.email.clone())),
+        phone: Set(text(input.phone.clone())),
+        address: Set(text(input.address.clone())),
+        city: Set(text(input.city.clone())),
+        country: Set(text(input.country.clone())),
+        zip: Set(text(input.zip.clone())),
+        tax_number: Set(text(input.tax_number.clone())),
+        credit_limit: Set(input.credit_limit),
+        loyalty_points: Set(input.loyalty_points),
+        note: Set(text(input.note.clone())),
+        photo: Set(None),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(crate::migration::now()),
+        updated_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+
+    Ok(CustomerView::from_row(row, Decimal::ZERO))
+}
+
+#[tauri::command]
+pub async fn update_customer(id: i32, input: CustomerInput) -> CmdResult<CustomerView> {
+    crate::commands_auth::require_permission(db(), "customer-edit").await?;
+    validate_customer(&input)?;
+    let db = db();
+    let found = customer::Entity::find_by_id(id)
+        .filter(customer::Column::DelStatus.eq(LIVE))
+        .one(db)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("customer".into()))?;
+
+    let balance = customer_balance_in(db, id).await?;
+    let mut am: customer::ActiveModel = found.into();
+    am.name = Set(required(&input.name, "customer name")?);
+    am.email = Set(text(input.email.clone()));
+    am.phone = Set(text(input.phone.clone()));
+    am.address = Set(text(input.address.clone()));
+    am.city = Set(text(input.city.clone()));
+    am.country = Set(text(input.country.clone()));
+    am.zip = Set(text(input.zip.clone()));
+    am.tax_number = Set(text(input.tax_number.clone()));
+    am.credit_limit = Set(input.credit_limit);
+    am.loyalty_points = Set(input.loyalty_points);
+    am.note = Set(text(input.note.clone()));
+    am.updated_at = Set(crate::migration::now());
+    let row = am.update(db).await?;
+
+    Ok(CustomerView::from_row(row, balance))
+}
+
+/// Marks the row deleted rather than removing it, so sales keep naming a customer.
+#[tauri::command]
+pub async fn delete_customer(id: i32) -> CmdResult<()> {
+    crate::commands_auth::require_permission(db(), "customer-destroy").await?;
+    delete_customer_in(db(), id).await
+}
+
+pub async fn delete_customer_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResult<()> {
+    let found = customer::Entity::find_by_id(id)
+        .filter(customer::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("customer".into()))?;
+
+    // The receipt foreign key restricts, so a customer who has paid cannot be
+    // deleted at all — which is the honest answer: their payment history is the
+    // reason the row matters.
+    if customer_receive::Entity::find()
+        .filter(customer_receive::Column::CustomerId.eq(id))
+        .one(conn)
+        .await?
+        .is_some()
+    {
+        return Err(CmdError::Conflict(
+            "this customer has payments recorded and cannot be deleted".into(),
+        ));
+    }
+
+    let mut am: customer::ActiveModel = found.into();
+    am.del_status = Set(DELETED.to_owned());
+    am.updated_at = Set(crate::migration::now());
+    am.update(conn).await?;
+    Ok(())
+}
+
+/// A customer plus what they owe.
+///
+/// `balance` is derived: completed sales less receipts. Nothing stores it, because a
+/// stored balance is a read-modify-write that two concurrent sales can interleave.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerView {
+    pub id: i32,
+    pub name: String,
+    pub code: Option<String>,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub zip: Option<String>,
+    pub tax_number: Option<String>,
+    pub credit_limit: Decimal,
+    pub loyalty_points: Decimal,
+    pub note: Option<String>,
+    pub photo: Option<String>,
+    pub created_at: NaiveDateTime,
+    pub balance: Decimal,
+    /// What they may still take on credit. Negative once they are over the limit.
+    pub credit_available: Decimal,
+}
+
+impl CustomerView {
+    fn from_row(row: customer::Model, balance: Decimal) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            code: row.code,
+            email: row.email,
+            phone: row.phone,
+            address: row.address,
+            city: row.city,
+            country: row.country,
+            zip: row.zip,
+            tax_number: row.tax_number,
+            credit_limit: row.credit_limit,
+            loyalty_points: row.loyalty_points,
+            note: row.note,
+            photo: row.photo,
+            created_at: row.created_at,
+            balance,
+            credit_available: row.credit_limit - balance,
+        }
+    }
+}
+
+/// Completed sales less receipts. Drafts are excluded: a draft is a basket nobody
+/// has paid for, so counting it would show a debt that does not exist.
+///
+/// `SUM` over no rows is `NULL` rather than 0, so both reads are `Option` and the
+/// zero is supplied here — same reason as `on_hand_in`.
+pub async fn customer_balance_in<C: ConnectionTrait>(conn: &C, customer_id: i32) -> CmdResult<Decimal> {
+    let charged = sale::Entity::find()
+        .select_only()
+        .column_as(sale::Column::GrandTotal.sum(), "total")
+        .filter(sale::Column::CustomerId.eq(customer_id))
+        .filter(sale::Column::Status.eq("Completed"))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
+
+    let paid = customer_receive::Entity::find()
+        .select_only()
+        .column_as(customer_receive::Column::Amount.sum(), "total")
+        .filter(customer_receive::Column::CustomerId.eq(customer_id))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
+
+    Ok((charged - paid).round_dp(MONEY_SCALE))
+}
+
+#[tauri::command]
+pub async fn customer_balance(id: i32) -> CmdResult<Decimal> {
+    crate::commands_auth::require_permission(db(), "customer-show").await?;
+    customer_balance_in(db(), id).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveInput {
+    pub amount: Decimal,
+    pub reference: Option<String>,
+    /// Optional so the caller can leave it out; defaults to now.
+    pub paid_at: Option<NaiveDateTime>,
+}
+
+#[tauri::command]
+pub async fn record_customer_receipt(customer_id: i32, input: ReceiveInput) -> CmdResult<customer_receive::Model> {
+    crate::commands_auth::require_permission(db(), "customer-edit").await?;
+    record_customer_receipt_in(db(), customer_id, input).await
+}
+
+pub async fn record_customer_receipt_in<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: i32,
+    input: ReceiveInput,
+) -> CmdResult<customer_receive::Model> {
+    if input.amount <= Decimal::ZERO {
+        return Err(CmdError::Validation("amount must be greater than zero".into()));
+    }
+    customer::Entity::find_by_id(customer_id)
+        .filter(customer::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("customer".into()))?;
+
+    Ok(customer_receive::ActiveModel {
+        customer_id: Set(customer_id),
+        amount: Set(input.amount),
+        reference: Set(text(input.reference)),
+        paid_at: Set(input.paid_at.unwrap_or_else(crate::migration::now)),
+        created_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?)
+}
+
+#[tauri::command]
+pub async fn list_customer_receipts(customer_id: i32) -> CmdResult<Vec<customer_receive::Model>> {
+    crate::commands_auth::require_permission(db(), "customer-show").await?;
+    let db = db();
+    customer_receive::Entity::find()
+        .filter(customer_receive::Column::CustomerId.eq(customer_id))
+        .order_by_desc(customer_receive::Column::PaidAt)
+        .all(db)
+        .await
+        .map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
+// Suppliers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierInput {
+    pub name: String,
+    pub code: Option<String>,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub zip: Option<String>,
+    pub tax_number: Option<String>,
+    pub opening_balance: Decimal,
+    pub note: Option<String>,
+}
+
+#[tauri::command]
+pub async fn list_suppliers(query: PageQuery) -> CmdResult<Page<SupplierView>> {
+    crate::commands_auth::require_permission(db(), "supplier-list").await?;
+    let db = db();
+    let mut q = supplier::Entity::find().filter(supplier::Column::DelStatus.eq(LIVE));
+
+    if let Some(term) = query.term() {
+        let like = like_term(&term);
+        q = q.filter(
+            Condition::any()
+                .add(supplier::Column::Name.contains(like.clone()))
+                .add(supplier::Column::Code.contains(like.clone()))
+                .add(supplier::Column::Phone.contains(like.clone()))
+                .add(supplier::Column::Email.contains(like)),
+        );
+    }
+
+    let total = q.clone().count(db).await?;
+    let rows = q
+        .order_by_asc(supplier::Column::Name)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(db)
+        .await?;
+
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let balance = supplier_balance_in(db, row.id).await?;
+        views.push(SupplierView::from_row(row, balance));
+    }
+    Ok(Page::new(views, total, &query))
+}
+
+#[tauri::command]
+pub async fn create_supplier(input: SupplierInput) -> CmdResult<SupplierView> {
+    crate::commands_auth::require_permission(db(), "supplier-create").await?;
+    let db = db();
+    let name = required(&input.name, "supplier name")?;
+
+    let code = text(input.code.clone());
+    if let Some(ref code) = code {
+        if supplier::Entity::find()
+            .filter(supplier::Column::Code.eq(code))
+            .filter(supplier::Column::DelStatus.eq(LIVE))
+            .one(db)
+            .await?
+            .is_some()
+        {
+            return Err(CmdError::Conflict(format!("supplier code {code} is already used")));
+        }
+    }
+
+    let row = supplier::ActiveModel {
+        name: Set(name),
+        code: Set(code),
+        email: Set(text(input.email.clone())),
+        phone: Set(text(input.phone.clone())),
+        address: Set(text(input.address.clone())),
+        city: Set(text(input.city.clone())),
+        country: Set(text(input.country.clone())),
+        zip: Set(text(input.zip.clone())),
+        tax_number: Set(text(input.tax_number.clone())),
+        opening_balance: Set(input.opening_balance),
+        note: Set(text(input.note.clone())),
+        photo: Set(None),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(crate::migration::now()),
+        updated_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?;
+
+    Ok(SupplierView::from_row(row, input.opening_balance))
+}
+
+#[tauri::command]
+pub async fn update_supplier(id: i32, input: SupplierInput) -> CmdResult<SupplierView> {
+    crate::commands_auth::require_permission(db(), "supplier-edit").await?;
+    let db = db();
+    let found = supplier::Entity::find_by_id(id)
+        .filter(supplier::Column::DelStatus.eq(LIVE))
+        .one(db)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("supplier".into()))?;
+
+    let balance = supplier_balance_in(db, id).await?;
+    let mut am: supplier::ActiveModel = found.into();
+    am.name = Set(required(&input.name, "supplier name")?);
+    am.email = Set(text(input.email.clone()));
+    am.phone = Set(text(input.phone.clone()));
+    am.address = Set(text(input.address.clone()));
+    am.city = Set(text(input.city.clone()));
+    am.country = Set(text(input.country.clone()));
+    am.zip = Set(text(input.zip.clone()));
+    am.tax_number = Set(text(input.tax_number.clone()));
+    am.opening_balance = Set(input.opening_balance);
+    am.note = Set(text(input.note.clone()));
+    am.updated_at = Set(crate::migration::now());
+    let row = am.update(db).await?;
+
+    Ok(SupplierView::from_row(row, balance))
+}
+
+#[tauri::command]
+pub async fn delete_supplier(id: i32) -> CmdResult<()> {
+    crate::commands_auth::require_permission(db(), "supplier-destroy").await?;
+    let db = db();
+    let found = supplier::Entity::find_by_id(id)
+        .filter(supplier::Column::DelStatus.eq(LIVE))
+        .one(db)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("supplier".into()))?;
+
+    if supplier_payment::Entity::find()
+        .filter(supplier_payment::Column::SupplierId.eq(id))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Err(CmdError::Conflict(
+            "this supplier has payments recorded and cannot be deleted".into(),
+        ));
+    }
+
+    let mut am: supplier::ActiveModel = found.into();
+    am.del_status = Set(DELETED.to_owned());
+    am.updated_at = Set(crate::migration::now());
+    am.update(db).await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierView {
+    pub id: i32,
+    pub name: String,
+    pub code: Option<String>,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub zip: Option<String>,
+    pub tax_number: Option<String>,
+    pub opening_balance: Decimal,
+    pub note: Option<String>,
+    pub photo: Option<String>,
+    pub created_at: NaiveDateTime,
+    /// What we owe them. Positive means the shop is in debt to this supplier.
+    pub balance: Decimal,
+}
+
+impl SupplierView {
+    fn from_row(row: supplier::Model, balance: Decimal) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            code: row.code,
+            email: row.email,
+            phone: row.phone,
+            address: row.address,
+            city: row.city,
+            country: row.country,
+            zip: row.zip,
+            tax_number: row.tax_number,
+            opening_balance: row.opening_balance,
+            note: row.note,
+            photo: row.photo,
+            created_at: row.created_at,
+            balance,
+        }
+    }
+}
+
+/// What we owe: the opening balance less payments. Purchases are Stage 6, so nothing
+/// else moves this number yet — adding them later is one more term in the sum.
+pub async fn supplier_balance_in<C: ConnectionTrait>(conn: &C, supplier_id: i32) -> CmdResult<Decimal> {
+    let opening = supplier::Entity::find_by_id(supplier_id)
+        .select_only()
+        .column(supplier::Column::OpeningBalance)
+        .into_tuple::<Decimal>()
+        .one(conn)
+        .await?
+        .unwrap_or(Decimal::ZERO);
+
+    let paid = supplier_payment::Entity::find()
+        .select_only()
+        .column_as(supplier_payment::Column::Amount.sum(), "total")
+        .filter(supplier_payment::Column::SupplierId.eq(supplier_id))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
+
+    Ok((opening - paid).round_dp(MONEY_SCALE))
+}
+
+#[tauri::command]
+pub async fn supplier_balance(id: i32) -> CmdResult<Decimal> {
+    crate::commands_auth::require_permission(db(), "supplier-show").await?;
+    supplier_balance_in(db(), id).await
+}
+
+#[tauri::command]
+pub async fn record_supplier_payment(
+    supplier_id: i32,
+    input: ReceiveInput,
+) -> CmdResult<supplier_payment::Model> {
+    crate::commands_auth::require_permission(db(), "supplier-edit").await?;
+    if input.amount <= Decimal::ZERO {
+        return Err(CmdError::Validation("amount must be greater than zero".into()));
+    }
+    let db = db();
+    supplier::Entity::find_by_id(supplier_id)
+        .filter(supplier::Column::DelStatus.eq(LIVE))
+        .one(db)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("supplier".into()))?;
+
+    Ok(supplier_payment::ActiveModel {
+        supplier_id: Set(supplier_id),
+        amount: Set(input.amount),
+        reference: Set(text(input.reference)),
+        paid_at: Set(input.paid_at.unwrap_or_else(crate::migration::now)),
+        created_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?)
+}
+
+#[tauri::command]
+pub async fn list_supplier_payments(supplier_id: i32) -> CmdResult<Vec<supplier_payment::Model>> {
+    crate::commands_auth::require_permission(db(), "supplier-show").await?;
+    let db = db();
+    supplier_payment::Entity::find()
+        .filter(supplier_payment::Column::SupplierId.eq(supplier_id))
+        .order_by_desc(supplier_payment::Column::PaidAt)
+        .all(db)
+        .await
+        .map_err(Into::into)
 }
 
 // ---------------------------------------------------------------------------

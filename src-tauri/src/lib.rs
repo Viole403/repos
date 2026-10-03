@@ -60,6 +60,20 @@ pub fn run() {
             commands_auth::create_role,
             commands_auth::set_role_permissions,
             commands_auth::delete_role,
+            commands::list_customers,
+            commands::create_customer,
+            commands::update_customer,
+            commands::delete_customer,
+            commands::customer_balance,
+            commands::record_customer_receipt,
+            commands::list_customer_receipts,
+            commands::list_suppliers,
+            commands::create_supplier,
+            commands::update_supplier,
+            commands::delete_supplier,
+            commands::supplier_balance,
+            commands::record_supplier_payment,
+            commands::list_supplier_payments,
             commands_auth::has_permission,
             commands_auth::my_permissions,
         ])
@@ -80,7 +94,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
     use crate::entities::sales::stock_movement::MovementType;
     use crate::entities::sales::{sale, sale_detail, stock_movement};
-    use crate::entities::trade::{customer, supplier};
+    use crate::entities::trade::{customer, supplier, supplier_payment};
     use sea_orm::prelude::Decimal;
     use sea_orm::ActiveValue::Set;
     use sea_orm::{
@@ -192,6 +206,48 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// An item with a code, since `items.code` is the only unique column.
+    async fn seed_customer(db: &DatabaseConnection, name: &str, credit_limit: Decimal) -> i32 {
+        let now = migration::now();
+        customer::ActiveModel {
+            name: Set(name.to_owned()),
+            credit_limit: Set(credit_limit),
+            loyalty_points: Set(Decimal::ZERO),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("seed customer")
+        .id
+    }
+
+    /// A completed sale for one customer. `checkout` would be the real writer, but the
+    /// balance only cares about status and total.
+    async fn seed_customer_sale(db: &DatabaseConnection, customer_id: i32, total: Decimal, status: &str) -> i32 {
+        let now = migration::now();
+        sale::ActiveModel {
+            invoice_no: Set(format!("PENDING-{customer_id}-{total}")),
+            status: Set(status.to_owned()),
+            subtotal: Set(total),
+            discount_total: Set(Decimal::ZERO),
+            tax_total: Set(Decimal::ZERO),
+            grand_total: Set(total),
+            paid_total: Set(total),
+            payment_method: Set("Cash".into()),
+            customer_id: Set(Some(customer_id)),
+            note: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("seed sale")
+        .id
+    }
+
     async fn seed_item(db: &DatabaseConnection, name: &str) -> i32 {
         let now = migration::now();
         item::ActiveModel {
@@ -1109,5 +1165,166 @@ mod tests {
         // nowhere else.
         assert_eq!(customer::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(supplier::Entity::find().count(&db).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_customer_with_no_sales_owes_nothing() {
+        let db = db::init_for_tests().await;
+        let id = seed_customer(&db, "Walk-in", Decimal::ZERO).await;
+        assert_eq!(commands::customer_balance_in(&db, id).await.unwrap(), Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_draft_sale_is_not_a_debt() {
+        let db = db::init_for_tests().await;
+        let id = seed_customer(&db, "Browser", Decimal::ZERO).await;
+        seed_customer_sale(&db, id, Decimal::new(250_000, 3), "Draft").await;
+        assert_eq!(
+            commands::customer_balance_in(&db, id).await.unwrap(),
+            Decimal::ZERO,
+            "a draft is a basket nobody has paid for, so it is not a debt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_receipt_reduces_the_balance() {
+        let db = db::init_for_tests().await;
+        let id = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        seed_customer_sale(&db, id, Decimal::new(100_000, 3), "Completed").await;
+        seed_customer_sale(&db, id, Decimal::new(150_500, 3), "Completed").await;
+        assert_eq!(commands::customer_balance_in(&db, id).await.unwrap(), Decimal::new(250_500, 3));
+
+        commands::record_customer_receipt_in(
+            &db,
+            id,
+            commands::ReceiveInput { amount: Decimal::new(50_500, 3), reference: None, paid_at: None },
+        )
+        .await
+        .expect("record a receipt");
+
+        assert_eq!(
+            commands::customer_balance_in(&db, id).await.unwrap(),
+            Decimal::new(200_000, 3),
+            "a payment that does not reduce the debt is not a payment"
+        );
+    }
+
+    #[tokio::test]
+    async fn paying_more_than_owed_leaves_a_credit_balance() {
+        let db = db::init_for_tests().await;
+        let id = seed_customer(&db, "Overpayer", Decimal::ZERO).await;
+        seed_customer_sale(&db, id, Decimal::new(100_000, 3), "Completed").await;
+        commands::record_customer_receipt_in(
+            &db,
+            id,
+            commands::ReceiveInput { amount: Decimal::new(150_000, 3), reference: None, paid_at: None },
+        )
+        .await
+        .expect("record an overpayment");
+
+        assert_eq!(
+            commands::customer_balance_in(&db, id).await.unwrap(),
+            Decimal::new(-50_000, 3),
+            "overpayment is negative, not clamped to zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_customer_with_payments_cannot_be_deleted() {
+        let db = db::init_for_tests().await;
+        let id = seed_customer(&db, "Has paid", Decimal::ZERO).await;
+        commands::record_customer_receipt_in(
+            &db,
+            id,
+            commands::ReceiveInput { amount: Decimal::new(10_000, 3), reference: None, paid_at: None },
+        )
+        .await
+        .expect("record a receipt");
+
+        assert!(
+            commands::delete_customer_in(&db, id).await.is_err(),
+            "deleting them strands the payment history that made the row matter"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_receipt_of_zero_is_refused() {
+        let db = db::init_for_tests().await;
+        let id = seed_customer(&db, "Zero", Decimal::ZERO).await;
+        assert!(
+            commands::record_customer_receipt_in(
+                &db,
+                id,
+                commands::ReceiveInput { amount: Decimal::ZERO, reference: None, paid_at: None },
+            )
+            .await
+            .is_err(),
+            "a zero receipt is a no-op row that makes the ledger lie"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_supplier_balance_is_the_opening_balance_less_payments() {
+        let db = db::init_for_tests().await;
+        let now = migration::now();
+        let id = supplier::ActiveModel {
+            name: Set("Wholesale".into()),
+            opening_balance: Set(Decimal::new(5_000_000, 3)),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap()
+        .id;
+        assert_eq!(commands::supplier_balance_in(&db, id).await.unwrap(), Decimal::new(5_000_000, 3));
+
+        supplier_payment::ActiveModel {
+            supplier_id: Set(id),
+            amount: Set(Decimal::new(2_000_000, 3)),
+            paid_at: Set(now),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            commands::supplier_balance_in(&db, id).await.unwrap(),
+            Decimal::new(3_000_000, 3),
+            "a payment to a supplier does not reduce what the shop owes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_customer_code_is_refused() {
+        let db = db::init_for_tests().await;
+        let input = || commands::CustomerInput {
+            name: "Someone".into(),
+            code: Some(" CUST-1 ".into()),
+            email: None,
+            phone: None,
+            address: None,
+            city: None,
+            country: None,
+            zip: None,
+            tax_number: None,
+            credit_limit: Decimal::ZERO,
+            loyalty_points: Decimal::ZERO,
+            note: None,
+        };
+        let first = commands::create_customer_in(&db, input()).await.expect("first");
+        assert_eq!(first.code.as_deref(), Some("CUST-1"), "the code should be trimmed");
+
+        assert!(
+            matches!(
+                commands::create_customer_in(&db, input()).await,
+                Err(commands::CmdError::Conflict(_))
+            ),
+            "two customers sharing a member number makes receipts ambiguous"
+        );
     }
 }
