@@ -23,6 +23,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::AuthAndRoles),
             Box::new(Migrations::MasterData),
             Box::new(Migrations::Items),
+            Box::new(Migrations::SalesAndStock),
         ]
     }
 }
@@ -32,6 +33,7 @@ pub enum Migrations {
     AuthAndRoles,
     MasterData,
     Items,
+    SalesAndStock,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -61,6 +63,7 @@ impl MigrationName for Migrations {
             Migrations::AuthAndRoles => "auth_and_roles",
             Migrations::MasterData => "master_data",
             Migrations::Items => "items",
+            Migrations::SalesAndStock => "sales_and_stock",
         }
     }
 }
@@ -72,6 +75,7 @@ impl MigrationTrait for Migrations {
             Migrations::AuthAndRoles => auth_and_roles(manager).await?,
             Migrations::MasterData => master_data(manager).await?,
             Migrations::Items => items(manager).await?,
+            Migrations::SalesAndStock => sales_and_stock(manager).await?,
         }
         Ok(())
     }
@@ -79,6 +83,15 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::SalesAndStock => {
+                for t in [
+                    StockMovements::Table.into_iden(),
+                    SaleDetails::Table.into_iden(),
+                    Sales::Table.into_iden(),
+                ] {
+                    manager.drop_table(Table::drop().table(t).if_exists().to_owned()).await?;
+                }
+            }
             Migrations::Items => manager
                 .drop_table(Table::drop().table(Items::Table).if_exists().to_owned())
                 .await?,
@@ -318,6 +331,181 @@ async fn items(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Sales, sale lines, and the stock ledger
+// ---------------------------------------------------------------------------
+
+/// Sale header, its lines, and the append-only stock ledger.
+///
+/// `stock_movements` is the load-bearing table here. On-hand quantity is
+/// *derived* as the sum of a row's `quantity` values, so there is deliberately no
+/// quantity column on `items`: nothing can drift out of sync with the ledger,
+/// because there is nothing to drift. `balance_after` records what the sum was
+/// immediately after that row landed, which turns "the count looks wrong" into
+/// "these two movements disagree".
+///
+/// `quantity` is **signed**: negative when stock leaves, positive when it arrives.
+/// That single convention means a receipt and a sale are the same kind of row and
+/// an audit never has to special-case a direction.
+async fn sales_and_stock(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(Sales::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Sales::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                // Human-facing reference. Derived from the primary key so it cannot
+                // collide — see `commands::checkout`.
+                .col(ColumnDef::new(Sales::InvoiceNo).string().not_null().unique_key())
+                // `Draft` or `Completed`. Checkout writes a draft first and promotes it
+                // on payment, so an app death mid-sale leaves a recoverable draft
+                // instead of a half-written sale.
+                .col(ColumnDef::new(Sales::Status).string().not_null().default("Draft"))
+                .col(ColumnDef::new(Sales::Subtotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Sales::DiscountTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Sales::TaxTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Sales::GrandTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                // Below `grand_total` is a part-paid / credit sale; above it is cash
+                // handed back as change. Both are legal, negative is not.
+                .col(ColumnDef::new(Sales::PaidTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Sales::PaymentMethod).string().not_null().default("Cash"))
+                // No foreign key yet: the customers table arrives in Stage 3 and
+                // inventing a stub table here would fork the schema.
+                .col(ColumnDef::new(Sales::CustomerId).integer().null())
+                .col(ColumnDef::new(Sales::Note).string().null())
+                .col(ColumnDef::new(Sales::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Sales::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_sales_created_at")
+                .table(Sales::Table)
+                .col(Sales::CreatedAt)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_sales_status")
+                .table(Sales::Table)
+                .col(Sales::Status)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(SaleDetails::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(SaleDetails::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(SaleDetails::SaleId).integer().not_null())
+                .col(ColumnDef::new(SaleDetails::ItemId).integer().not_null())
+                // Snapshotted from `items.name` at sale time. A rename afterwards must
+                // not rewrite what the customer was actually charged for.
+                .col(ColumnDef::new(SaleDetails::ItemName).string().not_null())
+                .col(ColumnDef::new(SaleDetails::UnitPrice).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(SaleDetails::Quantity).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(SaleDetails::Discount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(SaleDetails::LineTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(SaleDetails::TaxAmount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(SaleDetails::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                // Deleting the sale removes its lines — they have no meaning alone.
+                .foreign_key(&mut ForeignKey::create().name("fk_sale_details_sale").from(SaleDetails::Table, SaleDetails::SaleId).to(Sales::Table, Sales::Id).on_delete(ForeignKeyAction::Cascade).to_owned())
+                // RESTRICT, not CASCADE: deleting an item must not erase the record
+                // that it was once sold. Items are soft-deleted anyway, so this only
+                // fires on a hard delete.
+                .foreign_key(&mut ForeignKey::create().name("fk_sale_details_item").from(SaleDetails::Table, SaleDetails::ItemId).to(Items::Table, Items::Id).on_delete(ForeignKeyAction::Restrict).to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_sale_details_sale")
+                .table(SaleDetails::Table)
+                .col(SaleDetails::SaleId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(StockMovements::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(StockMovements::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(StockMovements::ItemId).integer().not_null())
+                .col(ColumnDef::new(StockMovements::SaleId).integer().null())
+                // Constrained vocabulary (`entities::sales::stock_movement::MovementType`)
+                // stored as its string form, so the ledger stays readable in SQL.
+                .col(ColumnDef::new(StockMovements::MovementType).string().not_null())
+                // SIGNED: negative leaves the shelf, positive arrives. On-hand is
+                // SUM(quantity) — there is no quantity column on `items` to fall out
+                // of sync with.
+                .col(ColumnDef::new(StockMovements::Quantity).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                // Free text: receipt number, adjustment reason code, transfer note.
+                .col(ColumnDef::new(StockMovements::Reference).string().null())
+                // On-hand immediately after this row. Makes a discrepancy traceable to
+                // one specific movement instead of to a number that drifted.
+                .col(ColumnDef::new(StockMovements::BalanceAfter).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(StockMovements::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(&mut ForeignKey::create().name("fk_stock_movements_item").from(StockMovements::Table, StockMovements::ItemId).to(Items::Table, Items::Id).on_delete(ForeignKeyAction::Restrict).to_owned())
+                // SET NULL, not CASCADE: a ledger row outlives the sale that caused it.
+                // A return written after the sale is purged still has to be on record.
+                .foreign_key(&mut ForeignKey::create().name("fk_stock_movements_sale").from(StockMovements::Table, StockMovements::SaleId).to(Sales::Table, Sales::Id).on_delete(ForeignKeyAction::SetNull).to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    // Non-unique indexes cannot be inlined into CREATE TABLE — `CONSTRAINT "x" ("c")`
+    // is rejected by both SQLite and Postgres. Each one is its own statement.
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_stock_movements_item")
+                .table(StockMovements::Table)
+                .col(StockMovements::ItemId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_stock_movements_sale")
+                .table(StockMovements::Table)
+                .col(StockMovements::SaleId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_stock_movements_created_at")
+                .table(StockMovements::Table)
+                .col(StockMovements::CreatedAt)
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
+}
+
 #[derive(Iden)]
 enum Users {
     Table,
@@ -429,6 +617,52 @@ enum Items {
     DelStatus,
     CreatedAt,
     UpdatedAt,
+}
+
+#[derive(Iden)]
+enum Sales {
+    Table,
+    Id,
+    InvoiceNo,
+    Status,
+    Subtotal,
+    DiscountTotal,
+    TaxTotal,
+    GrandTotal,
+    PaidTotal,
+    PaymentMethod,
+    CustomerId,
+    Note,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum SaleDetails {
+    Table,
+    Id,
+    SaleId,
+    ItemId,
+    ItemName,
+    UnitPrice,
+    Quantity,
+    Discount,
+    LineTotal,
+    TaxAmount,
+    CreatedAt,
+}
+
+#[derive(Iden)]
+enum StockMovements {
+    Table,
+    Id,
+    ItemId,
+    SaleId,
+    MovementType,
+    Quantity,
+    Reference,
+    BalanceAfter,
+    CreatedAt,
 }
 
 
