@@ -9,7 +9,7 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, PaginatorTrait,
     QueryFilter, QueryOrder,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::auth;
 use crate::commands::CmdError;
@@ -396,6 +396,188 @@ pub async fn delete_user_in<C: sea_orm::ConnectionTrait>(conn: &C, id: i32) -> C
         auth::sign_out();
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Roles
+// ---------------------------------------------------------------------------
+
+/// A role with the permissions it grants, for the role picker in settings.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleView {
+    pub id: i32,
+    pub name: String,
+    /// `"Master"` bypasses the pivot, so it lists every permission.
+    pub role_type: String,
+    pub permissions: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn list_roles() -> CmdResult<Vec<RoleView>> {
+    let conn = db();
+    require_account(conn, auth::current_user_id(), "role-list").await?;
+    list_roles_in(conn).await
+}
+
+pub async fn list_roles_in<C: sea_orm::ConnectionTrait>(conn: &C) -> CmdResult<Vec<RoleView>> {
+    let live_roles = roles::Entity::find()
+        .filter(roles::Column::DelStatus.eq("Live"))
+        .order_by_asc(roles::Column::Name)
+        .all(conn)
+        .await?;
+
+    let live_permissions: Vec<permissions::Model> = permissions::Entity::find()
+        .filter(permissions::Column::DelStatus.eq("Live"))
+        .order_by_asc(permissions::Column::Name)
+        .all(conn)
+        .await?;
+
+    let held: Vec<i32> = role_permissions::Entity::find()
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|rp| rp.permission_id)
+        .collect();
+
+    let views = live_roles
+        .into_iter()
+        .map(|role| {
+            // A Master role is never granted through the pivot, so it would report
+            // no permissions at all if the pivot were the only source here.
+            let master = role.role_type == MASTER_ROLE_TYPE;
+            let names = live_permissions
+                .iter()
+                .filter(|p| master || held.contains(&p.id))
+                .map(|p| p.name.clone())
+                .collect();
+            RoleView {
+                id: role.id,
+                name: role.name,
+                role_type: role.role_type,
+                permissions: names,
+            }
+        })
+        .collect();
+
+    Ok(views)
+}
+
+#[tauri::command]
+pub async fn set_user_role(user_id: i32, role_id: i32) -> CmdResult<()> {
+    let conn = db();
+    require_account(conn, auth::current_user_id(), "user-edit").await?;
+    set_user_role_in(conn, user_id, role_id).await
+}
+
+/// Live accounts holding a `Master` role.
+async fn owner_count<C: sea_orm::ConnectionTrait>(conn: &C) -> CmdResult<u64> {
+    let owner_roles: Vec<i32> = roles::Entity::find()
+        .filter(roles::Column::RoleType.eq(MASTER_ROLE_TYPE))
+        .filter(roles::Column::DelStatus.eq("Live"))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+
+    let owner_ids: Vec<i32> = user_roles::Entity::find()
+        .filter(user_roles::Column::RoleId.is_in(owner_roles))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|ur| ur.user_id)
+        .collect();
+
+    live_users_among(conn, &owner_ids).await
+}
+
+async fn live_users_among<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    ids: &[i32],
+) -> CmdResult<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    Ok(users::Entity::find()
+        .filter(users::Column::Id.is_in(ids.to_vec()))
+        .filter(users::Column::DelStatus.eq("Live"))
+        .all(conn)
+        .await?
+        .len() as u64)
+}
+
+pub async fn set_user_role_in<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+    role_id: i32,
+) -> CmdResult<()> {
+    let role = roles::Entity::find_by_id(role_id)
+        .filter(roles::Column::DelStatus.eq("Live"))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("role".into()))?;
+
+    let target = users::Entity::find_by_id(user_id)
+        .filter(users::Column::DelStatus.eq("Live"))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("user".into()))?;
+
+    let held: Vec<i32> = user_roles::Entity::find()
+        .filter(user_roles::Column::UserId.eq(user_id))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|ur| ur.role_id)
+        .collect();
+
+    if role.role_type != MASTER_ROLE_TYPE {
+        if owner_count(conn).await? <= 1 && was_owner(&held, conn).await? {
+            return Err(CmdError::Forbidden(
+                "this is the only owner account, so its role cannot be changed".into(),
+            ));
+        }
+    } else if live_user_count(conn).await? > 1 {
+        // Assigning by name is what `create_user` refuses. Assigning by id is the same
+        // privilege through a different door unless it is refused here too.
+        return Err(CmdError::Forbidden(
+            "the owner role belongs to the first account and cannot be assigned to another"
+                .into(),
+        ));
+    }
+
+    // The pivot is additive, so this replaces rather than appends — otherwise an
+    // account assigned a second role silently keeps the first.
+    user_roles::Entity::delete_many()
+        .filter(user_roles::Column::UserId.eq(user_id))
+        .exec(conn)
+        .await?;
+
+    user_roles::ActiveModel {
+        user_id: Set(user_id),
+        role_id: Set(role_id),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+
+    // `users.role` is the label the sidebar shows, so it follows the pivot.
+    let mut am: users::ActiveModel = target.into();
+    am.role = Set(Some(role.name));
+    am.updated_at = Set(chrono::Utc::now());
+    am.update(conn).await?;
+
+    Ok(())
+}
+
+async fn was_owner<C: sea_orm::ConnectionTrait>(held: &[i32], conn: &C) -> CmdResult<bool> {
+    Ok(!roles::Entity::find()
+        .filter(roles::Column::Id.is_in(held.to_vec()))
+        .filter(roles::Column::RoleType.eq(MASTER_ROLE_TYPE))
+        .all(conn)
+        .await?
+        .is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -1253,6 +1435,199 @@ mod tests {
         require_account(&conn, Some(owner.id), "user-list")
             .await
             .expect("the owner holds user-list");
+    }
+
+    #[tokio::test]
+    async fn a_master_role_cannot_be_assigned_to_a_second_account() {
+        let conn = init_for_tests().await;
+        let owner = create_user_in(
+            &conn,
+            UserInput {
+                name: "Owner".into(),
+                email: "owner@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("first");
+
+        let clerk = create_user_in(
+            &conn,
+            UserInput {
+                name: "Clerk".into(),
+                email: "clerk@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: Some("Cashier".into()),
+            },
+        )
+        .await
+        .expect("second");
+
+        let owner_role = roles::Entity::find()
+            .filter(roles::Column::RoleType.eq(MASTER_ROLE_TYPE))
+            .one(&conn)
+            .await
+            .unwrap()
+            .expect("the first account's role");
+
+        // Assigning by name is what `resolve_role_label` refuses. Assigning by id is
+        // the same privilege reached through a different door unless it is refused
+        // here too.
+        let err = set_user_role_in(&conn, clerk.id, owner_role.id)
+            .await
+            .expect_err("the owner role must not be assignable");
+
+        assert!(
+            matches!(err, CmdError::Forbidden(_)),
+            "expected Forbidden, got {err:?}"
+        );
+        assert!(
+            !has_permission_in(&conn, clerk.id, "sale-pos").await.unwrap(),
+            "the clerk gained owner permissions"
+        );
+        // The owner's own assignment is untouched.
+        assert!(has_permission_in(&conn, owner.id, "sale-pos").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_only_owner_cannot_demote_itself() {
+        let conn = init_for_tests().await;
+        let owner = create_user_in(
+            &conn,
+            UserInput {
+                name: "Owner".into(),
+                email: "owner@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("first");
+
+        seed_role(&conn, "Cashier", "Staff").await;
+        let cashier = roles::Entity::find()
+            .filter(roles::Column::Name.eq("Cashier"))
+            .one(&conn)
+            .await
+            .unwrap()
+            .expect("cashier role");
+
+        assert!(
+            set_user_role_in(&conn, owner.id, cashier.id).await.is_err(),
+            "the last owner can demote itself, leaving nobody able to undo it"
+        );
+        assert!(
+            has_permission_in(&conn, owner.id, "sale-pos").await.unwrap(),
+            "the refused demotion took effect anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn assigning_a_role_replaces_rather_than_accumulates() {
+        let conn = init_for_tests().await;
+        create_user_in(
+            &conn,
+            UserInput {
+                name: "Owner".into(),
+                email: "owner@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("first");
+        let clerk = create_user_in(
+            &conn,
+            UserInput {
+                name: "Clerk".into(),
+                email: "clerk@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: Some("Cashier".into()),
+            },
+        )
+        .await
+        .expect("second");
+
+        async fn role_id(conn: &DatabaseConnection, name: &str) -> i32 {
+            roles::Entity::find()
+                .filter(roles::Column::Name.eq(name))
+                .one(conn)
+                .await
+                .expect("query")
+                .unwrap_or_else(|| panic!("{name} role"))
+                .id
+        }
+        let cashier = role_id(&conn, "Cashier").await;
+        seed_role(&conn, "Manager", "Staff").await;
+        let manager = role_id(&conn, "Manager").await;
+
+        set_user_role_in(&conn, clerk.id, manager).await.expect("assign");
+
+        let held: Vec<i32> = user_roles::Entity::find()
+            .filter(user_roles::Column::UserId.eq(clerk.id))
+            .all(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|ur| ur.role_id)
+            .collect();
+
+        assert_eq!(
+            held,
+            vec![manager],
+            "the pivot is additive, so assigning leaves the account holding both roles"
+        );
+        assert_ne!(cashier, manager);
+    }
+
+    #[tokio::test]
+    async fn a_soft_deleted_role_cannot_be_assigned() {
+        let conn = init_for_tests().await;
+        create_user_in(
+            &conn,
+            UserInput {
+                name: "Owner".into(),
+                email: "owner@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("first");
+        let clerk = create_user_in(
+            &conn,
+            UserInput {
+                name: "Clerk".into(),
+                email: "clerk@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: Some("Cashier".into()),
+            },
+        )
+        .await
+        .expect("second");
+
+        let cashier = roles::Entity::find()
+            .filter(roles::Column::Name.eq("Cashier"))
+            .one(&conn)
+            .await
+            .unwrap()
+            .expect("cashier role");
+        let mut am: roles::ActiveModel = cashier.clone().into();
+        am.del_status = Set("Deleted".into());
+        am.update(&conn).await.unwrap();
+
+        assert!(
+            set_user_role_in(&conn, clerk.id, cashier.id).await.is_err(),
+            "a deleted role still grants nothing, so assigning it must not look like success"
+        );
     }
 
     #[tokio::test]
