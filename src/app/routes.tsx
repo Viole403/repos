@@ -1,10 +1,13 @@
 import type { ReactNode } from "react";
 import type { RouteObject } from "react-router-dom";
+import { Navigate, Outlet } from "react-router-dom";
 import { AppShell } from "./AppShell";
+import { HOME_PATH, LOGIN_PATH, useAuth } from "./auth";
 import { Dashboard } from "./screens/Dashboard";
 import { ItemsList } from "./screens/ItemsList";
 import { Brands } from "./screens/Brands";
 import { ItemCategories } from "./screens/ItemCategories";
+import { Login, SessionLoading } from "./screens/Login";
 import { Register } from "./screens/Register";
 import { Drafts } from "./screens/Drafts";
 import { Units } from "./screens/Units";
@@ -41,9 +44,41 @@ const children: RouteObject[] = navItems.flatMap((item) => {
     });
 });
 
+/**
+ * Gate for everything behind the login. `replace` so the guarded URL does not
+ * sit in history — signing back in would otherwise bounce through it again.
+ *
+ * This is navigation only. Nothing here is a security boundary: the backend
+ * session cell decides who is signed in, not which URL the user reached.
+ */
+const RequireAuth = () => {
+    const { status } = useAuth();
+
+    if (status === "restoring") return <SessionLoading />;
+    if (status === "anonymous") return <Navigate to={LOGIN_PATH} replace />;
+    return <Outlet />;
+};
+
+/** The login route itself: a signed-in operator has no reason to see it. */
+const OnlyAnonymous = () => {
+    const { status } = useAuth();
+
+    if (status === "restoring") return <SessionLoading />;
+    if (status === "authenticated") return <Navigate to={HOME_PATH} replace />;
+    return <Login />;
+};
+
 export const routes: RouteObject[] = [
+    // Not in `navItems`: the login screen is full-screen by design, so a sidebar
+    // entry for it would be a link that leaves the sidebar.
+    { path: LOGIN_PATH, element: <OnlyAnonymous /> },
     {
-        element: <AppShell />,
-        children,
+        element: <RequireAuth />,
+        children: [
+            {
+                element: <AppShell />,
+                children,
+            },
+        ],
     },
 ];
