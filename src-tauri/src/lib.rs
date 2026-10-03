@@ -1,5 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+mod auth;
 mod commands;
+mod commands_auth;
 mod db;
 mod entities;
 mod migration;
@@ -46,6 +48,14 @@ pub fn run() {
             commands::list_draft_sales,
             commands::promote_draft,
             commands::discard_draft,
+            commands_auth::login,
+            commands_auth::logout,
+            commands_auth::current_user,
+            commands_auth::list_users,
+            commands_auth::create_user,
+            commands_auth::delete_user,
+            commands_auth::has_permission,
+            commands_auth::my_permissions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
