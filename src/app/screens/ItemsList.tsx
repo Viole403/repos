@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { SearchLg } from "@untitledui/icons";
+import { Plus, SearchLg } from "@untitledui/icons";
 import { Button } from "@/components/base/buttons/button";
 import { Input } from "@/components/base/input/input";
-import { Table, TableCard } from "@/components/application/table/table";
+import { Table, TableCard, TableRowActionsDropdown } from "@/components/application/table/table";
+import { ItemForm } from "./ItemForm";
 import { formatMoney, formatQuantity } from "@/app/format";
 import type { ItemView } from "@/app/ipc";
 import { listItems } from "@/app/ipc";
@@ -19,6 +20,9 @@ export const ItemsList = () => {
     const [term, setTerm] = useState("");
     const [page, setPage] = useState(1);
     const [state, setState] = useState<State>({ status: "loading" });
+    const [editing, setEditing] = useState<ItemView | null | undefined>(undefined);
+    // Bumped after a write so the fetch effect reruns; state alone would not.
+    const [reload, setReload] = useState(0);
 
     // Typing should not fire a query per keystroke; page resets so results stay in view.
     useEffect(() => {
@@ -46,7 +50,7 @@ export const ItemsList = () => {
         return () => {
             cancelled = true;
         };
-    }, [page, term]);
+    }, [page, term, reload]);
 
     const pages = state.status === "ready" ? Math.max(1, Math.ceil(state.total / PER_PAGE)) : 1;
 
@@ -57,14 +61,19 @@ export const ItemsList = () => {
                     title="Items"
                     description={state.status === "ready" ? `${state.total} in catalog` : "Loading catalog…"}
                     contentTrailing={
-                        <Input
-                            aria-label="Search items"
-                            icon={SearchLg}
-                            placeholder="Search name or code"
-                            value={search}
-                            onChange={(value) => setSearch(String(value))}
-                            className="w-full md:w-72"
-                        />
+                        <div className="flex w-full flex-col gap-3 md:flex-row md:w-auto">
+                            <Input
+                                aria-label="Search items"
+                                icon={SearchLg}
+                                placeholder="Search name or code"
+                                value={search}
+                                onChange={setSearch}
+                                className="w-full md:w-72"
+                            />
+                            <Button size="md" iconLeading={Plus} onPress={() => setEditing(null)}>
+                                New item
+                            </Button>
+                        </div>
                     }
                 />
 
@@ -86,6 +95,7 @@ export const ItemsList = () => {
                             <Table.Head label="Sale unit" />
                             <Table.Head label="Purchase" className="text-right" />
                             <Table.Head label="Sale" className="text-right" />
+                            <Table.Head label="" className="w-16" />
                         </Table.Header>
                         <Table.Body>
                             {state.rows.map((item) => (
@@ -107,12 +117,28 @@ export const ItemsList = () => {
                                     </Table.Cell>
                                     <Table.Cell className="text-right">{formatMoney(item.purchasePrice)}</Table.Cell>
                                     <Table.Cell className="text-right font-medium text-primary">{formatMoney(item.salePrice)}</Table.Cell>
+                                    <Table.Cell>
+                                        <TableRowActionsDropdown onEdit={() => setEditing(item)} />
+                                    </Table.Cell>
                                 </Table.Row>
                             ))}
                         </Table.Body>
                     </Table>
                 )}
             </TableCard.Root>
+
+            {editing !== undefined && (
+                <ItemForm
+                    {...(editing ? { item: editing } : {})}
+                    onClose={() => setEditing(undefined)}
+                    onSaved={() => {
+                        setEditing(undefined);
+                        // Stay on page 1 after a create so the new row is visible.
+                        setPage(1);
+                        setReload((n) => n + 1);
+                    }}
+                />
+            )}
 
             <div className="flex items-center justify-between">
                 <p className="text-sm text-tertiary">

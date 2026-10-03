@@ -25,21 +25,37 @@ import { Dropdown } from "@/components/base/dropdown/dropdown";
 import { Tooltip, TooltipTrigger } from "@/components/base/tooltip/tooltip";
 import { cx } from "@/utils/cx";
 
-export const TableRowActionsDropdown = () => (
+interface TableRowActionsDropdownProps {
+    /** Called when Edit is chosen. Omit to leave the item out. */
+    onEdit?: () => void;
+    /** Called when Copy is chosen. Omit to leave the item out. */
+    onCopy?: () => void;
+    /** Called when Delete is chosen. Omit to leave the item out. */
+    onDelete?: () => void;
+}
+
+/** Row actions menu. Items with no handler are omitted rather than shown inert. */
+export const TableRowActionsDropdown = ({ onEdit, onCopy, onDelete }: TableRowActionsDropdownProps) => (
     <Dropdown.Root>
         <Dropdown.DotsButton />
 
         <Dropdown.Popover className="w-min">
             <Dropdown.Menu>
-                <Dropdown.Item icon={Edit01}>
-                    <span className="pr-4">Edit</span>
-                </Dropdown.Item>
-                <Dropdown.Item icon={Copy01}>
-                    <span className="pr-4">Copy link</span>
-                </Dropdown.Item>
-                <Dropdown.Item icon={Trash01}>
-                    <span className="pr-4">Delete</span>
-                </Dropdown.Item>
+                {onEdit && (
+                    <Dropdown.Item icon={Edit01} onAction={onEdit}>
+                        <span className="pr-4">Edit</span>
+                    </Dropdown.Item>
+                )}
+                {onCopy && (
+                    <Dropdown.Item icon={Copy01} onAction={onCopy}>
+                        <span className="pr-4">Copy</span>
+                    </Dropdown.Item>
+                )}
+                {onDelete && (
+                    <Dropdown.Item icon={Trash01} onAction={onDelete}>
+                        <span className="pr-4">Delete</span>
+                    </Dropdown.Item>
+                )}
             </Dropdown.Menu>
         </Dropdown.Popover>
     </Dropdown.Root>
