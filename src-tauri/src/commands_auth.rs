@@ -298,6 +298,46 @@ pub async fn has_permission(user_id: i32, permission: String) -> CmdResult<bool>
     has_permission_in(conn, user_id, &permission).await
 }
 
+/// Reject unless `user_id` holds `permission`.
+///
+/// This is the boundary the reference expresses as `middleware('permission:…')`.
+/// Tauri has no router to hang middleware on, so each command calls this first.
+///
+/// The identity is an argument rather than read from the session cell on purpose.
+/// The session lives in a process-wide `static`, and `cargo test` runs every test
+/// in one process — a guard that read the static would have each test's session
+/// depend on which other tests happened to run first. `require_permission`
+/// supplies the signed-in id; nothing reachable from the wire can, so a caller
+/// cannot nominate a more privileged account.
+pub async fn require<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+    permission: &str,
+) -> CmdResult<()>
+{
+    if has_permission_in(conn, user_id, permission).await? {
+        return Ok(());
+    }
+
+    Err(CmdError::Forbidden(format!(
+        "your account does not have the {permission} permission"
+    )))
+}
+
+/// The session-bound form, for a `#[tauri::command]` to call first.
+///
+/// Anonymous is its own message rather than a bare "lacks the permission", so a
+/// frontend whose session expired can tell "sign in again" from "ask your manager
+/// for the permission".
+pub async fn require_permission<C: sea_orm::ConnectionTrait>(conn: &C, permission: &str) -> CmdResult<()>
+{
+    let Some(user_id) = auth::current_user_id() else {
+        return Err(CmdError::Forbidden("you are not signed in".into()));
+    };
+
+    require(conn, user_id, permission).await
+}
+
 /// The signed-in user's permissions. The frontend uses this to hide what the
 /// operator cannot do, rather than letting a command reject at the last step.
 #[tauri::command]
@@ -634,5 +674,105 @@ mod tests {
 
         // A deleted *role* must not fall through to the Master branch either.
         assert!(permission_names_in(&conn, user).await.unwrap().is_empty());
+    }
+    /// Attach a role to a user, so a `require` check has something to resolve.
+    async fn give_role(conn: &DatabaseConnection, user: i32, role: i32) {
+        user_roles::ActiveModel { role_id: Set(role), user_id: Set(user), ..Default::default() }
+            .insert(conn)
+            .await
+            .expect("assign role");
+    }
+
+    /// Grant a permission to a role through the pivot, bypassing `Master`.
+    async fn grant(conn: &DatabaseConnection, role: i32, permission: i32) {
+        role_permissions::ActiveModel {
+            permission_id: Set(permission),
+            role_id: Set(role),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await
+        .expect("grant permission");
+    }
+
+    #[tokio::test]
+    async fn require_lets_a_granted_permission_through() {
+        let conn = init_for_tests().await;
+        let user = seed_user(&conn, "granted@example.com").await;
+        let role = seed_role(&conn, "Cashier", "Staff").await;
+        let permission = seed_permission(&conn, "unit-list").await;
+        give_role(&conn, user, role).await;
+        grant(&conn, role, permission).await;
+
+        require(&conn, user, "unit-list").await.expect("granted");
+    }
+
+    #[tokio::test]
+    async fn require_rejects_a_permission_the_role_lacks() {
+        let conn = init_for_tests().await;
+        let user = seed_user(&conn, "denied@example.com").await;
+        let role = seed_role(&conn, "Cashier", "Staff").await;
+        let granted = seed_permission(&conn, "unit-list").await;
+        give_role(&conn, user, role).await;
+        grant(&conn, role, granted).await;
+
+        // Same account, a different verb. This is the case that has to fail.
+        let err = require(&conn, user, "unit-create")
+            .await
+            .expect_err("must not be granted");
+        match err {
+            CmdError::Forbidden(message) => assert_eq!(
+                message, "your account does not have the unit-create permission"
+            ),
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn require_rejects_a_user_with_no_roles() {
+        let conn = init_for_tests().await;
+        let user = seed_user(&conn, "roleless@example.com").await;
+
+        // No role at all must grant nothing, rather than falling through to Master.
+        assert!(require(&conn, user, "unit-list").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn require_lets_a_master_role_through_without_a_pivot_row() {
+        let conn = init_for_tests().await;
+        let user = seed_user(&conn, "owner@example.com").await;
+        let role = seed_role(&conn, "Super Admin", "Master").await;
+        give_role(&conn, user, role).await;
+
+        // No permission row is attached: Master bypasses the pivot, which is the
+        // point of it. `sale-pos` is checked because it exists in the seeded
+        // catalog.
+        require(&conn, user, "sale-pos").await.expect("master bypasses the pivot");
+    }
+
+    #[tokio::test]
+    async fn require_rejects_when_the_granting_role_is_soft_deleted() {
+        let conn = init_for_tests().await;
+        let user = seed_user(&conn, "stale@example.com").await;
+        let role = seed_role(&conn, "Cashier", "Staff").await;
+        let permission = seed_permission(&conn, "unit-list").await;
+        give_role(&conn, user, role).await;
+        grant(&conn, role, permission).await;
+
+        // The grant still exists as a row; the role behind it does not.
+        let mut am: roles::ActiveModel =
+            roles::Entity::find_by_id(role).one(&conn).await.unwrap().unwrap().into();
+        am.del_status = Set("Deleted".into());
+        am.update(&conn).await.unwrap();
+
+        assert!(require(&conn, user, "unit-list").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn require_rejects_an_account_that_does_not_exist() {
+        let conn = init_for_tests().await;
+
+        // No user 9999. Must be a plain rejection, never a panic or an allow.
+        assert!(require(&conn, 9999, "unit-list").await.is_err());
     }
 }
