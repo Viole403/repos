@@ -122,6 +122,41 @@ pub async fn current_user() -> CmdResult<UserView> {
 }
 
 // ---------------------------------------------------------------------------
+// Install
+// ---------------------------------------------------------------------------
+
+/// Whether this install still needs an owner.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallStatus {
+    /// No live account exists, so nobody can sign in and the only way forward is
+    /// to create one. This is what the frontend branches on to decide between the
+    /// first-run wizard and the login screen.
+    pub needs_setup: bool,
+    /// Live accounts. Reported so the wizard can say what already exists; it is
+    /// not a secret, since anyone holding the binary can read the database file.
+    pub account_count: u64,
+}
+
+/// Unauthenticated on purpose: it has to answer *before* anyone can sign in, or it
+/// cannot tell the frontend to offer the wizard instead of a login form that will
+/// always be rejected. It deliberately reports no names, emails or roles, so the
+/// one command reachable without a session discloses as little as possible.
+#[tauri::command]
+pub async fn install_status() -> CmdResult<InstallStatus> {
+    let conn = db();
+    install_status_in(conn).await
+}
+
+pub async fn install_status_in<C: sea_orm::ConnectionTrait>(conn: &C) -> CmdResult<InstallStatus> {
+    let account_count = live_user_count(conn).await?;
+    Ok(InstallStatus {
+        needs_setup: account_count == 0,
+        account_count,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Accounts
 // ---------------------------------------------------------------------------
 
@@ -1010,6 +1045,37 @@ mod tests {
                 .is_empty(),
             "a refused account must not be left behind"
         );
+    }
+
+    /// The frontend branches on this to choose between the first-run wizard and the
+    /// login screen, so a wrong answer strands the install: reporting "set up" on a
+    /// fresh database shows a login form that can never succeed, and reporting
+    /// "needs setup" on a claimed one shows a form that would hand a second owner
+    /// role to whoever fills it in.
+    #[tokio::test]
+    async fn a_fresh_install_reports_that_it_needs_an_owner() {
+        let conn = init_for_tests().await;
+
+        let fresh = install_status_in(&conn).await.expect("status");
+        assert!(fresh.needs_setup, "a migrated database has no accounts");
+        assert_eq!(fresh.account_count, 0);
+
+        create_user_in(
+            &conn,
+            UserInput {
+                name: "Owner".into(),
+                email: "owner@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("first");
+
+        let claimed = install_status_in(&conn).await.expect("status");
+        assert!(!claimed.needs_setup, "an install with an owner is claimed");
+        assert_eq!(claimed.account_count, 1);
     }
 
     /// Deleting the only account has to leave the install recoverable.

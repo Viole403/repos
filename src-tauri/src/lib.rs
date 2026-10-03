@@ -51,6 +51,7 @@ pub fn run() {
             commands_auth::login,
             commands_auth::logout,
             commands_auth::current_user,
+            commands_auth::install_status,
             commands_auth::list_users,
             commands_auth::create_user,
             commands_auth::delete_user,
