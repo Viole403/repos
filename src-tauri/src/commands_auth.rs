@@ -557,9 +557,24 @@ mod tests {
             .await
             .expect("assign role");
 
+        // Compared against the table rather than a literal list: the catalog is
+        // seeded by migration, so the owner set is however many rows exist. The
+        // point of `Master` is that it bypasses the pivot entirely.
+        let expected: Vec<String> = permissions::Entity::find()
+            .filter(permissions::Column::DelStatus.eq("Live"))
+            .order_by_asc(permissions::Column::Name)
+            .all(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+
         let held = permission_names_in(&conn, user).await.unwrap();
-        assert_eq!(held, vec!["items.edit".to_string(), "sales.create".to_string()]);
+        assert_eq!(held, expected);
         assert!(has_permission_in(&conn, user, "sales.create").await.unwrap());
+        // A seeded permission too, not only the ones this test inserted.
+        assert!(has_permission_in(&conn, user, "item-create").await.unwrap());
     }
 
     #[tokio::test]
