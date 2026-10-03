@@ -11,6 +11,7 @@ import { Login, SessionLoading } from "./screens/Login";
 import { Setup } from "./screens/Setup";
 import { Accounts } from "./screens/Accounts";
 import { Roles } from "./screens/Roles";
+import { Sales } from "./screens/Sales";
 import { Customers } from "./screens/Customers";
 import { Suppliers } from "./screens/Suppliers";
 import { Register } from "./screens/Register";
@@ -30,6 +31,7 @@ const screens: Record<string, ReactNode> = {
     "/catalog/units": <Units />,
     "/catalog/brands": <Brands />,
     "/catalog/categories": <ItemCategories />,
+    "/sales": <Sales />,
     "/customers": <Customers />,
     "/purchase/suppliers": <Suppliers />,
     "/settings/accounts": <Accounts />,
