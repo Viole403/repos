@@ -29,6 +29,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::Items),
             Box::new(Migrations::SalesAndStock),
             Box::new(Migrations::PermissionCatalog),
+            Box::new(Migrations::CustomersAndSuppliers),
         ]
     }
 }
