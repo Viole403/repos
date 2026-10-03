@@ -340,6 +340,124 @@ export const deleteRole = (id: number) => call<void>("delete_role", { id });
  */
 export const currentUser = () => call<UserView>("current_user");
 
+// ---------------------------------------------------------------- trade
+export interface CustomerView {
+    id: number;
+    name: string;
+    code: string | null;
+    email: string | null;
+    phone: string | null;
+    address: string | null;
+    city: string | null;
+    country: string | null;
+    zip: string | null;
+    taxNumber: string | null;
+    creditLimit: Decimal;
+    loyaltyPoints: Decimal;
+    note: string | null;
+    photo: string | null;
+    createdAt: string;
+    /** Completed sales less receipts. Derived on the server, never stored. */
+    balance: Decimal;
+    /** What they may still take on credit. Negative once they are over the limit. */
+    creditAvailable: Decimal;
+}
+
+export interface CustomerInput {
+    name: string;
+    code?: string | null;
+    email?: string | null;
+    phone?: string | null;
+    address?: string | null;
+    city?: string | null;
+    country?: string | null;
+    zip?: string | null;
+    taxNumber?: string | null;
+    creditLimit: Decimal;
+    loyaltyPoints: Decimal;
+    note?: string | null;
+}
+
+export interface SupplierView {
+    id: number;
+    name: string;
+    code: string | null;
+    email: string | null;
+    phone: string | null;
+    address: string | null;
+    city: string | null;
+    country: string | null;
+    zip: string | null;
+    taxNumber: string | null;
+    openingBalance: Decimal;
+    note: string | null;
+    photo: string | null;
+    createdAt: string;
+    /** What the shop owes them. Positive means the shop is in debt. */
+    balance: Decimal;
+}
+
+export interface SupplierInput {
+    name: string;
+    code?: string | null;
+    email?: string | null;
+    phone?: string | null;
+    address?: string | null;
+    city?: string | null;
+    country?: string | null;
+    zip?: string | null;
+    taxNumber?: string | null;
+    openingBalance: Decimal;
+    note?: string | null;
+}
+
+/** Money in, with the date it arrived. The backend defaults `paidAt` to now. */
+export interface PaymentInput {
+    amount: Decimal;
+    reference?: string | null;
+    paidAt?: string | null;
+}
+
+export interface CustomerReceipt {
+    id: number;
+    customerId: number;
+    amount: Decimal;
+    reference: string | null;
+    paidAt: string;
+    createdAt: string;
+}
+
+export interface SupplierPayment {
+    id: number;
+    supplierId: number;
+    amount: Decimal;
+    reference: string | null;
+    paidAt: string;
+    createdAt: string;
+}
+
+export const listCustomers = (query: PageQuery = {}) => call<Page<CustomerView>>("list_customers", { query });
+export const createCustomer = (input: CustomerInput) => call<CustomerView>("create_customer", { input });
+export const updateCustomer = (id: number, input: CustomerInput) =>
+    call<CustomerView>("update_customer", { id, input });
+export const deleteCustomer = (id: number) => call<void>("delete_customer", { id });
+export const customerBalance = (id: number) => call<Decimal>("customer_balance", { id });
+export const recordCustomerReceipt = (customerId: number, input: PaymentInput) =>
+    call<CustomerReceipt>("record_customer_receipt", { customerId, input });
+export const listCustomerReceipts = (customerId: number) =>
+    call<CustomerReceipt[]>("list_customer_receipts", { customerId });
+
+export const listSuppliers = (query: PageQuery = {}) => call<Page<SupplierView>>("list_suppliers", { query });
+export const createSupplier = (input: SupplierInput) => call<SupplierView>("create_supplier", { input });
+export const updateSupplier = (id: number, input: SupplierInput) =>
+    call<SupplierView>("update_supplier", { id, input });
+export const deleteSupplier = (id: number) => call<void>("delete_supplier", { id });
+export const supplierBalance = (id: number) => call<Decimal>("supplier_balance", { id });
+export const recordSupplierPayment = (supplierId: number, input: PaymentInput) =>
+    call<SupplierPayment>("record_supplier_payment", { supplierId, input });
+export const listSupplierPayments = (supplierId: number) =>
+    call<SupplierPayment[]>("list_supplier_payments", { supplierId });
+
 export const listUnits = (query: PageQuery = {}) => call<Page<Unit>>("list_units", { query });
 export const createUnit = (input: UnitInput) => call<Unit>("create_unit", { input });
 export const deleteUnit = (id: number) => call<void>("delete_unit", { id });
