@@ -51,6 +51,14 @@ pub enum CmdError {
     Validation(String),
     #[error("{0}")]
     Conflict(String),
+    /// The signed-in operator is authenticated but not allowed to do this.
+    ///
+    /// Distinct from `Validation` on purpose: a rejected *value* is the caller's
+    /// mistake to fix, while this says the caller's *account* cannot perform the
+    /// action. The frontend hides what a permission forbids, so a surface hit means
+    /// the UI and the guard disagree.
+    #[error("{0}")]
+    Forbidden(String),
 }
 
 impl Serialize for CmdError {
@@ -134,6 +142,10 @@ pub struct UnitInput {
 
 #[tauri::command]
 pub async fn list_units(query: PageQuery) -> CmdResult<Page<unit::Model>> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "unit-list").await?;
     let db = db();
     let mut q = unit::Entity::find().filter(unit::Column::DelStatus.eq(LIVE));
 
@@ -154,6 +166,10 @@ pub async fn list_units(query: PageQuery) -> CmdResult<Page<unit::Model>> {
 
 #[tauri::command]
 pub async fn create_unit(input: UnitInput) -> CmdResult<unit::Model> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "unit-create").await?;
     let name = required(&input.unit_name, "unit name")?;
     let db = db();
 
@@ -192,6 +208,10 @@ pub struct BrandInput {
 
 #[tauri::command]
 pub async fn delete_unit(id: i32) -> CmdResult<()> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "unit-destroy").await?;
     let db = db();
     let Some(found) = unit::Entity::find_by_id(id).one(db).await? else {
         return Err(CmdError::NotFound("unit".into()));
@@ -205,6 +225,10 @@ pub async fn delete_unit(id: i32) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn list_brands(query: PageQuery) -> CmdResult<Page<brand::Model>> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "brand-list").await?;
     let db = db();
     let mut q = brand::Entity::find().filter(brand::Column::DelStatus.eq(LIVE));
 
@@ -225,6 +249,10 @@ pub async fn list_brands(query: PageQuery) -> CmdResult<Page<brand::Model>> {
 
 #[tauri::command]
 pub async fn create_brand(input: BrandInput) -> CmdResult<brand::Model> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "brand-create").await?;
     let name = required(&input.name, "brand name")?;
     let db = db();
 
@@ -265,6 +293,10 @@ pub struct CategoryInput {
 
 #[tauri::command]
 pub async fn delete_brand(id: i32) -> CmdResult<()> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "brand-destroy").await?;
     let db = db();
     let Some(found) = brand::Entity::find_by_id(id).one(db).await? else {
         return Err(CmdError::NotFound("brand".into()));
@@ -278,6 +310,10 @@ pub async fn delete_brand(id: i32) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn list_item_categories(query: PageQuery) -> CmdResult<Page<item_category::Model>> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "item_category-list").await?;
     let db = db();
     let mut q = item_category::Entity::find().filter(item_category::Column::DelStatus.eq(LIVE));
 
@@ -300,6 +336,10 @@ pub async fn list_item_categories(query: PageQuery) -> CmdResult<Page<item_categ
 
 #[tauri::command]
 pub async fn create_item_category(input: CategoryInput) -> CmdResult<item_category::Model> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "item_category-create").await?;
     let name = required(&input.name, "category name")?;
     let db = db();
 
@@ -328,6 +368,10 @@ pub async fn create_item_category(input: CategoryInput) -> CmdResult<item_catego
 
 #[tauri::command]
 pub async fn delete_item_category(id: i32) -> CmdResult<()> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "item_category-destroy").await?;
     let db = db();
     let Some(found) = item_category::Entity::find_by_id(id).one(db).await? else {
         return Err(CmdError::NotFound("item category".into()));
@@ -425,6 +469,10 @@ fn like_term(raw: &str) -> String {
 
 #[tauri::command]
 pub async fn list_items(query: PageQuery) -> CmdResult<Page<ItemView>> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "item-list").await?;
     let db = db();
 
     let rows = item::Entity::find()
@@ -498,6 +546,10 @@ fn by_id<K: std::hash::Hash + Eq, V>(pairs: impl IntoIterator<Item = (K, V)>) ->
 
 #[tauri::command]
 pub async fn create_item(input: ItemInput) -> CmdResult<item::Model> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "item-create").await?;
     validate(&input)?;
     let db = db();
 
@@ -539,6 +591,10 @@ pub async fn create_item(input: ItemInput) -> CmdResult<item::Model> {
 
 #[tauri::command]
 pub async fn update_item(id: i32, input: ItemInput) -> CmdResult<item::Model> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "item-edit").await?;
     validate(&input)?;
     let db = db();
 
@@ -579,6 +635,10 @@ pub async fn update_item(id: i32, input: ItemInput) -> CmdResult<item::Model> {
 
 #[tauri::command]
 pub async fn delete_item(id: i32) -> CmdResult<()> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "item-destroy").await?;
     let db = db();
     let Some(found) = item::Entity::find_by_id(id).one(db).await? else {
         return Err(CmdError::NotFound("item".into()));
@@ -660,6 +720,10 @@ pub async fn list_stock_movements(
     item_id: i32,
     query: PageQuery,
 ) -> CmdResult<Page<stock_movement::Model>> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "stock-stock").await?;
     list_stock_movements_in(db(), item_id, query).await
 }
 
@@ -690,6 +754,10 @@ pub(crate) async fn list_stock_movements_in<C: ConnectionTrait>(
 
 #[tauri::command]
 pub async fn stock_on_hand(item_id: i32) -> CmdResult<Decimal> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "stock-stock").await?;
     stock_on_hand_in(db(), item_id).await
 }
 
@@ -899,6 +967,10 @@ fn guard_discount_within_subtotal(discount_total: Decimal, subtotal: Decimal) ->
 /// exists to prevent.
 #[tauri::command]
 pub async fn checkout(input: CheckoutInput) -> CmdResult<SaleView> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "sale-create").await?;
     checkout_in(db(), input).await
 }
 
@@ -1060,6 +1132,10 @@ pub struct DraftSale {
 /// and offering one back is noise rather than recovery.
 #[tauri::command]
 pub async fn list_draft_sales() -> CmdResult<Vec<DraftSale>> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "sale-pos").await?;
     list_draft_sales_in(db()).await
 }
 
@@ -1119,6 +1195,10 @@ pub async fn promote_draft(
     paid_total: Option<Decimal>,
     payment_method: Option<String>,
 ) -> CmdResult<SaleView> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "sale-create").await?;
     promote_draft_in(db(), sale_id, paid_total, payment_method).await
 }
 
@@ -1304,6 +1384,10 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
 /// there is no ledger row to reconcile and nothing to give back.
 #[tauri::command]
 pub async fn discard_draft(sale_id: i32) -> CmdResult<()> {
+    // Guarded like the reference's `middleware('permission:…')`: check the
+    // session before anything else, so an unauthorised caller cannot use
+    // validation messages to probe the command.
+    crate::commands_auth::require_permission(db(), "sale-destroy").await?;
     discard_draft_in(db(), sale_id).await
 }
 
