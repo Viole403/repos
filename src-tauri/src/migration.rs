@@ -40,6 +40,7 @@ pub enum Migrations {
     Items,
     SalesAndStock,
     PermissionCatalog,
+    CustomersAndSuppliers,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -71,6 +72,7 @@ impl MigrationName for Migrations {
             Migrations::Items => "items",
             Migrations::SalesAndStock => "sales_and_stock",
             Migrations::PermissionCatalog => "permission_catalog",
+            Migrations::CustomersAndSuppliers => "customers_and_suppliers",
         }
     }
 }
@@ -84,6 +86,7 @@ impl MigrationTrait for Migrations {
             Migrations::Items => items(manager).await?,
             Migrations::SalesAndStock => sales_and_stock(manager).await?,
             Migrations::PermissionCatalog => permission_catalog(manager).await?,
+            Migrations::CustomersAndSuppliers => customers_and_suppliers(manager).await?,
         }
         Ok(())
     }
@@ -91,6 +94,14 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::CustomersAndSuppliers => {
+                for t in [
+                    Suppliers::Table.into_iden(),
+                    Customers::Table.into_iden(),
+                ] {
+                    manager.drop_table(Table::drop().table(t).if_exists().to_owned()).await?;
+                }
+            }
             Migrations::PermissionCatalog => {
                 // Data, not schema: reverse it by deleting the rows this migration
                 // owns, which is exactly the seeded catalog. Scoped by name so a
@@ -534,6 +545,89 @@ async fn sales_and_stock(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 // Permission catalog
 // ---------------------------------------------------------------------------
 
+/// Neither table stores a balance. It is derived from sales, receipts, purchases and
+/// payments, for the same reason stock is a ledger: a stored balance is a
+/// read-modify-write that two concurrent sales can interleave.
+async fn customers_and_suppliers(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(Customers::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Customers::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(Customers::Name).string().not_null())
+                .col(ColumnDef::new(Customers::Code).string().null().unique_key())
+                .col(ColumnDef::new(Customers::Email).string().null())
+                .col(ColumnDef::new(Customers::Phone).string().null())
+                .col(ColumnDef::new(Customers::Address).string().null())
+                .col(ColumnDef::new(Customers::City).string().null())
+                .col(ColumnDef::new(Customers::Country).string().null())
+                .col(ColumnDef::new(Customers::Zip).string().null())
+                .col(ColumnDef::new(Customers::TaxNumber).string().null())
+                // What a customer may owe before checkout refuses the sale.
+                .col(ColumnDef::new(Customers::CreditLimit).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Customers::LoyaltyPoints).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Customers::Note).string().null())
+                .col(ColumnDef::new(Customers::Photo).string().null())
+                .col(ColumnDef::new(Customers::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(Customers::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Customers::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_customers_name")
+                .table(Customers::Table)
+                .col(Customers::Name)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(Suppliers::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Suppliers::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(Suppliers::Name).string().not_null())
+                .col(ColumnDef::new(Suppliers::Code).string().null().unique_key())
+                .col(ColumnDef::new(Suppliers::Email).string().null())
+                .col(ColumnDef::new(Suppliers::Phone).string().null())
+                .col(ColumnDef::new(Suppliers::Address).string().null())
+                .col(ColumnDef::new(Suppliers::City).string().null())
+                .col(ColumnDef::new(Suppliers::Country).string().null())
+                .col(ColumnDef::new(Suppliers::Zip).string().null())
+                .col(ColumnDef::new(Suppliers::TaxNumber).string().null())
+                .col(ColumnDef::new(Suppliers::OpeningBalance).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Suppliers::Note).string().null())
+                .col(ColumnDef::new(Suppliers::Photo).string().null())
+                .col(ColumnDef::new(Suppliers::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(Suppliers::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Suppliers::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_suppliers_name")
+                .table(Suppliers::Table)
+                .col(Suppliers::Name)
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+
 /// Every permission this app guards, as `group` -> actions.
 ///
 /// Names are `group-action` (`item-create`, `sale-pos`), which is what the
@@ -606,6 +700,49 @@ async fn permission_catalog(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     }
 
     Ok(())
+}
+
+#[derive(Iden)]
+enum Customers {
+    Table,
+    Id,
+    Name,
+    Code,
+    Email,
+    Phone,
+    Address,
+    City,
+    Country,
+    Zip,
+    TaxNumber,
+    CreditLimit,
+    LoyaltyPoints,
+    Note,
+    Photo,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum Suppliers {
+    Table,
+    Id,
+    Name,
+    Code,
+    Email,
+    Phone,
+    Address,
+    City,
+    Country,
+    Zip,
+    TaxNumber,
+    OpeningBalance,
+    Note,
+    Photo,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
 }
 
 #[derive(Iden)]
