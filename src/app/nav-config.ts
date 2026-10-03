@@ -6,6 +6,7 @@ import {
     CreditCard01,
     Cube01,
     Home01,
+    Key01,
     LayersTwo01,
     Receipt,
     Settings01,
@@ -19,7 +20,7 @@ import {
 type NavEntry = NavItemType | NavItemDividerType;
 
 /** Screens that exist. Anything else in the tree is inert until built. */
-export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/settings/accounts"]);
+export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/settings/accounts", "/settings/roles"]);
 
 export const navItems: NavEntry[] = [
     { label: "Dashboard", href: "#/", icon: Home01 },
@@ -81,7 +82,7 @@ export const navItems: NavEntry[] = [
         icon: Settings01,
         items: [
             { label: "Accounts", href: "#/settings/accounts", icon: User01 },
-            { label: "Roles", href: "#/settings/roles", disabled: true },
+            { label: "Roles", href: "#/settings/roles", icon: Key01 },
         ],
     },
 ];
