@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
-use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbErr};
 use sea_orm_migration::MigratorTrait;
 use tokio::sync::OnceCell;
 
@@ -104,10 +104,68 @@ pub async fn init(app_data_dir: &std::path::Path, url_override: Option<&str>) ->
         }
     }
 
-    let conn = Database::connect(connect_options(&url)).await?;
+    let conn = match Database::connect(connect_options(&url)).await {
+        Ok(conn) => conn,
+        // Only a missing database is recoverable; anything else surfaces as-is.
+        Err(e) => match create_missing_postgres_db(&url).await {
+            Ok(true) => Database::connect(connect_options(&url))
+                .await
+                .map_err(|e| DbErr::Custom(format!("created the database but still could not connect: {e}")))?,
+            Ok(false) => return Err(e),
+            Err(cause) => return Err(DbErr::Custom(format!("could not create the database: {cause}; original error: {e}"))),
+        },
+    };
     Migrator::up(&conn, None).await?;
     DB.set(conn)
         .map_err(|_| DbErr::Custom("database already initialized".into()))
+}
+
+/// Creates the database named in `url` if absent, so a first run matches SQLite,
+/// which creates its file. Returns whether one was created.
+pub(crate) async fn create_missing_postgres_db(url: &str) -> Result<bool, DbErr> {
+    if is_sqlite(url) {
+        return Ok(false);
+    }
+    let Some(name) = database_name(url) else {
+        return Ok(false);
+    };
+    // Interpolated into DDL, so allow nothing that could close the quoted identifier.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Ok(false);
+    }
+
+    let maintenance = url_with_database(url, "postgres");
+    let admin = Database::connect(connect_options(&maintenance)).await?;
+
+    match admin.execute_unprepared(&format!("CREATE DATABASE \"{name}\"")).await {
+        Ok(_) => Ok(true),
+        // Already there — which is the outcome we wanted. Matched on the message
+        // rather than SQLSTATE 42P04, which only appears in the Debug form.
+        Err(e) if format!("{e}").contains("already exists") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The database name from a URL path, e.g. `postgres://host:5432/repos` -> `repos`.
+fn database_name(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let path = after_scheme.split_once('/')?.1;
+    let name = path.split(['?', '#']).next().unwrap_or("");
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// The same URL pointed at a different database, keeping credentials and host.
+fn url_with_database(url: &str, name: &str) -> String {
+    let (prefix, rest) = url.split_once("://").expect("checked by database_name");
+    let (_, tail) = match rest.split_once('/') {
+        Some(parts) => parts,
+        None => return format!("{prefix}://{rest}/{name}"),
+    };
+    let query = tail.find(['?', '#']).map(|i| &tail[i..]).unwrap_or("");
+    format!("{prefix}://{}/{}{}", rest.split_once('/').map(|(a, _)| a).unwrap_or(rest), name, query)
 }
 
 /// The shared connection.
@@ -164,4 +222,67 @@ pub async fn connect_to(url: &str) -> Option<DatabaseConnection> {
         panic!("migrations failed on {url}: {e}");
     }
     Some(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drops a database by name through the maintenance database.
+    async fn drop_database(base_url: &str, name: &str) {
+        let admin = Database::connect(connect_options(&url_with_database(base_url, "postgres")))
+            .await
+            .expect("admin connection");
+        admin
+            .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\""))
+            .await
+            .expect("drop probe database");
+    }
+
+    /// A first run against a fresh install must not fail just because the database
+    /// does not exist yet — SQLite creates its file, so Postgres should too.
+    #[tokio::test]
+    async fn creates_a_missing_postgres_database() {
+        let Ok(base) = std::env::var("REPOS_TEST_POSTGRES_URL") else {
+            eprintln!("skipping: REPOS_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let name = format!("{}_autocreate_probe", database_name(&base).unwrap_or_default());
+        let url = url_with_database(&base, &name);
+
+        // Self-cleaning, so a failed run does not poison the next one.
+        drop_database(&base, &name).await;
+        assert!(create_missing_postgres_db(&url).await.expect("probe is created"), "a missing database should be created");
+        assert!(
+            !create_missing_postgres_db(&url).await.expect("second call is a no-op"),
+            "an existing database must not be recreated"
+        );
+        drop_database(&base, &name).await;
+    }
+
+    /// A SQLite URL has no server to create anything, and must be left alone.
+    #[tokio::test]
+    async fn leaves_sqlite_alone() {
+        assert!(!create_missing_postgres_db("sqlite::memory:").await.expect("sqlite is not created"));
+    }
+
+    #[test]
+    fn extracts_the_database_name() {
+        assert_eq!(database_name("postgres://u:p@h:5432/repos").as_deref(), Some("repos"));
+        assert_eq!(database_name("postgres://u:p@h/repos?sslmode=require").as_deref(), Some("repos"));
+        assert_eq!(database_name("postgres://u:p@h:5432/"), None);
+        assert_eq!(database_name("nonsense"), None);
+    }
+
+    #[test]
+    fn keeps_credentials_and_query_when_repointing() {
+        assert_eq!(
+            url_with_database("postgres://u:p@h:5432/repos", "postgres"),
+            "postgres://u:p@h:5432/postgres"
+        );
+        assert_eq!(
+            url_with_database("postgres://u:p@h:5432/repos?sslmode=require", "postgres"),
+            "postgres://u:p@h:5432/postgres?sslmode=require"
+        );
+    }
 }
