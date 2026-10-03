@@ -12,7 +12,9 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "repos_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# This is the default, but we explicitly set it here to avoid confusion.
+# crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -43,15 +45,34 @@ sea-orm-migration = { version = "2.0", features = [
   "runtime-tokio-rustls",
 ] }
 
-
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Full debuginfo across every crate and job is the main cause of swap thrash
+# during `tauri dev`. Line tables still give a backtrace its line numbers.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+opt-level = 3
+
+# Dependencies are never what you're debugging, and they are most of the build.
+[profile.dev.package."*"]
+opt-level = 1 # Optimize for speed, not size
+debug = 0 # No debug info, just line tables
+
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1
-lto = true
+lto = "thin"
 opt-level = 3
 panic = "abort"
 strip = true
+
+# Untuk uji build harian, `cargo build --profile release-fast`
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = 2
+strip = false
