@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sea_orm::prelude::Decimal;
+use sea_orm::prelude::{DateTimeUtc, Decimal};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionSession, TransactionTrait,
@@ -796,6 +796,101 @@ fn validate_checkout(input: &CheckoutInput) -> CmdResult<()> {
     Ok(())
 }
 
+/// The gate every write path shares: the item must still be sellable, and the shelf
+/// must still cover the line.
+///
+/// Returns the item's current name and its on-hand quantity so a caller never has to
+/// read either again — and, more importantly, so `checkout` and draft promotion
+/// cannot drift into disagreeing about what "sellable" means.
+///
+/// A soft-deleted item is treated as missing rather than as a stock problem, which
+/// keeps the till from selling something the catalog screen no longer lists.
+async fn guard_line_sellable<C: ConnectionTrait>(
+    conn: &C,
+    line: &CheckoutLine,
+) -> CmdResult<(String, Decimal)> {
+    let Some(item) = item::Entity::find_by_id(line.item_id)
+        .filter(item::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+    else {
+        return Err(CmdError::NotFound(format!("item {}", line.item_id)));
+    };
+
+    let available = on_hand_in(conn, line.item_id).await?;
+    if line.quantity > available {
+        return Err(CmdError::Validation(format!(
+            "item '{}' has {available} in stock but {} was requested",
+            item.name, line.quantity
+        )));
+    }
+
+    Ok((item.name, available))
+}
+
+/// One ledger row for a sold line. Shared so `checkout` and draft promotion write an
+/// identical row for an identical event — the ledger is load-bearing, and two
+/// spellings of "a sale happened" would make an audit a matter of opinion.
+async fn record_sale_movement<C: ConnectionTrait>(
+    conn: &C,
+    item_id: i32,
+    sale_id: i32,
+    invoice_no: &str,
+    quantity: Decimal,
+    balance_after: Decimal,
+    now: DateTimeUtc,
+) -> CmdResult<()> {
+    // Signed: negative leaves the shelf. `balance_after` is the running on-hand for
+    // this item as of this row.
+    stock_movement::ActiveModel {
+        item_id: Set(item_id),
+        sale_id: Set(Some(sale_id)),
+        movement_type: Set(MOVEMENT_SALE.as_str().to_owned()),
+        quantity: Set(-quantity),
+        reference: Set(Some(invoice_no.to_owned())),
+        balance_after: Set(balance_after),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+
+    Ok(())
+}
+
+/// Fold a line's resulting balance into the view's per-item list, so a sale that
+/// lists the same item twice reports one row holding the final balance rather than
+/// two stale ones.
+fn record_on_hand(
+    view: &mut Vec<ItemOnHand>,
+    seen: &mut HashMap<i32, usize>,
+    item_id: i32,
+    balance_after: Decimal,
+) {
+    match seen.entry(item_id) {
+        Entry::Occupied(pos) => view[*pos.get()].quantity = balance_after,
+        Entry::Vacant(pos) => {
+            pos.insert(view.len());
+            view.push(ItemOnHand {
+                item_id,
+                quantity: balance_after,
+            });
+        }
+    }
+}
+
+/// Order-level guard shared by checkout and draft promotion: a discount larger than
+/// the subtotal writes a negative grand total, and negative money in the ledger is
+/// very hard to unwind.
+fn guard_discount_within_subtotal(discount_total: Decimal, subtotal: Decimal) -> CmdResult<()> {
+    if discount_total > subtotal {
+        return Err(CmdError::Validation(format!(
+            "discount {discount_total} is larger than the subtotal {subtotal}"
+        )));
+    }
+    Ok(())
+}
+
 /// Writes a sale, its lines, and the matching ledger rows as one unit.
 ///
 /// The whole thing runs in a single transaction. `DatabaseTransaction`'s `Drop`
@@ -867,35 +962,16 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     let mut seen: HashMap<i32, usize> = HashMap::with_capacity(input.lines.len());
 
     for line in &input.lines {
-        let Some(item) = item::Entity::find_by_id(line.item_id)
-            // A soft-deleted item cannot be sold; treating it as missing keeps the
-            // till from selling something the catalog screen no longer lists.
-            .filter(item::Column::DelStatus.eq(LIVE))
-            .one(&txn)
-            .await?
-        else {
-            return Err(CmdError::NotFound(format!("item {}", line.item_id)));
-        };
-
+        let (item_name, available) = guard_line_sellable(&txn, line).await?;
         let discount = line.discount.unwrap_or(Decimal::ZERO);
         let gross = line.unit_price * line.quantity;
-
-        // Summed inside the transaction, so a repeated item in the same cart sees
-        // the earlier line's decrement and cannot oversell between itself.
-        let available = on_hand_in(&txn, line.item_id).await?;
-        if line.quantity > available {
-            return Err(CmdError::Validation(format!(
-                "item '{}' has {available} in stock but {} was requested",
-                item.name, line.quantity
-            )));
-        }
 
         lines.push(
             sale_detail::ActiveModel {
                 sale_id: Set(sale_id),
                 item_id: Set(line.item_id),
                 // Snapshot: a later rename must not rewrite the receipt.
-                item_name: Set(item.name.clone()),
+                item_name: Set(item_name),
                 unit_price: Set(line.unit_price),
                 quantity: Set(line.quantity),
                 discount: Set(discount),
@@ -911,32 +987,21 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
         line_discount_total += discount;
 
         if promoted {
-            // Signed: negative leaves the shelf. `balance_after` is the running
-            // on-hand for this item as of this row.
+            // `available` was read inside the transaction, so a repeated item in the
+            // same cart sees the earlier line's decrement and cannot oversell between
+            // itself.
             let balance_after = available - line.quantity;
-            stock_movement::ActiveModel {
-                item_id: Set(line.item_id),
-                sale_id: Set(Some(sale_id)),
-                movement_type: Set(MOVEMENT_SALE.as_str().to_owned()),
-                quantity: Set(-line.quantity),
-                reference: Set(Some(invoice_no.clone())),
-                balance_after: Set(balance_after),
-                created_at: Set(now),
-                ..Default::default()
-            }
-            .insert(&txn)
+            record_sale_movement(
+                &txn,
+                line.item_id,
+                sale_id,
+                &invoice_no,
+                line.quantity,
+                balance_after,
+                now,
+            )
             .await?;
-
-            match seen.entry(line.item_id) {
-                Entry::Occupied(pos) => stock_on_hand[*pos.get()].quantity = balance_after,
-                Entry::Vacant(pos) => {
-                    pos.insert(stock_on_hand.len());
-                    stock_on_hand.push(ItemOnHand {
-                        item_id: line.item_id,
-                        quantity: balance_after,
-                    });
-                }
-            }
+            record_on_hand(&mut stock_on_hand, &mut seen, line.item_id, balance_after);
         }
     }
 
@@ -945,12 +1010,7 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     // Both statements are in the same transaction, so no reader ever sees the
     // half-filled row.
     let discount_total = line_discount_total + input.discount_total.unwrap_or(Decimal::ZERO);
-    // Same reason as the per-line guard: keep negative money out of the ledger.
-    if discount_total > subtotal {
-        return Err(CmdError::Validation(format!(
-            "discount {discount_total} is larger than the subtotal {subtotal}"
-        )));
-    }
+    guard_discount_within_subtotal(discount_total, subtotal)?;
     let tax_total = input.tax_total.unwrap_or(Decimal::ZERO);
     let grand_total = subtotal - discount_total + tax_total;
     let mut header: sale::ActiveModel = header.into();
@@ -974,6 +1034,306 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     txn.commit().await?;
 
     Ok(view)
+}
+
+// ---------------------------------------------------------------------------
+// The draft lifecycle
+//
+// `checkout(promote: false)` already writes a recoverable `Draft`: a header, its
+// lines, and deliberately no stock movements. These three commands are the other
+// half of that promise — reading a draft back after a crash, turning one into a real
+// sale, and throwing one away. Without the read-back the draft is unreachable and
+// the crash recovery is theoretical.
+// ---------------------------------------------------------------------------
+
+/// A draft and its lines: everything needed to put the cashier back where they were.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftSale {
+    pub sale: sale::Model,
+    pub lines: Vec<sale_detail::Model>,
+}
+
+/// Every draft that is worth resuming, newest first.
+///
+/// An empty draft is omitted: it is a cart the cashier opened and walked away from,
+/// and offering one back is noise rather than recovery.
+#[tauri::command]
+pub async fn list_draft_sales() -> CmdResult<Vec<DraftSale>> {
+    list_draft_sales_in(db()).await
+}
+
+pub(crate) async fn list_draft_sales_in<C: ConnectionTrait>(conn: &C) -> CmdResult<Vec<DraftSale>> {
+    let headers = sale::Entity::find()
+        .filter(sale::Column::Status.eq(SALE_STATUS_DRAFT))
+        // Newest first, `id` breaking ties so the order is stable when two drafts land
+        // inside the same clock tick — the same rule the stock ledger follows.
+        .order_by_desc(sale::Column::CreatedAt)
+        .order_by_desc(sale::Column::Id)
+        .all(conn)
+        .await?;
+
+    if headers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // One query for every draft's lines, grouped in memory. A resume screen wants all
+    // of them, so a per-draft read would be N round trips for the same rows.
+    let ids: Vec<i32> = headers.iter().map(|h| h.id).collect();
+    let rows = sale_detail::Entity::find()
+        .filter(sale_detail::Column::SaleId.is_in(ids))
+        .order_by_asc(sale_detail::Column::Id)
+        .all(conn)
+        .await?;
+
+    let mut grouped: HashMap<i32, Vec<sale_detail::Model>> = HashMap::new();
+    for row in rows {
+        grouped.entry(row.sale_id).or_default().push(row);
+    }
+
+    let mut out = Vec::with_capacity(headers.len());
+    for header in headers {
+        let Some(lines) = grouped.remove(&header.id) else {
+            continue;
+        };
+        if lines.is_empty() {
+            continue;
+        }
+        out.push(DraftSale {
+            sale: header,
+            lines,
+        });
+    }
+    Ok(out)
+}
+
+/// Completes a draft: re-validates it, recomputes the money from the stored lines,
+/// and writes the stock movements the draft deliberately withheld.
+///
+/// Nothing from the draft's own header is believed: it was written when the cart was
+/// first scanned, and the draft may have been sitting for days behind a catalog that
+/// has since changed — including a shelf another till has emptied.
+#[tauri::command]
+pub async fn promote_draft(
+    sale_id: i32,
+    paid_total: Option<Decimal>,
+    payment_method: Option<String>,
+) -> CmdResult<SaleView> {
+    promote_draft_in(db(), sale_id, paid_total, payment_method).await
+}
+
+pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    sale_id: i32,
+    paid_total: Option<Decimal>,
+    payment_method: Option<String>,
+) -> CmdResult<SaleView> {
+    let now = chrono::Utc::now();
+    let txn = conn.begin().await?;
+
+    let Some(header) = sale::Entity::find_by_id(sale_id).one(&txn).await? else {
+        return Err(CmdError::NotFound("sale".into()));
+    };
+    // The friendly half of the double-spend guard: it turns the common case — a second
+    // click on a button that already worked — into a clear message. The decisive half
+    // is the conditional UPDATE at the bottom of this function, which is what makes
+    // two *concurrent* promotions safe.
+    if header.status != SALE_STATUS_DRAFT {
+        return Err(CmdError::Conflict(format!(
+            "sale {sale_id} is {}, not a draft",
+            header.status
+        )));
+    }
+
+    let stored = sale_detail::Entity::find()
+        .filter(sale_detail::Column::SaleId.eq(sale_id))
+        .order_by_asc(sale_detail::Column::Id)
+        .all(&txn)
+        .await?;
+    if stored.is_empty() {
+        return Err(CmdError::Validation(format!(
+            "draft sale {sale_id} has no lines"
+        )));
+    }
+
+    // Blank means "keep what the draft already had", matching checkout's tolerance of
+    // the till sending the field whether or not the cashier touched it.
+    let method = match payment_method.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => required(raw, "payment method")?,
+        _ if !header.payment_method.trim().is_empty() => header.payment_method.clone(),
+        _ => SALE_PAYMENT_DEFAULT.to_owned(),
+    };
+
+    // The lines are the record; the header's totals are a cache of them, so every
+    // figure is rebuilt from the lines rather than read back.
+    let mut subtotal = Decimal::ZERO;
+    let mut line_discount_total = Decimal::ZERO;
+    for l in &stored {
+        subtotal += l.unit_price * l.quantity;
+        line_discount_total += l.discount;
+    }
+    // An order-level discount is a cashier input with nowhere else to live, so it
+    // carries over — recovered as the *excess* over the line discounts, which makes
+    // the line part of `discount_total` the rebuilt figure rather than the stored one.
+    // Dropping it instead would silently charge the customer full price, so the
+    // `max` only guards a header inconsistent with its own lines.
+    let order_discount = (header.discount_total - line_discount_total).max(Decimal::ZERO);
+    let discount_total = line_discount_total + order_discount;
+    let tax_total = header.tax_total;
+
+    // The same validator a fresh checkout passes, over the same input shape, so the
+    // rules live in exactly one place: quantities positive, prices and discounts
+    // non-negative, no discount larger than its line, no negative money anywhere.
+    validate_checkout(&CheckoutInput {
+        lines: stored
+            .iter()
+            .map(|l| CheckoutLine {
+                item_id: l.item_id,
+                quantity: l.quantity,
+                unit_price: l.unit_price,
+                discount: Some(l.discount),
+            })
+            .collect(),
+        discount_total: Some(discount_total),
+        tax_total: Some(tax_total),
+        paid_total,
+        payment_method: Some(method.clone()),
+        note: header.note.clone(),
+        promote: None,
+    })?;
+    guard_discount_within_subtotal(discount_total, subtotal)?;
+
+    let grand_total = subtotal - discount_total + tax_total;
+    let paid = paid_total.unwrap_or(grand_total);
+
+    let mut lines: Vec<sale_detail::Model> = Vec::with_capacity(stored.len());
+    let mut stock_on_hand: Vec<ItemOnHand> = Vec::with_capacity(stored.len());
+    let mut seen: HashMap<i32, usize> = HashMap::with_capacity(stored.len());
+
+    for stored_line in &stored {
+        let line = CheckoutLine {
+            item_id: stored_line.item_id,
+            quantity: stored_line.quantity,
+            unit_price: stored_line.unit_price,
+            discount: Some(stored_line.discount),
+        };
+        // The check that matters: the shelf is re-read now, not trusted from scan time,
+        // because another till may have sold this stock while the draft waited. Also
+        // rejects the sale if the item was soft-deleted in the meantime.
+        let (_, available) = guard_line_sellable(&txn, &line).await?;
+        let net = stored_line.unit_price * stored_line.quantity - stored_line.discount;
+
+        let line_row = if net == stored_line.line_total {
+            stored_line.clone()
+        } else {
+            // Persist the rebuilt figure, so the stored row matches the money actually
+            // charged rather than the provisional one written at draft time.
+            let mut am: sale_detail::ActiveModel = stored_line.clone().into();
+            am.line_total = Set(net);
+            am.update(&txn).await?
+        };
+        lines.push(line_row);
+
+        let balance_after = available - line.quantity;
+        record_sale_movement(
+            &txn,
+            line.item_id,
+            sale_id,
+            &header.invoice_no,
+            line.quantity,
+            balance_after,
+            now,
+        )
+        .await?;
+        record_on_hand(&mut stock_on_hand, &mut seen, line.item_id, balance_after);
+    }
+
+    // The decisive double-spend guard, and the point of no return. `status = 'Draft'`
+    // in the WHERE clause makes this a compare-and-swap: a second promoter racing this
+    // one matches no row, sees `rows_affected == 0`, and its whole transaction — the
+    // movements above included — rolls back. There is no window in which two
+    // promotions both commit, which is what makes this safe on a second terminal as
+    // well as on a double click.
+    let flipped = sale::Entity::update_many()
+        .set(sale::ActiveModel {
+            status: Set(SALE_STATUS_COMPLETED.to_owned()),
+            subtotal: Set(subtotal),
+            discount_total: Set(discount_total),
+            tax_total: Set(tax_total),
+            grand_total: Set(grand_total),
+            paid_total: Set(paid),
+            payment_method: Set(method),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .filter(sale::Column::Id.eq(sale_id))
+        .filter(sale::Column::Status.eq(SALE_STATUS_DRAFT))
+        .exec(&txn)
+        .await?;
+
+    if flipped.rows_affected == 0 {
+        return Err(CmdError::Conflict(format!(
+            "sale {sale_id} is no longer a draft"
+        )));
+    }
+
+    // Read the header back instead of assembling it here, so the view is what the
+    // database holds rather than what this function believes it wrote.
+    let row = sale::Entity::find_by_id(sale_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("sale".into()))?;
+
+    let view = SaleView {
+        sale: row,
+        lines,
+        stock_on_hand,
+    };
+    // Committed last: the movements and the status flip become visible together, or
+    // neither does.
+    txn.commit().await?;
+
+    Ok(view)
+}
+
+/// Throws a draft away.
+///
+/// A hard delete, not a soft one: a draft was never completed, so it carries no
+/// financial history worth preserving, and `sales` has no `del_status` by design.
+/// `sale_details` cascades from the foreign key; a draft wrote no stock movements, so
+/// there is no ledger row to reconcile and nothing to give back.
+#[tauri::command]
+pub async fn discard_draft(sale_id: i32) -> CmdResult<()> {
+    discard_draft_in(db(), sale_id).await
+}
+
+pub(crate) async fn discard_draft_in<C: ConnectionTrait>(conn: &C, sale_id: i32) -> CmdResult<()> {
+    let Some(header) = sale::Entity::find_by_id(sale_id).one(conn).await? else {
+        return Err(CmdError::NotFound("sale".into()));
+    };
+    if header.status != SALE_STATUS_DRAFT {
+        return Err(CmdError::Conflict(format!(
+            "sale {sale_id} is {} and cannot be discarded",
+            header.status
+        )));
+    }
+
+    // Conditional delete: `status = 'Draft'` in the WHERE makes this the point where a
+    // promotion that got there first wins, instead of this call erasing a completed
+    // sale's header out from under it.
+    let deleted = sale::Entity::delete_many()
+        .filter(sale::Column::Id.eq(sale_id))
+        .filter(sale::Column::Status.eq(SALE_STATUS_DRAFT))
+        .exec(conn)
+        .await?;
+
+    if deleted.rows_affected == 0 {
+        return Err(CmdError::Conflict(format!(
+            "sale {sale_id} is no longer a draft"
+        )));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

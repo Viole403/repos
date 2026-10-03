@@ -43,6 +43,9 @@ pub fn run() {
             commands::list_stock_movements,
             commands::stock_on_hand,
             commands::checkout,
+            commands::list_draft_sales,
+            commands::promote_draft,
+            commands::discard_draft,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -176,6 +179,43 @@ mod tests {
 
     fn dec(v: i64) -> Decimal {
         Decimal::from(v)
+    }
+
+    /// Save a cart as a `Draft` and return its id — a checkout interrupted before
+    /// payment. Shorthand for the promotion tests, which all need one.
+    async fn draft(db: &DatabaseConnection, lines: Vec<CheckoutLine>) -> i32 {
+        commands::checkout_in(
+            db,
+            CheckoutInput {
+                lines,
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: Some(false),
+            },
+        )
+        .await
+        .expect("draft checkout succeeds")
+        .sale
+        .id
+    }
+
+    /// Ledger rows attributable to one sale. Filtered in Rust rather than SQL because
+    /// `sale_id` is nullable and this reads clearer than an `IS NOT NULL` predicate.
+    async fn movements_for_sale(
+        db: &DatabaseConnection,
+        sale_id: i32,
+    ) -> Vec<stock_movement::Model> {
+        stock_movement::Entity::find()
+            .order_by_asc(stock_movement::Column::Id)
+            .all(db)
+            .await
+            .expect("read the ledger")
+            .into_iter()
+            .filter(|m| m.sale_id == Some(sale_id))
+            .collect()
     }
 
     #[tokio::test]
@@ -540,6 +580,434 @@ mod tests {
         assert!(page.rows.iter().all(|m| m.item_id == rice));
         assert!(page.rows[0].id > page.rows[1].id, "newest movement first");
         assert_eq!(page.rows[0].quantity, dec(-1));
+    }
+
+    // -----------------------------------------------------------------------
+    // The draft lifecycle
+    //
+    // `checkout(promote: false)` writes a recoverable draft and deliberately no stock
+    // movements. These cover the half that makes that promise real: reading the draft
+    // back, promoting it, and discarding it.
+    // -----------------------------------------------------------------------
+
+    /// A crashed checkout leaves a draft. This is the read-back that makes the crash
+    /// recoverable — without it the draft is unreachable and the promise `checkout`
+    /// makes by writing one is empty.
+    #[tokio::test]
+    async fn a_draft_is_listed_for_resume_with_its_lines() {
+        let db = db::init_for_tests().await;
+        let tea = seed_item(&db, "Tea").await;
+        let sugar = seed_item(&db, "Sugar").await;
+        seed_stock(&db, tea, dec(10)).await;
+        seed_stock(&db, sugar, dec(10)).await;
+
+        let first = draft(
+            &db,
+            vec![line(tea, dec(2), dec(5000)), line(sugar, dec(1), dec(3000))],
+        )
+        .await;
+        let second = draft(&db, vec![line(tea, dec(1), dec(5000))]).await;
+
+        // A completed sale is not resumable, so it must not appear here at all.
+        commands::checkout_in(
+            &db,
+            CheckoutInput {
+                lines: vec![line(sugar, dec(1), dec(3000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+            },
+        )
+        .await
+        .expect("checkout succeeds");
+
+        let drafts = commands::list_draft_sales_in(&db).await.expect("list drafts");
+
+        assert_eq!(drafts.len(), 2, "only drafts are resumable");
+        // Newest first, so the crashed cart is the top row.
+        assert_eq!(drafts[0].sale.id, second);
+        assert_eq!(drafts[1].sale.id, first);
+        assert!(drafts.iter().all(|d| d.sale.status == "Draft"));
+
+        // Both of the older draft's lines come back, in cart order.
+        let older = drafts.iter().find(|d| d.sale.id == first).expect("the first draft");
+        assert_eq!(older.lines.len(), 2);
+        assert_eq!(older.lines[0].item_id, tea);
+        assert_eq!(older.lines[0].quantity, dec(2));
+        assert_eq!(older.lines[1].item_id, sugar);
+    }
+
+    /// Promotion is the half of checkout a draft skipped: the ledger rows land, the
+    /// header becomes `Completed`, and the shelf agrees.
+    #[tokio::test]
+    async fn promote_draft_completes_the_sale_and_moves_stock() {
+        let db = db::init_for_tests().await;
+        let cola = seed_item(&db, "Cola").await;
+        let biscuit = seed_item(&db, "Biscuit").await;
+        seed_stock(&db, cola, dec(10)).await;
+        seed_stock(&db, biscuit, dec(4)).await;
+
+        let sale_id = draft(
+            &db,
+            vec![line(cola, dec(2), dec(5000)), line(biscuit, dec(1), dec(2000))],
+        )
+        .await;
+
+        let view = commands::promote_draft_in(&db, sale_id, Some(dec(13000)), Some("Qris".into()))
+            .await
+            .expect("promotion succeeds");
+
+        assert_eq!(view.sale.id, sale_id);
+        assert_eq!(view.sale.status, "Completed");
+        // Rebuilt from the stored lines rather than read back from the draft header.
+        assert_eq!(view.sale.subtotal, dec(12000));
+        assert_eq!(view.sale.discount_total, Decimal::ZERO);
+        assert_eq!(view.sale.grand_total, dec(12000));
+        assert_eq!(view.sale.paid_total, dec(13000));
+        assert_eq!(view.sale.payment_method, "Qris");
+        // The draft already carried its final invoice number, so the ledger can point
+        // at it without a second numbering pass.
+        assert_eq!(view.sale.invoice_no, format!("INV-{sale_id:06}"));
+        assert_eq!(view.lines.len(), 2);
+
+        // The movements the draft withheld are on the ledger, pointing at the sale.
+        let movements = movements_for_sale(&db, sale_id).await;
+        assert_eq!(movements.len(), 2);
+        assert!(movements.iter().all(|m| m.movement_type == "Sale"));
+        assert!(movements.iter().all(|m| m.reference.as_deref() == Some(view.sale.invoice_no.as_str())));
+        // `balance_after` is the running on-hand: 10 - 2 for cola, 4 - 1 for biscuit.
+        assert_eq!(movements[0].quantity, dec(-2));
+        assert_eq!(movements[0].balance_after, dec(8));
+        assert_eq!(movements[1].quantity, dec(-1));
+        assert_eq!(movements[1].balance_after, dec(3));
+
+        // And the derived shelf agrees with the ledger.
+        assert_eq!(commands::stock_on_hand_in(&db, cola).await.unwrap(), dec(8));
+        assert_eq!(commands::stock_on_hand_in(&db, biscuit).await.unwrap(), dec(3));
+
+        // The view carries the resulting on-hand, so the register needs no second call.
+        assert_eq!(view.stock_on_hand.len(), 2);
+
+        // A completed sale is no longer resumable.
+        assert!(commands::list_draft_sales_in(&db).await.unwrap().is_empty());
+    }
+
+    /// With no arguments, the draft's own payment method carries over and the sale is
+    /// paid in full — which is what a cashier pressing "complete" means.
+    #[tokio::test]
+    async fn promote_draft_defaults_the_payment_method_and_the_paid_total() {
+        let db = db::init_for_tests().await;
+        let soap = seed_item(&db, "Soap").await;
+        seed_stock(&db, soap, dec(5)).await;
+
+        let sale_id = draft(&db, vec![line(soap, dec(2), dec(3000))]).await;
+
+        let view = commands::promote_draft_in(&db, sale_id, None, None)
+            .await
+            .expect("promotion succeeds");
+
+        assert_eq!(view.sale.payment_method, "Cash", "the draft's own method");
+        assert_eq!(view.sale.paid_total, view.sale.grand_total, "paid in full");
+        assert_eq!(view.sale.paid_total, dec(6000));
+    }
+
+    /// The double-spend guard, from the sequential side. Asserted against exact
+    /// figures: "the number went down" would pass just as happily on a double
+    /// decrement as on a correct one.
+    #[tokio::test]
+    async fn promoting_twice_does_not_double_decrement_stock() {
+        let db = db::init_for_tests().await;
+        let tv = seed_item(&db, "Television").await;
+        seed_stock(&db, tv, dec(5)).await;
+
+        let sale_id = draft(&db, vec![line(tv, dec(2), dec(500000))]).await;
+
+        commands::promote_draft_in(&db, sale_id, None, None)
+            .await
+            .expect("the first promotion succeeds");
+        assert_eq!(commands::stock_on_hand_in(&db, tv).await.unwrap(), dec(3));
+        assert_eq!(movements_for_sale(&db, sale_id).await.len(), 1);
+
+        // The second attempt is refused, not silently accepted.
+        let err = commands::promote_draft_in(&db, sale_id, None, None)
+            .await
+            .expect_err("a completed sale cannot be promoted again");
+        assert!(
+            matches!(err, commands::CmdError::Conflict(_)),
+            "unexpected error: {err}"
+        );
+
+        // 5 - 2, once. Not 5 - 2 - 2.
+        assert_eq!(commands::stock_on_hand_in(&db, tv).await.unwrap(), dec(3));
+        assert_eq!(
+            movements_for_sale(&db, sale_id).await.len(),
+            1,
+            "one movement for the sale, not two"
+        );
+        // The ledger as a whole is still the opening balance plus that single row.
+        assert_eq!(stock_movement::Entity::find().count(&db).await.unwrap(), 2);
+    }
+
+    /// The same guard, on a sale that was completed outright and was therefore never
+    /// a draft: there is nothing to promote and nothing may be written.
+    #[tokio::test]
+    async fn promote_draft_rejects_a_sale_that_was_never_a_draft() {
+        let db = db::init_for_tests().await;
+        let mug = seed_item(&db, "Mug").await;
+        seed_stock(&db, mug, dec(7)).await;
+
+        let done = commands::checkout_in(
+            &db,
+            CheckoutInput {
+                lines: vec![line(mug, dec(2), dec(15000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+            },
+        )
+        .await
+        .expect("checkout succeeds")
+        .sale
+        .id;
+
+        let err = commands::promote_draft_in(&db, done, None, None)
+            .await
+            .expect_err("a completed sale cannot be promoted");
+        assert!(
+            matches!(err, commands::CmdError::Conflict(_)),
+            "unexpected error: {err}"
+        );
+
+        // The original movement is untouched: still exactly one, still for 2 units.
+        assert_eq!(movements_for_sale(&db, done).await.len(), 1);
+        assert_eq!(commands::stock_on_hand_in(&db, mug).await.unwrap(), dec(5));
+    }
+
+    /// A draft waits; stock does not. Promotion re-reads the shelf instead of trusting
+    /// what the cart believed when it was scanned.
+    #[tokio::test]
+    async fn promote_draft_rejects_when_the_stock_is_gone() {
+        let db = db::init_for_tests().await;
+        let last = seed_item(&db, "LastOne").await;
+        seed_stock(&db, last, dec(3)).await;
+
+        let sale_id = draft(&db, vec![line(last, dec(3), dec(9999))]).await;
+
+        // Another till sells the same stock while the draft waits.
+        commands::checkout_in(
+            &db,
+            CheckoutInput {
+                lines: vec![line(last, dec(2), dec(9999))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+            },
+        )
+        .await
+        .expect("the other till sells");
+
+        let err = commands::promote_draft_in(&db, sale_id, None, None)
+            .await
+            .expect_err("1 left cannot cover a held line of 3");
+        assert!(format!("{err}").contains("in stock but"), "got: {err}");
+
+        // The draft is untouched and still resumable — a refusal must not destroy the
+        // cart the cashier was working on.
+        let drafts = commands::list_draft_sales_in(&db).await.expect("list drafts");
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].sale.id, sale_id);
+        assert_eq!(drafts[0].sale.status, "Draft");
+        assert_eq!(
+            movements_for_sale(&db, sale_id).await.len(),
+            0,
+            "a refused promotion writes no movement"
+        );
+        assert_eq!(commands::stock_on_hand_in(&db, last).await.unwrap(), dec(1));
+    }
+
+    /// A draft may have sat for days behind a catalog that changed, so promotion runs
+    /// the stored lines back through the *same* validator a fresh checkout passes.
+    /// These rows are poked directly because checkout itself cannot produce them.
+    #[tokio::test]
+    async fn promote_draft_revalidates_the_stored_lines() {
+        let db = db::init_for_tests().await;
+        let nail = seed_item(&db, "Nail").await;
+        seed_stock(&db, nail, dec(100)).await;
+
+        let sale_id = draft(&db, vec![line(nail, dec(5), dec(500))]).await;
+        let detail = sale_detail::Entity::find()
+            .filter(sale_detail::Column::SaleId.eq(sale_id))
+            .one(&db)
+            .await
+            .unwrap()
+            .expect("the draft's line");
+
+        let mut am: sale_detail::ActiveModel = detail.clone().into();
+        am.quantity = Set(Decimal::ZERO);
+        am.update(&db).await.unwrap();
+
+        let err = commands::promote_draft_in(&db, sale_id, None, None)
+            .await
+            .expect_err("a zero quantity cannot be promoted");
+        assert!(
+            format!("{err}").contains("quantity must be greater than zero"),
+            "unexpected error: {err}"
+        );
+
+        // A negative price, the other half of the same rule.
+        let mut am: sale_detail::ActiveModel = detail.into();
+        am.quantity = Set(dec(5));
+        am.unit_price = Set(dec(-1));
+        am.update(&db).await.unwrap();
+
+        let err = commands::promote_draft_in(&db, sale_id, None, None)
+            .await
+            .expect_err("a negative price cannot be promoted");
+        assert!(
+            format!("{err}").contains("unit price cannot be negative"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(movements_for_sale(&db, sale_id).await.len(), 0);
+        assert_eq!(commands::stock_on_hand_in(&db, nail).await.unwrap(), dec(100));
+    }
+
+    /// The two shapes promotion cannot recover from: nothing at that id, and a draft
+    /// with no lines. The latter is unreachable through checkout, which refuses an
+    /// empty cart, so the row is written directly.
+    #[tokio::test]
+    async fn promote_draft_rejects_a_missing_or_empty_sale() {
+        let db = db::init_for_tests().await;
+
+        let err = commands::promote_draft_in(&db, 9999, None, None)
+            .await
+            .expect_err("no such sale");
+        assert!(
+            matches!(err, commands::CmdError::NotFound(_)),
+            "unexpected error: {err}"
+        );
+
+        let now = chrono::Utc::now();
+        let empty = sale::ActiveModel {
+            invoice_no: Set("PENDING-empty".into()),
+            status: Set("Draft".into()),
+            subtotal: Set(Decimal::ZERO),
+            discount_total: Set(Decimal::ZERO),
+            tax_total: Set(Decimal::ZERO),
+            grand_total: Set(Decimal::ZERO),
+            paid_total: Set(Decimal::ZERO),
+            payment_method: Set("Cash".into()),
+            customer_id: Set(None),
+            note: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert an empty draft")
+        .id;
+
+        // Omitted from the resume list, so it can never be reached from the UI either.
+        assert!(commands::list_draft_sales_in(&db).await.unwrap().is_empty());
+
+        let err = commands::promote_draft_in(&db, empty, None, None)
+            .await
+            .expect_err("a draft with no lines cannot be promoted");
+        assert!(
+            matches!(err, commands::CmdError::Validation(_)),
+            "unexpected error: {err}"
+        );
+        assert_eq!(movements_for_sale(&db, empty).await.len(), 0);
+    }
+
+    /// A draft was never completed, so discarding it is a plain delete: the lines go
+    /// with it, and the shelf is never touched because no movement ever existed.
+    #[tokio::test]
+    async fn discard_draft_removes_the_sale_and_its_lines() {
+        let db = db::init_for_tests().await;
+        let tea = seed_item(&db, "Tea").await;
+        seed_stock(&db, tea, dec(10)).await;
+
+        let sale_id = draft(&db, vec![line(tea, dec(2), dec(5000))]).await;
+        assert_eq!(sale_detail::Entity::find().count(&db).await.unwrap(), 1);
+
+        commands::discard_draft_in(&db, sale_id)
+            .await
+            .expect("discard succeeds");
+
+        assert!(
+            sale::Entity::find_by_id(sale_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "the header is gone"
+        );
+        assert_eq!(
+            sale_detail::Entity::find().count(&db).await.unwrap(),
+            0,
+            "the lines went with it"
+        );
+        assert!(commands::list_draft_sales_in(&db).await.unwrap().is_empty());
+        // Discarding is not a return: the opening balance is still 10.
+        assert_eq!(commands::stock_on_hand_in(&db, tea).await.unwrap(), dec(10));
+    }
+
+    /// A completed sale is financial history, so it cannot be discarded — only voided
+    /// or refunded, which is a stage away and deliberately not a hard delete.
+    #[tokio::test]
+    async fn discard_draft_refuses_a_completed_sale() {
+        let db = db::init_for_tests().await;
+        let mug = seed_item(&db, "Mug").await;
+        seed_stock(&db, mug, dec(7)).await;
+
+        let done = commands::checkout_in(
+            &db,
+            CheckoutInput {
+                lines: vec![line(mug, dec(2), dec(15000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+            },
+        )
+        .await
+        .expect("checkout succeeds")
+        .sale
+        .id;
+
+        let err = commands::discard_draft_in(&db, done)
+            .await
+            .expect_err("a completed sale cannot be discarded");
+        assert!(
+            matches!(err, commands::CmdError::Conflict(_)),
+            "unexpected error: {err}"
+        );
+
+        // The sale and its movement both survive the refused delete.
+        assert!(sale::Entity::find_by_id(done).one(&db).await.unwrap().is_some());
+        assert_eq!(sale_detail::Entity::find().count(&db).await.unwrap(), 1);
+        assert_eq!(movements_for_sale(&db, done).await.len(), 1);
+
+        let err = commands::discard_draft_in(&db, 9999)
+            .await
+            .expect_err("no such sale");
+        assert!(
+            matches!(err, commands::CmdError::NotFound(_)),
+            "unexpected error: {err}"
+        );
     }
 
     /// Postgres is the default backend, so the schema has to apply there too — not
