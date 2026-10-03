@@ -6,6 +6,7 @@ import { ItemsList } from "./screens/ItemsList";
 import { Brands } from "./screens/Brands";
 import { ItemCategories } from "./screens/ItemCategories";
 import { Register } from "./screens/Register";
+import { Drafts } from "./screens/Drafts";
 import { Units } from "./screens/Units";
 import { enabledRoutes, navItems } from "./nav-config";
 
@@ -16,6 +17,7 @@ const toPath = (href: string) => href.replace(/^#/, "") || "/";
 const screens: Record<string, ReactNode> = {
     "/": <Dashboard />,
     "/pos": <Register />,
+    "/sales/holds": <Drafts />,
     "/catalog/items": <ItemsList />,
     "/catalog/units": <Units />,
     "/catalog/brands": <Brands />,
