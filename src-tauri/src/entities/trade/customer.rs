@@ -27,9 +27,16 @@ pub struct Model {
     pub updated_at: chrono::NaiveDateTime,
 }
 
-// No relations declared until something joins to this table; `DeriveRelation` still
-// has to exist for the derive output to compile.
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    #[sea_orm(has_many = "super::customer_receive::Entity")]
+    CustomerReceive,
+}
+
+impl Related<super::customer_receive::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::CustomerReceive.def()
+    }
+}
 
 impl ActiveModelBehavior for ActiveModel {}
