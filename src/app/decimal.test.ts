@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { decAdd, decCompare, decMul, decStep, decSub, decSum } from "./decimal";
+import {
+    decAdd,
+    decCompare,
+    decIsNegative,
+    decMul,
+    decStep,
+    decSub,
+    decSum,
+} from "./decimal";
 
 /**
  * Money reaches the till as a string, so these helpers are the only thing standing
@@ -84,5 +92,15 @@ describe("decCompare", () => {
         expect(decCompare("2", "10")).toBe(-1);
         expect(decCompare("10", "2")).toBe(1);
         expect(decCompare("2", "2.000")).toBe(0);
+    });
+});
+describe("decIsNegative", () => {
+    test("reads the sign from the digits, not the string order", () => {
+        // "-50.000" < "0" happens to hold for ASCII, but "9.999" < "0" does not —
+        // a string comparison would call this negative.
+        expect(decIsNegative("-50.000")).toBe(true);
+        expect(decIsNegative("9.999")).toBe(false);
+        expect(decIsNegative("0")).toBe(false);
+        expect(decIsNegative("0.001")).toBe(false);
     });
 });

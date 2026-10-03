@@ -58,6 +58,8 @@ export const decSum = (values: readonly Decimal[]): Decimal => values.reduce((to
 
 export const decIsPositive = (value: Decimal): boolean => toScaled(value) > 0n;
 
+export const decIsNegative = (value: Decimal): boolean => toScaled(value) < 0n;
+
 /** -1, 0 or 1. Compare via this rather than `Number(a) - Number(b)`. */
 export const decCompare = (a: Decimal, b: Decimal): number => {
     const left = toScaled(a);
