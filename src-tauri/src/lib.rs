@@ -1,14 +1,126 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+mod commands;
+mod db;
+mod entities;
+mod migration;
+
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .setup(|app| {
+            // Async work can't run on the sync setup hook, so block the thread
+            // until migrations finish. This happens once, before the window opens.
+            let handle = app.handle().clone();
+            let data_dir = handle
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|e| panic!("failed to resolve app data dir: {e}"));
+
+            let url_override = std::env::var("REPOS_DATABASE_URL").ok();
+            tauri::async_runtime::block_on(db::init(&data_dir, url_override.as_deref()))
+                .expect("failed to initialize database");
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::health_check,
+            commands::list_units,
+            commands::create_unit,
+            commands::delete_unit,
+            commands::list_brands,
+            commands::create_brand,
+            commands::delete_brand,
+            commands::list_item_categories,
+            commands::create_item_category,
+            commands::delete_item_category,
+            commands::list_items,
+            commands::create_item,
+            commands::update_item,
+            commands::delete_item,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    //! Migration smoke test against a real in-memory SQLite database.
+    //!
+    //! This is the only automated check in the repo so far. It proves the schema
+    //! applies cleanly and that the soft-delete filter behaves — the two things most
+    //! likely to break silently.
+    use super::*;
+    use crate::entities::catalog::{item, unit};
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+
+    #[tokio::test]
+    async fn migrations_apply_and_query() {
+        let db = db::init_for_tests().await;
+
+        // Tables exist and are empty.
+        assert_eq!(unit::Entity::find().count(&db).await.unwrap(), 0);
+
+        // Insert, then confirm the soft-delete filter hides it.
+        let now = chrono::Utc::now();
+        unit::ActiveModel {
+            unit_name: Set("Piece".into()),
+            description: Set(None),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        assert_eq!(unit::Entity::find().count(&db).await.unwrap(), 1);
+
+        let row = unit::Entity::find()
+            .filter(unit::Column::UnitName.eq("Piece"))
+            .one(&db)
+            .await
+            .unwrap()
+            .expect("unit inserted");
+        let mut model: unit::ActiveModel = row.into();
+        model.del_status = Set("Deleted".into());
+        model.update(&db).await.unwrap();
+
+        assert_eq!(
+            unit::Entity::find()
+                .filter(unit::Column::DelStatus.eq("Live"))
+                .count(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(unit::Entity::find().count(&db).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn dump_schema_sql() {
+        use sea_orm_migration::prelude::SchemaManager;
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let sm = SchemaManager::new(&db);
+        for name in ["auth_and_roles", "master_data", "items"] {
+            let m: &dyn sea_orm_migration::MigrationTrait = match name {
+                "auth_and_roles" => &migration::Migrations::AuthAndRoles,
+                "master_data" => &migration::Migrations::MasterData,
+                _ => &migration::Migrations::Items,
+            };
+            if let Err(e) = m.up(&sm).await {
+                panic!("{name}: {e}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn item_table_exists() {
+        let db = db::init_for_tests().await;
+        assert_eq!(item::Entity::find().count(&db).await.unwrap(), 0);
+    }
 }
