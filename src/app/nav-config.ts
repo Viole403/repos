@@ -19,7 +19,7 @@ import {
 type NavEntry = NavItemType | NavItemDividerType;
 
 /** Screens that exist. Anything else in the tree is inert until built. */
-export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories"]);
+export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/settings/accounts"]);
 
 export const navItems: NavEntry[] = [
     { label: "Dashboard", href: "#/", icon: Home01 },
@@ -76,5 +76,12 @@ export const navItems: NavEntry[] = [
     { label: "Payments", href: "#/payments", icon: CreditCard01, disabled: true },
     { label: "Reports", href: "#/reports", icon: BarChart01, disabled: true },
     { divider: true },
-    { label: "Settings", href: "#/settings", icon: Settings01, disabled: true },
+    {
+        label: "Settings",
+        icon: Settings01,
+        items: [
+            { label: "Accounts", href: "#/settings/accounts", icon: User01 },
+            { label: "Roles", href: "#/settings/roles", disabled: true },
+        ],
+    },
 ];

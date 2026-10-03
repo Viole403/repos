@@ -9,6 +9,7 @@ import { Brands } from "./screens/Brands";
 import { ItemCategories } from "./screens/ItemCategories";
 import { Login, SessionLoading } from "./screens/Login";
 import { Setup } from "./screens/Setup";
+import { Accounts } from "./screens/Accounts";
 import { Register } from "./screens/Register";
 import { Drafts } from "./screens/Drafts";
 import { Units } from "./screens/Units";
@@ -26,6 +27,7 @@ const screens: Record<string, ReactNode> = {
     "/catalog/units": <Units />,
     "/catalog/brands": <Brands />,
     "/catalog/categories": <ItemCategories />,
+    "/settings/accounts": <Accounts />,
 };
 
 /** Derived from the sidebar, so no nav entry can point at a route that does not exist. */
