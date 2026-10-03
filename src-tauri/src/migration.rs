@@ -31,6 +31,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::SalesAndStock),
             Box::new(Migrations::PermissionCatalog),
             Box::new(Migrations::CustomersAndSuppliers),
+            Box::new(Migrations::TradeCredit),
         ]
     }
 }
@@ -43,6 +44,7 @@ pub enum Migrations {
     SalesAndStock,
     PermissionCatalog,
     CustomersAndSuppliers,
+    TradeCredit,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -85,6 +87,7 @@ impl MigrationName for Migrations {
             Migrations::SalesAndStock => "sales_and_stock",
             Migrations::PermissionCatalog => "permission_catalog",
             Migrations::CustomersAndSuppliers => "customers_and_suppliers",
+            Migrations::TradeCredit => "trade_credit",
         }
     }
 }
@@ -99,6 +102,7 @@ impl MigrationTrait for Migrations {
             Migrations::SalesAndStock => sales_and_stock(manager).await?,
             Migrations::PermissionCatalog => permission_catalog(manager).await?,
             Migrations::CustomersAndSuppliers => customers_and_suppliers(manager).await?,
+            Migrations::TradeCredit => trade_credit(manager).await?,
         }
         Ok(())
     }
@@ -106,6 +110,14 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::TradeCredit => {
+                for t in [
+                    SupplierPayments::Table.into_iden(),
+                    CustomerReceives::Table.into_iden(),
+                ] {
+                    manager.drop_table(Table::drop().table(t).if_exists().to_owned()).await?;
+                }
+            }
             Migrations::CustomersAndSuppliers => {
                 for t in [
                     Suppliers::Table.into_iden(),
@@ -638,6 +650,65 @@ async fn customers_and_suppliers(manager: &SchemaManager<'_>) -> Result<(), DbEr
     Ok(())
 }
 
+/// What a customer paid and what was paid to a supplier.
+///
+/// Append-only, like `stock_movements`: a balance is the sum over these and the
+/// sales or purchases that made it owed. No running balance column, because that is a
+/// read-modify-write two concurrent payments can interleave.
+async fn trade_credit(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(CustomerReceives::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(CustomerReceives::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(CustomerReceives::CustomerId).integer().not_null())
+                .col(ColumnDef::new(CustomerReceives::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(CustomerReceives::Reference).string().null())
+                // When the money arrived, which is not when the row was written: a
+                // receipt for last Tuesday is entered today.
+                .col(ColumnDef::new(CustomerReceives::PaidAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(CustomerReceives::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_customer_receives_customer")
+                        .from(CustomerReceives::Table, CustomerReceives::CustomerId)
+                        .to(Customers::Table, Customers::Id)
+                        // Restricted rather than cascading: deleting a customer who has
+                        // paid is a mistake worth refusing, not something to tidy up.
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(SupplierPayments::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(SupplierPayments::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(SupplierPayments::SupplierId).integer().not_null())
+                .col(ColumnDef::new(SupplierPayments::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(SupplierPayments::Reference).string().null())
+                .col(ColumnDef::new(SupplierPayments::PaidAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(SupplierPayments::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_supplier_payments_supplier")
+                        .from(SupplierPayments::Table, SupplierPayments::SupplierId)
+                        .to(Suppliers::Table, Suppliers::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 
 /// Every permission this app guards, as `group` -> actions.
@@ -712,6 +783,28 @@ async fn permission_catalog(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     }
 
     Ok(())
+}
+
+#[derive(Iden)]
+enum CustomerReceives {
+    Table,
+    Id,
+    CustomerId,
+    Amount,
+    Reference,
+    PaidAt,
+    CreatedAt,
+}
+
+#[derive(Iden)]
+enum SupplierPayments {
+    Table,
+    Id,
+    SupplierId,
+    Amount,
+    Reference,
+    PaidAt,
+    CreatedAt,
 }
 
 #[derive(Iden)]
