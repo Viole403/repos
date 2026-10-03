@@ -22,3 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local machine tuning, not project source: build job count, sccache, and a
+# mold/clang linker chosen for one box. Committing it breaks builds elsewhere
+# (rustc-wrapper alone fails without sccache installed).
+src-tauri/.cargo/
+
+# Language-server cache and per-machine project state.
+.serena/
