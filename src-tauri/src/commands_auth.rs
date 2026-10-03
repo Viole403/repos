@@ -157,12 +157,44 @@ pub async fn install_status_in<C: sea_orm::ConnectionTrait>(conn: &C) -> CmdResu
 // Accounts
 // ---------------------------------------------------------------------------
 
+/// Guard an account read or write. The session id is an argument for the same
+/// reason it is on [`require`]; nothing from the wire supplies it.
+async fn require_account<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user_id: Option<i32>,
+    permission: &str,
+) -> CmdResult<()> {
+    match user_id {
+        Some(id) => require(conn, id, permission).await,
+        None => Err(CmdError::Forbidden("you are not signed in".into())),
+    }
+}
+
+/// Guard for creating an account — the one command reachable without a session,
+/// and only while nobody can sign in. The exception closes on the first live
+/// account, so it cannot mint extra accounts on a claimed install.
+pub async fn require_account_create<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user_id: Option<i32>,
+) -> CmdResult<()> {
+    if live_user_count(conn).await? == 0 {
+        return Ok(());
+    }
+    require_account(conn, user_id, "user-create").await
+}
+
 #[tauri::command]
 pub async fn list_users() -> CmdResult<Vec<UserView>> {
+    let conn = db();
+    require_account(conn, auth::current_user_id(), "user-list").await?;
+    list_users_in(conn).await
+}
+
+pub async fn list_users_in<C: sea_orm::ConnectionTrait>(conn: &C) -> CmdResult<Vec<UserView>> {
     let rows = users::Entity::find()
         .filter(users::Column::DelStatus.eq("Live"))
         .order_by_asc(users::Column::Name)
-        .all(db())
+        .all(conn)
         .await?;
     Ok(rows.into_iter().map(UserView::from).collect())
 }
@@ -334,6 +366,7 @@ async fn attach_role<C: sea_orm::ConnectionTrait>(
 #[tauri::command]
 pub async fn create_user(input: UserInput) -> CmdResult<UserView> {
     let conn = db();
+    require_account_create(conn, auth::current_user_id()).await?;
     create_user_in(conn, input).await
 }
 
@@ -344,6 +377,7 @@ pub async fn create_user(input: UserInput) -> CmdResult<UserView> {
 #[tauri::command]
 pub async fn delete_user(id: i32) -> CmdResult<()> {
     let conn = db();
+    require_account(conn, auth::current_user_id(), "user-destroy").await?;
     delete_user_in(conn, id).await
 }
 
@@ -1119,7 +1153,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_soft_deleted_account_resolves_no_permissions() {
+    async fn an_unclaimed_install_takes_an_account_without_a_session() {
+        let conn = init_for_tests().await;
+        assert_eq!(live_user_count(&conn).await.unwrap(), 0);
+
+        require_account_create(&conn, None)
+            .await
+            .expect("the first account has to be creatable with nobody signed in");
+    }
+
+    #[tokio::test]
+    async fn a_claimed_install_refuses_an_anonymous_account() {
         let conn = init_for_tests().await;
         let owner = create_user_in(
             &conn,
@@ -1133,16 +1177,107 @@ mod tests {
         )
         .await
         .expect("first");
+
+        let err = require_account_create(&conn, None)
+            .await
+            .expect_err("one account exists, so the exception is closed");
+
         assert!(
-            has_permission_in(&conn, owner.id, "user-list").await.unwrap(),
-            "an owner bypasses the pivot, so the fix cannot hide behind the grants"
+            matches!(err, CmdError::Forbidden(_)),
+            "expected Forbidden, got {err:?}"
         );
+        require_account_create(&conn, Some(owner.id))
+            .await
+            .expect("the owner holds user-create");
+    }
+
+    #[tokio::test]
+    async fn a_signed_in_account_without_the_permission_cannot_create_another() {
+        let conn = init_for_tests().await;
+        create_user_in(
+            &conn,
+            UserInput {
+                name: "Owner".into(),
+                email: "owner@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("first");
+
+        let clerk = create_user_in(
+            &conn,
+            UserInput {
+                name: "Clerk".into(),
+                email: "clerk@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: Some("Cashier".into()),
+            },
+        )
+        .await
+        .expect("second");
+
+        let err = require_account_create(&conn, Some(clerk.id))
+            .await
+            .expect_err("a Staff role with no grants must not create accounts");
+
+        assert!(
+            matches!(err, CmdError::Forbidden(ref m) if m.contains("user-create")),
+            "expected a refusal naming the permission, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_accounts_needs_the_list_permission() {
+        let conn = init_for_tests().await;
+        let owner = create_user_in(
+            &conn,
+            UserInput {
+                name: "Owner".into(),
+                email: "owner@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("first");
+
+        assert!(
+            require_account(&conn, None, "user-list").await.is_err(),
+            "an anonymous caller must not read the account list"
+        );
+        require_account(&conn, Some(owner.id), "user-list")
+            .await
+            .expect("the owner holds user-list");
+    }
+
+    #[tokio::test]
+    async fn a_soft_deleted_account_does_not_pass_a_guard() {
+        let conn = init_for_tests().await;
+        let owner = create_user_in(
+            &conn,
+            UserInput {
+                name: "Owner".into(),
+                email: "owner@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("first");
 
         delete_user_in(&conn, owner.id).await.expect("delete");
 
         assert!(
-            !has_permission_in(&conn, owner.id, "user-list").await.unwrap(),
-            "a deleted account still holds every permission, so deleting one removes nothing"
+            require_account(&conn, Some(owner.id), "user-list")
+                .await
+                .is_err(),
+            "a deleted owner still passes the guard, so deleting an account removes nothing"
         );
     }
 }
