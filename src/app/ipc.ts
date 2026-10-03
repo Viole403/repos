@@ -150,6 +150,102 @@ export interface ItemInput {
     loyaltyPoint?: Decimal;
 }
 
+/**
+ * A sale header. No `delStatus`: financial history is voided or refunded, never
+ * soft-deleted. `status` is typed `string` to mirror the column, but the only two
+ * values written are `Draft` and `Completed`.
+ */
+export interface Sale {
+    id: number;
+    invoiceNo: string;
+    status: string;
+    /** Sum of `unitPrice * quantity` across lines, before any discount. */
+    subtotal: Decimal;
+    discountTotal: Decimal;
+    taxTotal: Decimal;
+    /** `subtotal - discountTotal + taxTotal`. */
+    grandTotal: Decimal;
+    /** Below `grandTotal` is a part-paid sale; above it is change given back. */
+    paidTotal: Decimal;
+    paymentMethod: string;
+    customerId: number | null;
+    note: string | null;
+    createdAt: Timestamp;
+    updatedAt: Timestamp;
+}
+
+/** One cart line as written. `itemName` and `unitPrice` are sale-time snapshots. */
+export interface SaleDetail {
+    id: number;
+    saleId: number;
+    itemId: number;
+    itemName: string;
+    unitPrice: Decimal;
+    quantity: Decimal;
+    discount: Decimal;
+    /** `unitPrice * quantity - discount`. */
+    lineTotal: Decimal;
+    taxAmount: Decimal;
+    createdAt: Timestamp;
+}
+
+/** One entry per distinct item touched by a sale. */
+export interface ItemOnHand {
+    itemId: number;
+    quantity: Decimal;
+}
+
+export interface SaleView {
+    sale: Sale;
+    lines: SaleDetail[];
+    /** Returned so the register can refresh without a second round-trip. */
+    stockOnHand: ItemOnHand[];
+}
+
+export interface CheckoutLine {
+    itemId: number;
+    /** Must be greater than zero. Fractional is real (2.5 kg). */
+    quantity: Decimal;
+    /** The price *at sale time*, from the client. */
+    unitPrice: Decimal;
+    discount?: Decimal | null;
+}
+
+export interface CheckoutInput {
+    lines: CheckoutLine[];
+    /** Order-level discount, applied on top of the per-line discounts. */
+    discountTotal?: Decimal | null;
+    taxTotal?: Decimal | null;
+    /** Omit to pay in full. A smaller figure is a part-paid / credit sale. */
+    paidTotal?: Decimal | null;
+    /** `"Cash" | "Card" | "Qris"` in the register; any non-blank string server-side. */
+    paymentMethod?: string | null;
+    note?: string | null;
+    /** `false` leaves the sale as a `Draft` and writes no stock movements. Defaults `true`. */
+    promote?: boolean | null;
+}
+
+/** Closed vocabulary, stored and sent in PascalCase so raw SQL stays readable. */
+export type MovementType = "Sale" | "SaleReturn" | "GoodsReceipt" | "Adjustment" | "TransferOut" | "TransferIn" | "OpeningBalance";
+
+/**
+ * One immutable ledger row. On-hand is derived as `SUM(quantity)`, so `items`
+ * carries no quantity column. `quantity` is signed: negative leaves the shelf.
+ */
+export interface StockMovement {
+    id: number;
+    itemId: number;
+    /** Null once the causing sale is hard-deleted; the movement outlives it. */
+    saleId: number | null;
+    movementType: MovementType;
+    quantity: Decimal;
+    /** Receipt number, adjustment reason code, transfer note. */
+    reference: string | null;
+    /** On-hand immediately after this row landed. */
+    balanceAfter: Decimal;
+    createdAt: Timestamp;
+}
+
 export class IpcError extends Error {
     constructor(message: string) {
         super(message);
@@ -188,3 +284,13 @@ export const listItems = (query: PageQuery = {}) => call<Page<ItemView>>("list_i
 export const createItem = (input: ItemInput) => call<Item>("create_item", { input });
 export const updateItem = (id: number, input: ItemInput) => call<Item>("update_item", { id, input });
 export const deleteItem = (id: number) => call<void>("delete_item", { id });
+
+export const listStockMovements = (itemId: number, query: PageQuery = {}) => call<Page<StockMovement>>("list_stock_movements", { itemId, query });
+export const stockOnHand = (itemId: number) => call<Decimal>("stock_on_hand", { itemId });
+
+/**
+ * Writes the sale, its lines and the stock movements as one transaction. The
+ * server recomputes every total and rejects an oversell or a non-positive
+ * quantity, so this is the authority — client totals are for display only.
+ */
+export const checkout = (input: CheckoutInput) => call<SaleView>("checkout", { input });
