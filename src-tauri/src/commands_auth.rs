@@ -168,15 +168,125 @@ pub async fn create_user_in<C: sea_orm::ConnectionTrait>(conn: &C, input: UserIn
         ..Default::default()
     };
 
+    // Resolved before the insert: refusing afterwards would leave an account row with
+    // no role attached, which is an account that can sign in and then do nothing.
+    let (label, role_type) = resolve_role_label(conn, input.role.as_deref()).await?;
+
     // The unique index is the real guard; this turns it into a readable message
     // instead of a raw database error surfacing in a toast.
-    match model.insert(conn).await {
-        Ok(row) => Ok(UserView::from(row)),
-        Err(DbErr::Query(err)) if is_unique_violation(&err) => Err(CmdError::Conflict(format!(
-            "an account with the email {email} already exists"
-        ))),
-        Err(err) => Err(err.into()),
+    let row = match model.clone().insert(conn).await {
+        Ok(row) => row,
+        Err(DbErr::Query(err)) if is_unique_violation(&err) => {
+            return Err(CmdError::Conflict(format!(
+                "an account with the email {email} already exists"
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    // A user row on its own grants nothing: permissions resolve through the
+    // `user_roles` pivot, so without this the account authenticates and then every
+    // guarded command rejects it. The first account is made owner-level because a
+    // fresh install has no users, and so no other way to create one that could reach
+    // the screen needed to create the first account.
+    attach_role(conn, row.id, &label, role_type).await?;
+
+    Ok(UserView {
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        phone: row.phone,
+        role: Some(label),
+        photo: row.photo,
+    })
+}
+
+/// Role of the first account. `Master` is owner level and bypasses the
+/// `role_permissions` pivot entirely.
+const FIRST_ACCOUNT_ROLE: &str = "Super Admin";
+const STAFF_ROLE_NAME: &str = "Staff";
+const MASTER_ROLE_TYPE: &str = "Master";
+const STAFF_ROLE_TYPE: &str = "Staff";
+
+/// Decide which role a new account gets, or refuse the request.
+///
+/// The `role` field on a user is free text, so an unknown name would otherwise
+/// produce an account with a label and no permissions at all. Resolving it against a
+/// real role type is what makes the label mean something.
+async fn resolve_role_label<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    label: Option<&str>,
+) -> CmdResult<(String, &'static str)> {
+    // Counted before this account's own row exists, so empty means this is the first.
+    let first = users::Entity::find().all(conn).await?.is_empty();
+    let requested = label
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_owned);
+
+    if !first && requested.as_deref() == Some(FIRST_ACCOUNT_ROLE) {
+        // Refused rather than quietly downgraded: the owner role belongs to the first
+        // account, and naming it must not become a way to reach it.
+        return Err(CmdError::Validation(format!(
+            "{FIRST_ACCOUNT_ROLE} is the first account's role and cannot be taken by another"
+        )));
     }
+
+    Ok(match requested {
+        Some(name) => (name, if first { MASTER_ROLE_TYPE } else { STAFF_ROLE_TYPE }),
+        None if first => (FIRST_ACCOUNT_ROLE.to_owned(), MASTER_ROLE_TYPE),
+        None => (STAFF_ROLE_NAME.to_owned(), STAFF_ROLE_TYPE),
+    })
+}
+
+/// Attach the resolved role to the account, creating the role when it does not exist.
+async fn attach_role<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+    label: &str,
+    role_type: &str,
+) -> CmdResult<()> {
+    // Matched on the type as well as the name. Matching the name alone would let a
+    // later account attach to the `Master` row the first one created, and every
+    // operator after the owner would silently hold owner permissions.
+    let role_id = match roles::Entity::find()
+        .filter(roles::Column::Name.eq(label))
+        .filter(roles::Column::RoleType.eq(role_type))
+        .filter(roles::Column::DelStatus.eq("Live"))
+        .one(conn)
+        .await?
+    {
+        Some(existing) => existing.id,
+        None => roles::ActiveModel {
+            name: Set(label.to_owned()),
+            guard_name: Set(label.to_owned()),
+            role_type: Set(role_type.to_owned()),
+            del_status: Set("Live".into()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?
+        .id,
+    };
+
+    let already = user_roles::Entity::find()
+        .filter(user_roles::Column::UserId.eq(user_id))
+        .filter(user_roles::Column::RoleId.eq(role_id))
+        .one(conn)
+        .await?;
+    if already.is_none() {
+        user_roles::ActiveModel {
+            user_id: Set(user_id),
+            role_id: Set(role_id),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -774,5 +884,111 @@ mod tests {
 
         // No user 9999. Must be a plain rejection, never a panic or an allow.
         assert!(require(&conn, 9999, "unit-list").await.is_err());
+    }
+    /// A fresh install has no users. The very first account must be usable, or
+    /// nobody can ever sign in and every command stays locked behind the guards.
+    #[tokio::test]
+    async fn the_first_account_can_actually_use_the_app() {
+        let conn = init_for_tests().await;
+
+        assert!(
+            users::Entity::find().all(&conn).await.unwrap().is_empty(),
+            "a migrated database starts with no accounts"
+        );
+
+        let owner = create_user_in(
+            &conn,
+            UserInput {
+                name: "Owner".into(),
+                email: "owner@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("the first account must be creatable");
+
+        // The user row is not enough: permissions resolve through the pivot, and a
+        // soft-deleted user must not pass either.
+        assert!(
+            require(&conn, owner.id, "sale-pos")
+                .await
+                .is_ok(),
+            "the first account holds no permissions, so every guarded command rejects"
+        );
+    }
+    /// The first account is owner-level because there is nothing to bootstrap it with.
+    /// Every account after that must not be, or any operator could mint themselves an
+    /// owner by typing a role name.
+    #[tokio::test]
+    async fn a_later_account_does_not_inherit_owner_level() {
+        let conn = init_for_tests().await;
+        let input = |email: &str| UserInput {
+            name: "Someone".into(),
+            email: email.into(),
+            password: "correct-horse".into(),
+            phone: None,
+            role: None,
+        };
+
+        let first = create_user_in(&conn, input("first@example.com")).await.expect("first");
+        require(&conn, first.id, "sale-pos").await.expect("owner");
+
+        // The same request that just worked, on a second account.
+        let second = create_user_in(&conn, input("second@example.com")).await.expect("second");
+
+        assert!(
+            require(&conn, second.id, "sale-pos").await.is_err(),
+            "a second account must not be owner-level"
+        );
+    }
+
+    /// Naming a role must not grant it either — the label is resolved, not trusted.
+    #[tokio::test]
+    async fn a_named_role_does_not_grant_itself() {
+        let conn = init_for_tests().await;
+        create_user_in(
+            &conn,
+            UserInput {
+                name: "Owner".into(),
+                email: "owner@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("first");
+
+        // Asking for the owner role by name is refused outright — silently accepting
+        // the request and downgrading it would tell the operator the account was set
+        // up when it is not.
+        let err = create_user_in(
+            &conn,
+            UserInput {
+                name: "Wannabe".into(),
+                email: "wannabe@example.com".into(),
+                password: "correct-horse".into(),
+                phone: None,
+                role: Some(FIRST_ACCOUNT_ROLE.into()),
+            },
+        )
+        .await
+        .expect_err("naming the owner role must be refused");
+
+        assert!(
+            matches!(err, CmdError::Validation(_)),
+            "expected a Validation refusal, got {err:?}"
+        );
+        assert!(
+            users::Entity::find()
+                .filter(users::Column::Email.eq("wannabe@example.com"))
+                .all(&conn)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused account must not be left behind"
+        );
     }
 }
