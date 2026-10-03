@@ -60,6 +60,7 @@ pub fn run() {
             commands_auth::create_role,
             commands_auth::set_role_permissions,
             commands_auth::delete_role,
+            commands::list_sales,
             commands::list_customers,
             commands::create_customer,
             commands::update_customer,
@@ -246,6 +247,43 @@ mod tests {
         .await
         .expect("seed sale")
         .id
+    }
+
+    async fn seed_sale(
+        db: &DatabaseConnection,
+        at: chrono::NaiveDateTime,
+        total: Decimal,
+        customer_id: Option<i32>,
+        status: &str,
+    ) -> i32 {
+        let invoice = format!("PENDING-{at}-{total:?}");
+        sale::ActiveModel {
+            invoice_no: Set(invoice),
+            status: Set(status.to_owned()),
+            subtotal: Set(total),
+            discount_total: Set(Decimal::ZERO),
+            tax_total: Set(Decimal::ZERO),
+            grand_total: Set(total),
+            paid_total: Set(total),
+            payment_method: Set("Cash".into()),
+            customer_id: Set(customer_id),
+            note: Set(None),
+            created_at: Set(at),
+            updated_at: Set(at),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("seed sale")
+        .id
+    }
+
+    fn page_one() -> commands::PageQuery {
+        commands::PageQuery { page: 1, per_page: 50, search: None }
+    }
+
+    fn no_filter() -> commands::SaleFilter {
+        commands::SaleFilter::default()
     }
 
     async fn seed_item(db: &DatabaseConnection, name: &str) -> i32 {
@@ -1444,5 +1482,90 @@ mod tests {
             view.sale.customer_id.is_none(),
             "a walk-in sale must not be pinned to a placeholder customer"
         );
+    }
+
+    #[tokio::test]
+    async fn the_sales_list_names_the_customer() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let now = migration::now();
+        seed_sale(&db, now, Decimal::new(1_000, 3), Some(customer), "Completed").await;
+        seed_sale(&db, now, Decimal::new(2_000, 3), None, "Completed").await;
+
+        let rows = commands::list_sales_in(&db, &no_filter(), &page_one()).await.unwrap().rows;
+        assert_eq!(rows.len(), 2);
+        let named = rows.iter().find(|r| r.customer_id == Some(customer)).unwrap();
+        assert_eq!(named.customer_name.as_deref(), Some("Regular"));
+        let walk_in = rows.iter().find(|r| r.customer_id.is_none()).unwrap();
+        assert!(walk_in.customer_name.is_none(), "a walk-in sale must not inherit a name");
+    }
+
+    #[tokio::test]
+    async fn a_date_filter_includes_the_whole_named_day() {
+        let db = db::init_for_tests().await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        let morning = day.and_hms_opt(0, 0, 1).unwrap();
+        let last_second = day.and_hms_opt(23, 59, 59).unwrap();
+        let next_day = day.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap();
+
+        seed_sale(&db, morning, Decimal::new(1_000, 3), None, "Completed").await;
+        seed_sale(&db, last_second, Decimal::new(2_000, 3), None, "Completed").await;
+        seed_sale(&db, next_day, Decimal::new(3_000, 3), None, "Completed").await;
+
+        let filter = commands::SaleFilter {
+            from: Some("2026-10-03".into()),
+            to: Some("2026-10-03".into()),
+            ..Default::default()
+        };
+        let rows = commands::list_sales_in(&db, &filter, &page_one()).await.unwrap().rows;
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "a sale at 23:59:59 is inside the day it happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_date_narrows_nothing() {
+        let db = db::init_for_tests().await;
+        seed_sale(&db, migration::now(), Decimal::new(1_000, 3), None, "Completed").await;
+
+        let filter = commands::SaleFilter { from: Some("03/10/2026".into()), ..Default::default() };
+        let rows = commands::list_sales_in(&db, &filter, &page_one()).await.unwrap().rows;
+        assert_eq!(rows.len(), 1, "a typo in the date box empties the list instead of ignoring it");
+    }
+
+    #[tokio::test]
+    async fn a_draft_is_hidden_from_the_sales_list_unless_asked_for() {
+        let db = db::init_for_tests().await;
+        let now = migration::now();
+        seed_sale(&db, now, Decimal::new(1_000, 3), None, "Completed").await;
+        seed_sale(&db, now, Decimal::new(2_000, 3), None, "Draft").await;
+
+        let all = commands::list_sales_in(&db, &no_filter(), &page_one()).await.unwrap();
+        assert_eq!(all.rows.len(), 2);
+        assert_eq!(all.total, 2);
+
+        let completed = commands::list_sales_in(
+            &db,
+            &commands::SaleFilter { status: Some("Completed".into()), ..Default::default() },
+            &page_one(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(completed.total, 1);
+        assert_eq!(completed.rows[0].status, "Completed");
+    }
+
+    #[tokio::test]
+    async fn the_sales_list_is_newest_first() {
+        let db = db::init_for_tests().await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        seed_sale(&db, day.and_hms_opt(9, 0, 0).unwrap(), Decimal::new(1_000, 3), None, "Completed").await;
+        let later = seed_sale(&db, day.and_hms_opt(17, 0, 0).unwrap(), Decimal::new(2_000, 3), None, "Completed").await;
+
+        let rows = commands::list_sales_in(&db, &no_filter(), &page_one()).await.unwrap().rows;
+        assert_eq!(rows.first().unwrap().id, later, "the newest sale is not first");
     }
 }

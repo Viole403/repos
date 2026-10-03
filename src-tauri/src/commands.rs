@@ -723,6 +723,130 @@ pub async fn list_supplier_payments(supplier_id: i32) -> CmdResult<Vec<supplier_
 }
 
 // ---------------------------------------------------------------------------
+// Sales
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaleFilter {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub customer_id: Option<i32>,
+    /// Inclusive start of the day, as `YYYY-MM-DD`.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Inclusive end of the day. Compared as a half-open `< next day`, so a sale at
+    /// 23:59 is not lost to a `BETWEEN` on dates.
+    #[serde(default)]
+    pub to: Option<String>,
+}
+
+/// A sale row with the customer named, so the list does not show ids.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaleSummary {
+    pub id: i32,
+    pub invoice_no: String,
+    pub status: String,
+    pub grand_total: Decimal,
+    pub paid_total: Decimal,
+    pub payment_method: String,
+    pub customer_id: Option<i32>,
+    pub customer_name: Option<String>,
+    pub note: Option<String>,
+    pub created_at: NaiveDateTime,
+}
+
+#[tauri::command]
+pub async fn list_sales(filter: SaleFilter, query: PageQuery) -> CmdResult<Page<SaleSummary>> {
+    crate::commands_auth::require_permission(db(), "sale-list").await?;
+    list_sales_in(db(), &filter, &query).await
+}
+
+pub async fn list_sales_in<C: ConnectionTrait>(
+    conn: &C,
+    filter: &SaleFilter,
+    query: &PageQuery,
+) -> CmdResult<Page<SaleSummary>> {
+    let mut q = sale::Entity::find();
+
+    if let Some(ref status) = filter.status {
+        let trimmed = status.trim();
+        if !trimmed.is_empty() {
+            q = q.filter(sale::Column::Status.eq(trimmed));
+        }
+    }
+    if let Some(customer_id) = filter.customer_id {
+        q = q.filter(sale::Column::CustomerId.eq(customer_id));
+    }
+    // A bad date is ignored rather than refused: a filter box with a typo should show
+    // the unfiltered list, not an error the cashier has to dismiss before seeing sales.
+    if let Some((start, _)) = filter.from.as_deref().and_then(day_bounds) {
+        q = q.filter(sale::Column::CreatedAt.gte(start));
+    }
+    // Half-open on the *next* day, so a sale at 23:59 on the named day is included.
+    if let Some((_, next)) = filter.to.as_deref().and_then(day_bounds) {
+        q = q.filter(sale::Column::CreatedAt.lt(next));
+    }
+
+    let total = q.clone().count(conn).await?;
+    let rows = q
+        .order_by_desc(sale::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+
+    // One query for the page rather than one per row.
+    let names = customer_names(conn, &rows).await?;
+
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        views.push(SaleSummary {
+            customer_name: row.customer_id.and_then(|id| names.get(&id).cloned()),
+            id: row.id,
+            invoice_no: row.invoice_no,
+            status: row.status,
+            grand_total: row.grand_total,
+            paid_total: row.paid_total,
+            payment_method: row.payment_method,
+            customer_id: row.customer_id,
+            note: row.note,
+            created_at: row.created_at,
+        });
+    }
+    Ok(Page::new(views, total, query))
+}
+
+/// Midnight at the start of `YYYY-MM-DD`, and midnight at the start of the next day.
+/// `None` for anything unparseable, so a typo narrows nothing rather than erroring.
+fn day_bounds(raw: &str) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
+    Some((date.and_hms_opt(0, 0, 0)?, date.succ_opt()?.and_hms_opt(0, 0, 0)?))
+}
+
+/// Names for the page's customers, keyed by id. Walk-in sales are simply absent.
+async fn customer_names<C: ConnectionTrait>(
+    conn: &C,
+    rows: &[sale::Model],
+) -> CmdResult<std::collections::HashMap<i32, String>> {
+    let ids: Vec<i32> = rows.iter().filter_map(|r| r.customer_id).collect();
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let found = customer::Entity::find()
+        .filter(customer::Column::Id.is_in(ids))
+        .all(conn)
+        .await?;
+    Ok(found.into_iter().map(|c| (c.id, c.name)).collect())
+}
+
+// ---------------------------------------------------------------------------
 // Units
 // ---------------------------------------------------------------------------
 
