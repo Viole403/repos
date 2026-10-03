@@ -292,12 +292,31 @@ export const healthCheck = () => call<number>("health_check");
 
 // ---------------------------------------------------------------- auth
 //
-// ponytail: these four are the only auth surface the frontend needs. Role-based
-// permission checks belong on the Rust side — a client-side guard is UI, not a
-// boundary. Add wrappers here only when a command actually exists.
+// Permission checks belong on the Rust side — a client-side guard is UI, not a
+// boundary. Add a wrapper here only when a command exists to call.
 
+export interface InstallStatus {
+    /** No live account exists, so nobody can sign in and the wizard is the only way in. */
+    needsSetup: boolean;
+    accountCount: number;
+}
+
+export interface UserInput {
+    name: string;
+    email: string;
+    password: string;
+    phone?: string | null;
+    role?: string | null;
+}
+
+export const installStatus = () => call<InstallStatus>("install_status");
 export const login = (input: LoginInput) => call<UserView>("login", { input });
 export const logout = () => call<void>("logout");
+export const listUsers = () => call<UserView[]>("list_users");
+export const createUser = (input: UserInput) => call<UserView>("create_user", { input });
+export const deleteUser = (id: number) => call<void>("delete_user", { id });
+/** The signed-in user's permissions, for hiding what the operator cannot do. */
+export const myPermissions = () => call<string[]>("my_permissions");
 /**
  * The signed-in user. The session lives in a process-wide cell, so this is the
  * restore — but note it *rejects* with `NotFound("session")` when nobody is
