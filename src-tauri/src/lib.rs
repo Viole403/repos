@@ -57,6 +57,9 @@ pub fn run() {
             commands_auth::delete_user,
             commands_auth::list_roles,
             commands_auth::set_user_role,
+            commands_auth::create_role,
+            commands_auth::set_role_permissions,
+            commands_auth::delete_role,
             commands_auth::has_permission,
             commands_auth::my_permissions,
         ])
