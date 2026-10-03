@@ -3,6 +3,7 @@ import type { RouteObject } from "react-router-dom";
 import { AppShell } from "./AppShell";
 import { Dashboard } from "./screens/Dashboard";
 import { ItemsList } from "./screens/ItemsList";
+import { Brands } from "./screens/Brands";
 import { Units } from "./screens/Units";
 import { enabledRoutes, navItems } from "./nav-config";
 
@@ -14,6 +15,7 @@ const screens: Record<string, ReactNode> = {
     "/": <Dashboard />,
     "/catalog/items": <ItemsList />,
     "/catalog/units": <Units />,
+    "/catalog/brands": <Brands />,
 };
 
 /** Derived from the sidebar, so no nav entry can point at a route that does not exist. */
