@@ -19,11 +19,11 @@ import {
 type NavEntry = NavItemType | NavItemDividerType;
 
 /** Screens that exist. Anything else in the tree is inert until built. */
-export const enabledRoutes = new Set(["/", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories"]);
+export const enabledRoutes = new Set(["/", "/pos", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories"]);
 
 export const navItems: NavEntry[] = [
     { label: "Dashboard", href: "#/", icon: Home01 },
-    { label: "POS Register", href: "#/pos", icon: ShoppingCart01, disabled: true },
+    { label: "POS Register", href: "#/pos", icon: ShoppingCart01 },
     { divider: true },
     {
         label: "Catalog",

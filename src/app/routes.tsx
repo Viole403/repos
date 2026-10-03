@@ -5,6 +5,7 @@ import { Dashboard } from "./screens/Dashboard";
 import { ItemsList } from "./screens/ItemsList";
 import { Brands } from "./screens/Brands";
 import { ItemCategories } from "./screens/ItemCategories";
+import { Register } from "./screens/Register";
 import { Units } from "./screens/Units";
 import { enabledRoutes, navItems } from "./nav-config";
 
@@ -14,6 +15,7 @@ const toPath = (href: string) => href.replace(/^#/, "") || "/";
 /** Every route the app renders, keyed by path. An enabled entry missing here throws — see AGENTS.md. */
 const screens: Record<string, ReactNode> = {
     "/": <Dashboard />,
+    "/pos": <Register />,
     "/catalog/items": <ItemsList />,
     "/catalog/units": <Units />,
     "/catalog/brands": <Brands />,
