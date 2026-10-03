@@ -8,6 +8,7 @@ import { ItemsList } from "./screens/ItemsList";
 import { Brands } from "./screens/Brands";
 import { ItemCategories } from "./screens/ItemCategories";
 import { Login, SessionLoading } from "./screens/Login";
+import { Setup } from "./screens/Setup";
 import { Register } from "./screens/Register";
 import { Drafts } from "./screens/Drafts";
 import { Units } from "./screens/Units";
@@ -61,11 +62,11 @@ const RequireAuth = () => {
 
 /** The login route itself: a signed-in operator has no reason to see it. */
 const OnlyAnonymous = () => {
-    const { status } = useAuth();
+    const { status, needsSetup } = useAuth();
 
     if (status === "restoring") return <SessionLoading />;
     if (status === "authenticated") return <Navigate to={HOME_PATH} replace />;
-    return <Login />;
+    return needsSetup ? <Setup /> : <Login />;
 };
 
 export const routes: RouteObject[] = [

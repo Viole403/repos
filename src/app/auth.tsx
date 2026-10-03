@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import type { UserView } from "@/app/ipc";
-import { currentUser, login as loginRequest, logout as logoutRequest } from "@/app/ipc";
+import { currentUser, installStatus, login as loginRequest, logout as logoutRequest } from "@/app/ipc";
 
 /**
  * Session state for the whole app. The backend keeps the signed-in id in a
@@ -15,6 +15,8 @@ type AuthStatus = "restoring" | "authenticated" | "anonymous";
 interface AuthState {
     status: AuthStatus;
     user: UserView | null;
+    /** False once signed in, so it never contradicts the session. */
+    needsSetup: boolean;
     /** Signs in; throws `IpcError` with the backend's message on bad credentials. */
     login: (email: string, password: string) => Promise<void>;
     logout: () => Promise<void>;
@@ -25,24 +27,28 @@ const AuthContext = createContext<AuthState | null>(null);
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
     const [status, setStatus] = useState<AuthStatus>("restoring");
     const [user, setUser] = useState<UserView | null>(null);
+    const [needsSetup, setNeedsSetup] = useState(false);
 
     useEffect(() => {
-        // A rejection here means "no session", which is the expected state on a
-        // cold launch — the command rejects rather than returning null, and there
-        // is no way to tell that apart from a real failure over the wire. Either
-        // way the operator lands on the login screen, which is where an anonymous
-        // launch belongs.
         void currentUser()
             .then((found) => {
                 setUser(found);
                 setStatus("authenticated");
             })
-            .catch(() => setStatus("anonymous"));
+            .catch(async () => {
+                // The rejection means "no session", which cannot distinguish signed-out
+                // from unclaimed: `CmdError` reaches the wire as a bare string. A fresh
+                // install has no account to sign in with, so ask which case this is.
+                const install = await installStatus().catch(() => null);
+                setNeedsSetup(install?.needsSetup ?? false);
+                setStatus("anonymous");
+            });
     }, []);
 
     const login = useCallback(async (email: string, password: string) => {
         const found = await loginRequest({ email: email.trim(), password });
         setUser(found);
+        setNeedsSetup(false);
         setStatus("authenticated");
     }, []);
 
@@ -53,11 +59,15 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
             await logoutRequest();
         } finally {
             setUser(null);
+            setNeedsSetup(false);
             setStatus("anonymous");
         }
     }, []);
 
-    const value = useMemo<AuthState>(() => ({ status, user, login, logout }), [status, user, login, logout]);
+    const value = useMemo<AuthState>(
+        () => ({ status, user, needsSetup, login, logout }),
+        [status, user, needsSetup, login, logout],
+    );
 
     return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
