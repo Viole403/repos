@@ -28,6 +28,12 @@ thiserror = "2"
 log = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
+# Password hashing for the login commands. Argon2id with the crate's default
+# (memory-hard) parameters; `getrandom` supplies the salt. Verification reads the
+# parameters back out of the stored PHC string, so raising the cost later does not
+# invalidate existing hashes.
+argon2 = { version = "0.5", features = ["std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Persistence. SQLite is the default target; mysql/postgres drivers are compiled in
 # so the same build can point at any of the three (see src-tauri/src/db.rs).
