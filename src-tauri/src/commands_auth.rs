@@ -230,16 +230,23 @@ pub async fn permission_names_in<C: sea_orm::ConnectionTrait>(conn: &C, user_id:
         return Ok(Vec::new());
     }
 
-    let owns = roles::Entity::find()
-        .filter(roles::Column::Id.is_in(role_ids.clone()))
-        .filter(roles::Column::RoleType.eq("Master"))
+    // Resolve the roles down to the live ones first. Revoking a role is a
+    // soft-delete, so without this the pivot below would keep handing out
+    // everything a deleted role still pointed at.
+    let live_roles = roles::Entity::find()
+        .filter(roles::Column::Id.is_in(role_ids))
         .filter(roles::Column::DelStatus.eq("Live"))
-        .one(conn)
-        .await?
-        .is_some();
-    if owns {
+        .all(conn)
+        .await?;
+
+    if live_roles.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if live_roles.iter().any(|r| r.role_type == "Master") {
         return Ok(permissions::Entity::find()
             .filter(permissions::Column::DelStatus.eq("Live"))
+            .order_by_asc(permissions::Column::Name)
             .all(conn)
             .await?
             .into_iter()
@@ -247,8 +254,10 @@ pub async fn permission_names_in<C: sea_orm::ConnectionTrait>(conn: &C, user_id:
             .collect());
     }
 
+    let live_role_ids: Vec<i32> = live_roles.into_iter().map(|r| r.id).collect();
+
     let held: Vec<i32> = role_permissions::Entity::find()
-        .filter(role_permissions::Column::RoleId.is_in(role_ids))
+        .filter(role_permissions::Column::RoleId.is_in(live_role_ids))
         .all(conn)
         .await?
         .into_iter()
@@ -307,4 +316,308 @@ fn is_unique_violation(err: &sea_orm::RuntimeErr) -> bool {
     text.contains("unique constraint")
         || text.contains("duplicate key")
         || text.contains("unique violation")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::init_for_tests;
+    use sea_orm::DatabaseConnection;
+
+    /// Create an account without going through `create_user_in`, so tests that
+    /// need a *known* password do not pay Argon2's cost twice or depend on the
+    /// validator's rules.
+    async fn seed_user(conn: &DatabaseConnection, email: &str) -> i32 {
+        let now = chrono::Utc::now();
+        let model = users::ActiveModel {
+            name: Set("Cashier".into()),
+            email: Set(email.into()),
+            password_hash: Set(auth::hash_password("correct-horse").expect("hash")),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        model.insert(conn).await.expect("seed user").id
+    }
+
+    async fn seed_role(conn: &DatabaseConnection, name: &str, role_type: &str) -> i32 {
+        let now = chrono::Utc::now();
+        let model = roles::ActiveModel {
+            name: Set(name.into()),
+            guard_name: Set(name.into()),
+            role_type: Set(role_type.into()),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        model.insert(conn).await.expect("seed role").id
+    }
+
+    async fn seed_permission(conn: &DatabaseConnection, name: &str) -> i32 {
+        let now = chrono::Utc::now();
+        let model = permissions::ActiveModel {
+            name: Set(name.into()),
+            group_name: Set("sales".into()),
+            guard_name: Set(name.into()),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        model.insert(conn).await.expect("seed permission").id
+    }
+
+    #[test]
+    fn argon2_round_trips_and_salts() {
+        let first = auth::hash_password("correct-horse").expect("hash");
+        let second = auth::hash_password("correct-horse").expect("hash");
+
+        assert!(auth::verify_password("correct-horse", &first));
+        assert!(auth::verify_password("correct-horse", &second));
+        assert!(!auth::verify_password("wrong-horse", &first));
+
+        // Same input must not produce the same digest, or the column would leak
+        // "these two accounts chose the same password".
+        assert_ne!(first, second);
+        assert!(first.starts_with("$argon2id$"), "not a PHC string: {first}");
+    }
+
+    #[tokio::test]
+    async fn login_accepts_the_right_password_and_is_case_insensitive() {
+        let conn = init_for_tests().await;
+        seed_user(&conn, "till@example.com").await;
+
+        let view = login_in(
+            &conn,
+            LoginInput { email: "TILL@Example.com".into(), password: "correct-horse".into() },
+        )
+        .await
+        .expect("login");
+
+        assert_eq!(view.email, "till@example.com");
+    }
+
+    #[tokio::test]
+    async fn login_rejects_a_wrong_password() {
+        let conn = init_for_tests().await;
+        seed_user(&conn, "till@example.com").await;
+
+        let err = login_in(
+            &conn,
+            LoginInput { email: "till@example.com".into(), password: "nope".into() },
+        )
+        .await
+        .expect_err("must reject");
+
+        assert_eq!(err.to_string(), REJECTED);
+    }
+
+    /// The message must be byte-identical for an unknown address and a wrong
+    /// password. If these ever differ, the login form becomes an oracle for
+    /// which addresses are registered.
+    #[tokio::test]
+    async fn login_does_not_reveal_whether_the_account_exists() {
+        let conn = init_for_tests().await;
+        seed_user(&conn, "real@example.com").await;
+
+        let unknown = login_in(
+            &conn,
+            LoginInput { email: "ghost@example.com".into(), password: "correct-horse".into() },
+        )
+        .await
+        .expect_err("unknown account");
+        let wrong = login_in(
+            &conn,
+            LoginInput { email: "real@example.com".into(), password: "wrong".into() },
+        )
+        .await
+        .expect_err("wrong password");
+
+        assert_eq!(unknown.to_string(), wrong.to_string());
+        assert_eq!(unknown.to_string(), REJECTED);
+    }
+
+    #[tokio::test]
+    async fn login_ignores_a_soft_deleted_account() {
+        let conn = init_for_tests().await;
+        let id = seed_user(&conn, "gone@example.com").await;
+
+        let mut am: users::ActiveModel =
+            users::Entity::find_by_id(id).one(&conn).await.unwrap().unwrap().into();
+        am.del_status = Set("Deleted".into());
+        am.update(&conn).await.unwrap();
+
+        let err = login_in(
+            &conn,
+            LoginInput { email: "gone@example.com".into(), password: "correct-horse".into() },
+        )
+        .await
+        .expect_err("deleted account must not authenticate");
+
+        assert_eq!(err.to_string(), REJECTED);
+    }
+
+    #[tokio::test]
+    async fn create_user_hashes_the_password_and_never_stores_it_plain() {
+        let conn = init_for_tests().await;
+
+        let view = create_user_in(
+            &conn,
+            UserInput {
+                name: "Ada".into(),
+                email: "Ada@Example.com".into(),
+                password: "s3cret-passphrase".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("create");
+
+        assert_eq!(view.email, "ada@example.com", "email must be normalised");
+
+        let row = users::Entity::find_by_id(view.id).one(&conn).await.unwrap().unwrap();
+        assert_ne!(row.password_hash, "s3cret-passphrase");
+        assert!(!row.password_hash.contains("s3cret-passphrase"));
+        assert!(auth::verify_password("s3cret-passphrase", &row.password_hash));
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_a_short_password() {
+        let conn = init_for_tests().await;
+
+        let err = create_user_in(
+            &conn,
+            UserInput {
+                name: "Ada".into(),
+                email: "ada@example.com".into(),
+                password: "short".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect_err("too short");
+
+        assert!(err.to_string().contains("8 characters"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_a_duplicate_email() {
+        let conn = init_for_tests().await;
+        create_user_in(
+            &conn,
+            UserInput {
+                name: "Ada".into(),
+                email: "ada@example.com".into(),
+                password: "s3cret-passphrase".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect("first account");
+
+        let err = create_user_in(
+            &conn,
+            UserInput {
+                name: "Impostor".into(),
+                email: "ada@example.com".into(),
+                password: "s3cret-passphrase".into(),
+                phone: None,
+                role: None,
+            },
+        )
+        .await
+        .expect_err("duplicate email");
+
+        assert!(matches!(err, CmdError::Conflict(_)), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_user_with_no_roles_holds_no_permissions() {
+        let conn = init_for_tests().await;
+        let user = seed_user(&conn, "nobody@example.com").await;
+
+        assert!(permission_names_in(&conn, user).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_master_role_holds_every_live_permission() {
+        let conn = init_for_tests().await;
+        let user = seed_user(&conn, "owner@example.com").await;
+        let role = seed_role(&conn, "Super Admin", "Master").await;
+        seed_permission(&conn, "sales.create").await;
+        seed_permission(&conn, "items.edit").await;
+
+        user_roles::ActiveModel { role_id: Set(role), user_id: Set(user), ..Default::default() }
+            .insert(&conn)
+            .await
+            .expect("assign role");
+
+        let held = permission_names_in(&conn, user).await.unwrap();
+        assert_eq!(held, vec!["items.edit".to_string(), "sales.create".to_string()]);
+        assert!(has_permission_in(&conn, user, "sales.create").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn permissions_come_through_the_role_permissions_pivot() {
+        let conn = init_for_tests().await;
+        let user = seed_user(&conn, "clerk@example.com").await;
+        let role = seed_role(&conn, "Cashier", "Staff").await;
+        let allowed = seed_permission(&conn, "sales.create").await;
+        seed_permission(&conn, "settings.delete").await;
+
+        user_roles::ActiveModel { role_id: Set(role), user_id: Set(user), ..Default::default() }
+            .insert(&conn)
+            .await
+            .expect("assign role");
+        role_permissions::ActiveModel {
+            permission_id: Set(allowed),
+            role_id: Set(role),
+            ..Default::default()
+        }
+        .insert(&conn)
+        .await
+        .expect("grant permission");
+
+        let held = permission_names_in(&conn, user).await.unwrap();
+        assert_eq!(held, vec!["sales.create".to_string()]);
+        assert!(has_permission_in(&conn, user, "sales.create").await.unwrap());
+        assert!(
+            !has_permission_in(&conn, user, "settings.delete").await.unwrap(),
+            "an ungranted permission must not pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_soft_deleted_role_grants_nothing() {
+        let conn = init_for_tests().await;
+        let user = seed_user(&conn, "stale@example.com").await;
+        let role = seed_role(&conn, "Cashier", "Staff").await;
+        let granted = seed_permission(&conn, "sales.create").await;
+
+        user_roles::ActiveModel { role_id: Set(role), user_id: Set(user), ..Default::default() }
+            .insert(&conn)
+            .await
+            .expect("assign role");
+        role_permissions::ActiveModel {
+            permission_id: Set(granted),
+            role_id: Set(role),
+            ..Default::default()
+        }
+        .insert(&conn)
+        .await
+        .expect("grant permission");
+
+        let mut am: roles::ActiveModel =
+            roles::Entity::find_by_id(role).one(&conn).await.unwrap().unwrap().into();
+        am.del_status = Set("Deleted".into());
+        am.update(&conn).await.unwrap();
+
+        // A deleted *role* must not fall through to the Master branch either.
+        assert!(permission_names_in(&conn, user).await.unwrap().is_empty());
+    }
 }
