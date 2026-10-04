@@ -25,7 +25,7 @@ use crate::entities::auth::users;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{booking, combo_item, combo_sale, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, loyalty_entry, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, service_rating, servicing, stock_movement, warranty};
+use crate::entities::sales::{booking, combo_item, combo_sale, credit_note, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, loyalty_entry, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, service_rating, servicing, stock_movement, warranty};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -5933,6 +5933,239 @@ pub async fn open_customer_display(app: tauri::AppHandle) -> CmdResult<()> {
     .build()
     .map_err(|e| CmdError::Validation(format!("cannot open customer display: {e}")))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Credit notes
+// ---------------------------------------------------------------------------
+
+fn credit_no_for(id: i32) -> String {
+    format!("CN-{id:06}")
+}
+
+/// A credit note row with what is left to spend, so the list shows no arithmetic.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditNoteSummary {
+    pub id: i32,
+    pub credit_no: String,
+    pub customer_id: i32,
+    pub customer_name: Option<String>,
+    pub amount: Decimal,
+    pub applied_total: Decimal,
+    pub remaining: Decimal,
+    pub created_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditNoteView {
+    pub note: credit_note::Model,
+    pub customer_name: Option<String>,
+    pub remaining: Decimal,
+}
+
+fn credit_note_remaining(row: &credit_note::Model) -> Decimal {
+    (row.amount - row.applied_total).max(Decimal::ZERO).round_dp(MONEY_SCALE)
+}
+
+/// Issues store credit against a customer, usually from a return. The amount is
+/// a promise against future sales — no cash leaves the drawer, and the customer
+/// balance is untouched until the credit is actually spent.
+#[tauri::command]
+pub async fn issue_credit_note(
+    customer_id: i32,
+    amount: Decimal,
+    sale_return_id: Option<i32>,
+    note: Option<String>,
+) -> CmdResult<CreditNoteView> {
+    crate::commands_auth::require_permission(db(), "creditnote-issue").await?;
+    let user_id = crate::auth::current_user_id();
+    issue_credit_note_in(db(), user_id, customer_id, amount, sale_return_id, note).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn issue_credit_note_in<C: ConnectionTrait>(
+    conn: &C,
+    user_id: Option<i32>,
+    customer_id: i32,
+    amount: Decimal,
+    sale_return_id: Option<i32>,
+    note: Option<String>,
+) -> CmdResult<CreditNoteView> {
+    if amount <= Decimal::ZERO {
+        return Err(CmdError::Validation("credit amount must be greater than zero".into()));
+    }
+    let now = crate::migration::now();
+    customer::Entity::find_by_id(customer_id)
+        .filter(customer::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("customer".into()))?;
+    if let Some(return_id) = sale_return_id {
+        let ret = sale_return::Entity::find_by_id(return_id)
+            .one(conn)
+            .await?
+            .ok_or_else(|| CmdError::NotFound("sale return".into()))?;
+        let owner = sale::Entity::find_by_id(ret.sale_id)
+            .one(conn)
+            .await?
+            .and_then(|s| s.customer_id);
+        if owner != Some(customer_id) {
+            return Err(CmdError::Validation("that return belongs to another customer".into()));
+        }
+        if ret.refunded_total > Decimal::ZERO && ret.refunded_total != amount.round_dp(MONEY_SCALE) {
+            // A return that already paid cash cannot also become credit for a
+            // different figure — one refund path per return.
+            return Err(CmdError::Validation(
+                "that return already refunded a different amount".into(),
+            ));
+        }
+    }
+
+    let row = credit_note::ActiveModel {
+        credit_no: Set(String::new()),
+        customer_id: Set(customer_id),
+        sale_return_id: Set(sale_return_id),
+        amount: Set(amount.round_dp(MONEY_SCALE)),
+        applied_total: Set(Decimal::ZERO),
+        created_by: Set(user_id),
+        note: Set(text(note)),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+    let credit_no = credit_no_for(row.id);
+    let mut am: credit_note::ActiveModel = row.into();
+    am.credit_no = Set(credit_no);
+    let row = am.update(conn).await?;
+    get_credit_note_in(conn, row.id).await
+}
+
+/// Spends credit against the customer balance. A partial spend leaves the rest;
+/// an overspend is refused rather than going negative, because credit is a
+/// promise for a fixed figure, not a loan.
+#[tauri::command]
+pub async fn apply_credit_note(id: i32, amount: Decimal) -> CmdResult<CreditNoteView> {
+    crate::commands_auth::require_permission(db(), "creditnote-issue").await?;
+    apply_credit_note_in(db(), id, amount).await
+}
+
+pub(crate) async fn apply_credit_note_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    id: i32,
+    amount: Decimal,
+) -> CmdResult<CreditNoteView> {
+    if amount <= Decimal::ZERO {
+        return Err(CmdError::Validation("applied amount must be greater than zero".into()));
+    }
+    let txn = conn.begin().await?;
+    let note = credit_note::Entity::find_by_id(id)
+        .filter(credit_note::Column::DelStatus.eq(LIVE))
+        .one(&txn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("credit note".into()))?;
+    let remaining = credit_note_remaining(&note);
+    if amount > remaining {
+        return Err(CmdError::Validation(format!(
+            "that note has {remaining} left, not {amount}"
+        )));
+    }
+
+    // A receipt in the same table the balance math already counts, with the
+    // note number as reference so the audit reads as one story. Positive: the
+    // customer has paid ahead, and an overpaid account reads negative — the
+    // same convention a cash overpayment follows.
+    customer_receive::ActiveModel {
+        customer_id: Set(note.customer_id),
+        amount: Set(amount.round_dp(MONEY_SCALE)),
+        reference: Set(Some(note.credit_no.clone())),
+        paid_at: Set(crate::migration::now()),
+        created_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
+
+    let mut am: credit_note::ActiveModel = note.into();
+    let applied = am.applied_total.clone().unwrap() + amount.round_dp(MONEY_SCALE);
+    am.applied_total = Set(applied);
+    am.update(&txn).await?;
+    txn.commit().await?;
+    get_credit_note_in(conn, id).await
+}
+
+#[tauri::command]
+pub async fn list_credit_notes(
+    customer_id: Option<i32>,
+    query: PageQuery,
+) -> CmdResult<Page<CreditNoteSummary>> {
+    crate::commands_auth::require_permission(db(), "creditnote-list").await?;
+    list_credit_notes_in(db(), customer_id, &query).await
+}
+
+pub async fn list_credit_notes_in<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: Option<i32>,
+    query: &PageQuery,
+) -> CmdResult<Page<CreditNoteSummary>> {
+    let mut q = credit_note::Entity::find().filter(credit_note::Column::DelStatus.eq(LIVE));
+    if let Some(customer_id) = customer_id {
+        q = q.filter(credit_note::Column::CustomerId.eq(customer_id));
+    }
+
+    let total = q.clone().count(conn).await?;
+    let rows = q
+        .order_by_desc(credit_note::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+
+    let ids: Vec<i32> = rows.iter().map(|r| r.customer_id).collect();
+    let names = ticket_customer_names(conn, &ids).await?;
+    let views = rows
+        .into_iter()
+        .map(|row| {
+            let remaining = credit_note_remaining(&row);
+            CreditNoteSummary {
+                id: row.id,
+                credit_no: row.credit_no,
+                customer_id: row.customer_id,
+                customer_name: names.get(&row.customer_id).cloned(),
+                amount: row.amount,
+                applied_total: row.applied_total,
+                remaining,
+                created_at: row.created_at,
+            }
+        })
+        .collect();
+    Ok(Page::new(views, total, query))
+}
+
+#[tauri::command]
+pub async fn get_credit_note(id: i32) -> CmdResult<CreditNoteView> {
+    crate::commands_auth::require_permission(db(), "creditnote-show").await?;
+    get_credit_note_in(db(), id).await
+}
+
+pub async fn get_credit_note_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+) -> CmdResult<CreditNoteView> {
+    let row = credit_note::Entity::find_by_id(id)
+        .filter(credit_note::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("credit note".into()))?;
+    let remaining = credit_note_remaining(&row);
+    let customer_name = customer::Entity::find_by_id(row.customer_id)
+        .one(conn)
+        .await?
+        .map(|c| c.name);
+    Ok(CreditNoteView { note: row, customer_name, remaining })
 }
 
 // ---------------------------------------------------------------------------

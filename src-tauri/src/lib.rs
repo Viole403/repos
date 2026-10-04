@@ -104,6 +104,10 @@ pub fn run() {
             commands::submit_rating,
             commands::list_ratings,
             commands::open_customer_display,
+            commands::issue_credit_note,
+            commands::apply_credit_note,
+            commands::list_credit_notes,
+            commands::get_credit_note,
             commands::sell_gift_card,
             commands::reload_gift_card,
             commands::list_gift_cards,
@@ -2515,6 +2519,70 @@ mod tests {
         .await
         .expect_err("fractional points");
         assert!(format!("{err}").contains("whole points"));
+    }
+
+    #[tokio::test]
+    async fn a_credit_note_spends_down_and_refuses_overspend() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Putri", Decimal::ZERO).await;
+
+        let view = commands::issue_credit_note_in(&db, Some(1), customer, Decimal::new(10_000_000, 3), None, None)
+            .await
+            .expect("note issued");
+        assert!(view.note.credit_no.starts_with("CN-"), "got {}", view.note.credit_no);
+        assert_eq!(view.remaining, Decimal::new(10_000_000, 3));
+        // Issuing is a promise, not a payment: the balance does not move.
+        assert_eq!(
+            commands::customer_balance_in(&db, customer).await.unwrap(),
+            Decimal::ZERO
+        );
+
+        let view = commands::apply_credit_note_in(&db, view.note.id, Decimal::new(4_000_000, 3))
+            .await
+            .expect("partial spend");
+        assert_eq!(view.remaining, Decimal::new(6_000_000, 3));
+        assert_eq!(
+            commands::customer_balance_in(&db, customer).await.unwrap(),
+            Decimal::new(-4_000_000, 3),
+            "spent credit prepays the account"
+        );
+
+        let err = commands::apply_credit_note_in(&db, view.note.id, Decimal::new(7_000_000, 3))
+            .await
+            .expect_err("overspend refused");
+        assert!(format!("{err}").contains("left"));
+    }
+
+    #[tokio::test]
+    async fn a_return_can_become_store_credit() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Rian", Decimal::ZERO).await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+
+        let view = sell_to_customer(&db, mug, customer, None).await;
+        let mut input = return_line(view.lines[0].id, dec(2));
+        input.sale_id = view.sale.id;
+        let ret = commands::create_return_in(&db, input, None).await.expect("return");
+
+        let note = commands::issue_credit_note_in(
+            &db,
+            Some(1),
+            customer,
+            ret.refunded_total,
+            Some(ret.id),
+            None,
+        )
+        .await
+        .expect("note from return");
+        assert_eq!(note.note.amount, ret.refunded_total);
+
+        // Credit for another customer's return is refused.
+        let other = seed_customer(&db, "Sinta", Decimal::ZERO).await;
+        let err = commands::issue_credit_note_in(&db, Some(1), other, ret.refunded_total, Some(ret.id), None)
+            .await
+            .expect_err("wrong customer");
+        assert!(format!("{err}").contains("another customer"));
     }
 
     #[tokio::test]
