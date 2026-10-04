@@ -46,6 +46,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::WarrantyAndServicing),
             Box::new(Migrations::GiftCards),
             Box::new(Migrations::Loyalty),
+            Box::new(Migrations::ServiceRatings),
         ]
     }
 }
@@ -73,6 +74,7 @@ pub enum Migrations {
     WarrantyAndServicing,
     GiftCards,
     Loyalty,
+    ServiceRatings,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -130,6 +132,7 @@ impl MigrationName for Migrations {
         Migrations::WarrantyAndServicing => "warranty_and_servicing",
         Migrations::GiftCards => "gift_cards",
         Migrations::Loyalty => "loyalty",
+        Migrations::ServiceRatings => "service_ratings",
         }
     }
 }
@@ -159,6 +162,7 @@ impl MigrationTrait for Migrations {
             Migrations::WarrantyAndServicing => warranty_and_servicing(manager).await?,
             Migrations::GiftCards => gift_cards(manager).await?,
             Migrations::Loyalty => loyalty(manager).await?,
+            Migrations::ServiceRatings => service_ratings(manager).await?,
         }
         Ok(())
     }
@@ -166,6 +170,18 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::ServiceRatings => {
+                manager
+                    .drop_table(Table::drop().table(ServiceRatings::Table).if_exists().to_owned())
+                    .await?;
+                let conn = manager.get_connection();
+                for name in RATING_PERMISSIONS {
+                    permissions::Entity::delete_many()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .exec(conn)
+                        .await?;
+                }
+            }
             Migrations::Loyalty => {
                 manager
                     .drop_table(Table::drop().table(LoyaltyEntries::Table).if_exists().to_owned())
@@ -1141,6 +1157,68 @@ async fn installment_stock_link(manager: &SchemaManager<'_>) -> Result<(), DbErr
                 .to_owned(),
         )
         .await?;
+    Ok(())
+}
+
+/// One-tap service ratings from the customer display. A `Like` or `Dislike` per
+/// completed sale, anonymous and uneditable — the same screen is offered for
+/// every rating, so there is no path that filters criticism out.
+async fn service_ratings(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(ServiceRatings::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(ServiceRatings::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(ServiceRatings::SaleId).integer().null())
+                .col(ColumnDef::new(ServiceRatings::Rating).string().not_null())
+                .col(ColumnDef::new(ServiceRatings::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_service_ratings_sale")
+                        .from(ServiceRatings::Table, ServiceRatings::SaleId)
+                        .to(Sales::Table, Sales::Id)
+                        .on_delete(ForeignKeyAction::SetNull)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_service_ratings_sale_id")
+                .table(ServiceRatings::Table)
+                .col(ServiceRatings::SaleId)
+                .to_owned(),
+        )
+        .await?;
+
+    let conn = manager.get_connection();
+    let now = now();
+    for name in RATING_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        let group = name.split_once('-').map(|(g, _)| g).unwrap_or("rating");
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set(group.to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
     Ok(())
 }
 
@@ -2135,6 +2213,18 @@ const INSTALLMENT_PERMISSIONS: &[&str] = &[
     "installment-show",
     "installment-collect",
 ];
+
+#[derive(Iden)]
+enum ServiceRatings {
+    Table,
+    Id,
+    SaleId,
+    Rating,
+    CreatedAt,
+}
+
+/// Permissions this migration owns, for the down arm above.
+const RATING_PERMISSIONS: &[&str] = &["rating-submit", "rating-list"];
 
 #[derive(Iden)]
 enum LoyaltyEntries {
