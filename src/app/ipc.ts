@@ -440,6 +440,48 @@ export const updateQuotation = (id: number, input: QuotationInput) =>
     call<QuotationView>("update_quotation", { id, input });
 export const deleteQuotation = (id: number) => call<void>("delete_quotation", { id });
 
+export interface BookingInput {
+    customerId: number;
+    serviceSellerId?: number | null;
+    status?: string | null;
+    /** `YYYY-MM-DDTHH:MM`, as a datetime-local field sends it. */
+    startAt: string;
+    endAt: string;
+    note?: string | null;
+}
+
+export interface BookingFilter {
+    status?: string | null;
+    customerId?: number | null;
+    /** `YYYY-MM-DD`, inclusive. Unparseable narrows nothing. */
+    from?: string | null;
+    to?: string | null;
+}
+
+export interface BookingView {
+    id: number;
+    customerId: number;
+    customerName: string | null;
+    serviceSellerId: number | null;
+    serviceSellerName: string | null;
+    status: string;
+    startAt: Timestamp;
+    endAt: Timestamp;
+    note: string | null;
+    createdAt: Timestamp;
+}
+
+/** Closed vocabulary, mirrored from the server. Anything else is refused. */
+export const BOOKING_STATUSES = ["Booked", "Waiting", "Completed", "Cancelled"] as const;
+
+export const listBookings = (filter: BookingFilter = {}, query: PageQuery = {}) =>
+    call<Page<BookingView>>("list_bookings", { filter, query });
+export const getBooking = (id: number) => call<BookingView>("get_booking", { id });
+export const createBooking = (input: BookingInput) => call<BookingView>("create_booking", { input });
+export const updateBooking = (id: number, input: BookingInput) =>
+    call<BookingView>("update_booking", { id, input });
+export const deleteBooking = (id: number) => call<void>("delete_booking", { id });
+
 export interface ReturnLine {
     /** Which line of the original sale this reverses. */
     saleDetailId: number;
