@@ -25,7 +25,7 @@ use crate::entities::auth::users;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{booking, combo_item, combo_sale, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, servicing, stock_movement, warranty};
+use crate::entities::sales::{booking, combo_item, combo_sale, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, loyalty_entry, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, servicing, stock_movement, warranty};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -150,7 +150,6 @@ pub struct CustomerInput {
     pub zip: Option<String>,
     pub tax_number: Option<String>,
     pub credit_limit: Decimal,
-    pub loyalty_points: Decimal,
     pub note: Option<String>,
 }
 
@@ -158,9 +157,6 @@ fn validate_customer(input: &CustomerInput) -> CmdResult<()> {
     required(&input.name, "customer name")?;
     if input.credit_limit < Decimal::ZERO {
         return Err(CmdError::Validation("credit limit cannot be negative".into()));
-    }
-    if input.loyalty_points < Decimal::ZERO {
-        return Err(CmdError::Validation("loyalty points cannot be negative".into()));
     }
     Ok(())
 }
@@ -197,10 +193,12 @@ pub async fn list_customers(query: PageQuery) -> CmdResult<Page<CustomerView>> {
 
     // The balance is summed per row rather than joined, so a page of 20 costs 20
     // aggregates rather than a correlated subquery per column of every row.
+    // Points ride along the same way: derived from the ledger, never the column.
     let mut views = Vec::with_capacity(rows.len());
     for row in rows {
         let balance = customer_balance_in(db, row.id).await?;
-        views.push(CustomerView::from_row(row, balance));
+        let points = loyalty_points_in(db, row.id).await?;
+        views.push(CustomerView::from_row(row, balance, Decimal::from(points)));
     }
     Ok(Page::new(views, total, &query))
 }
@@ -239,7 +237,6 @@ pub async fn create_customer_in<C: ConnectionTrait>(conn: &C, input: CustomerInp
         zip: Set(text(input.zip.clone())),
         tax_number: Set(text(input.tax_number.clone())),
         credit_limit: Set(input.credit_limit),
-        loyalty_points: Set(input.loyalty_points),
         note: Set(text(input.note.clone())),
         photo: Set(None),
         del_status: Set(LIVE.to_owned()),
@@ -250,21 +247,28 @@ pub async fn create_customer_in<C: ConnectionTrait>(conn: &C, input: CustomerInp
     .insert(conn)
     .await?;
 
-    Ok(CustomerView::from_row(row, Decimal::ZERO))
+    Ok(CustomerView::from_row(row, Decimal::ZERO, Decimal::ZERO))
 }
 
 #[tauri::command]
 pub async fn update_customer(id: i32, input: CustomerInput) -> CmdResult<CustomerView> {
     crate::commands_auth::require_permission(db(), "customer-edit").await?;
+    update_customer_in(db(), id, input).await
+}
+
+pub(crate) async fn update_customer_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+    input: CustomerInput,
+) -> CmdResult<CustomerView> {
     validate_customer(&input)?;
-    let db = db();
     let found = customer::Entity::find_by_id(id)
         .filter(customer::Column::DelStatus.eq(LIVE))
-        .one(db)
+        .one(conn)
         .await?
         .ok_or_else(|| CmdError::NotFound("customer".into()))?;
 
-    let balance = customer_balance_in(db, id).await?;
+    let balance = customer_balance_in(conn, id).await?;
     let mut am: customer::ActiveModel = found.into();
     am.name = Set(required(&input.name, "customer name")?);
     am.email = Set(text(input.email.clone()));
@@ -275,12 +279,14 @@ pub async fn update_customer(id: i32, input: CustomerInput) -> CmdResult<Custome
     am.zip = Set(text(input.zip.clone()));
     am.tax_number = Set(text(input.tax_number.clone()));
     am.credit_limit = Set(input.credit_limit);
-    am.loyalty_points = Set(input.loyalty_points);
+    // The ledger owns points now: an edit here would be a second writer beside
+    // every earn and redeem, and the two would disagree within a day.
     am.note = Set(text(input.note.clone()));
     am.updated_at = Set(crate::migration::now());
-    let row = am.update(db).await?;
+    let row = am.update(conn).await?;
+    let points = loyalty_points_in(conn, row.id).await?;
 
-    Ok(CustomerView::from_row(row, balance))
+    Ok(CustomerView::from_row(row, balance, Decimal::from(points)))
 }
 
 /// Marks the row deleted rather than removing it, so sales keep naming a customer.
@@ -346,7 +352,7 @@ pub struct CustomerView {
 }
 
 impl CustomerView {
-    fn from_row(row: customer::Model, balance: Decimal) -> Self {
+    fn from_row(row: customer::Model, balance: Decimal, loyalty_points: Decimal) -> Self {
         Self {
             id: row.id,
             name: row.name,
@@ -359,7 +365,7 @@ impl CustomerView {
             zip: row.zip,
             tax_number: row.tax_number,
             credit_limit: row.credit_limit,
-            loyalty_points: row.loyalty_points,
+            loyalty_points,
             note: row.note,
             photo: row.photo,
             created_at: row.created_at,
@@ -1120,6 +1126,14 @@ pub async fn create_return_in<C: ConnectionTrait + TransactionTrait>(
     }
 
     let view = ReturnView { lines, stock_on_hand, ..return_row.into() };
+
+    // The sale's earn reverses with the goods: points were paid for a spend that,
+    // line by line, is being undone. Only earned points reverse — redeemed points
+    // stay spent.
+    if let Some(customer_id) = original.customer_id {
+        void_loyalty(&txn, customer_id, original.id).await?;
+    }
+
     // Committed last. Without this the transaction rolls back on `Drop` and the
     // return, the stock it put back and the ledger row all vanish together.
     txn.commit().await?;
@@ -2053,6 +2067,13 @@ fn validate_payments(lines: &[PaymentLine]) -> CmdResult<()> {
                 "{where_}: a gift card tender needs a card number"
             )));
         }
+        // Points are whole: one point spends as one rupiah, and there is no
+        // fractional rupiah for a fraction of a point to mean.
+        if line.method.trim() == LOYALTY_METHOD && line.amount.fract() != Decimal::ZERO {
+            return Err(CmdError::Validation(format!(
+                "{where_}: a loyalty tender must be whole points"
+            )));
+        }
     }
     Ok(())
 }
@@ -2208,6 +2229,18 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
 
     // Insert first with a provisional invoice number, because the real one is
     // derived from the primary key this insert produces.
+    // A walk-in has no account to earn from or redeem against, so a stored-value
+    // or points tender without a named customer is refused up front rather than
+    // halfway through the payment loop below.
+    if customer_id.is_none() {
+        if let Some(lines) = input.payments.as_ref() {
+            if lines.iter().any(|l| l.method.trim() == LOYALTY_METHOD) {
+                return Err(CmdError::Validation(
+                    "a loyalty tender needs a named customer".into(),
+                ));
+            }
+        }
+    }
     let header = sale::ActiveModel {
         invoice_no: Set(provisional_invoice_no()),
         status: Set(
@@ -2363,6 +2396,14 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     // six-column UPDATE keyed on the primary key, not a rewrite of the row.
     let row = header.update(&txn).await?;
 
+    // Drafts earn nothing: a draft is a basket nobody has paid for. Walk-ins earn
+    // nothing either — there is no account to credit.
+    if promoted {
+        if let Some(customer_id) = customer_id {
+            earn_loyalty(&txn, customer_id, row.paid_total, row.id).await?;
+        }
+    }
+
     if let Some(lines) = payments.as_ref() {
         for line in lines {
             write_payment(&txn, sale_id, line).await?;
@@ -2372,6 +2413,10 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
                 let card_no = line.gift_card_no.as_deref().expect("validated above");
                 redeem_gift_card(&txn, card_no, line.gift_card_pin.as_deref(), line.amount, sale_id)
                     .await?;
+            }
+            if line.method.trim() == LOYALTY_METHOD {
+                let customer_id = customer_id.expect("refused for walk-ins above");
+                redeem_loyalty(&txn, customer_id, line.amount, sale_id).await?;
             }
         }
     }
@@ -2682,6 +2727,12 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
         return Err(CmdError::Conflict(format!(
             "sale {sale_id} is no longer a draft"
         )));
+    }
+
+    // Completing the draft is the spend: a parked basket earns nothing until the
+    // money is real, exactly like a direct checkout.
+    if let Some(customer_id) = header.customer_id {
+        earn_loyalty(&txn, customer_id, paid, sale_id).await?;
     }
 
     // Read the header back instead of assembling it here, so the view is what the
@@ -5615,6 +5666,144 @@ pub async fn get_gift_card_in<C: ConnectionTrait>(
     let card_no = required(&card_no.to_owned(), "card number")?;
     let card = live_gift_card(conn, &card_no).await?;
     gift_card_view(conn, card).await
+}
+
+// ---------------------------------------------------------------------------
+// Loyalty
+// ---------------------------------------------------------------------------
+
+/// The tender method that spends points. Exact match, like every other method.
+pub const LOYALTY_METHOD: &str = "Loyalty";
+
+/// What a points row can be. `Void` reverses an earn when its sale is returned;
+/// expiry buckets are still open (there is no expiry schedule to bucket by yet).
+pub const LOYALTY_KINDS: &[&str] = &["Earn", "Redeem", "Void"];
+
+/// One point per Rp1.000 of paid total, floored — fixed until the settings table
+/// lands and can hold the rate. A point spends as Rp1 for the same reason.
+pub const LOYALTY_PER_THOUSAND: i64 = 1;
+
+/// The balance is `SUM(points)` — never the `loyalty_points` column, which stopped
+/// being written when this table arrived. May go negative: a shortfall is signed
+/// debt, not a silent refusal, so the next earn visibly pays it down.
+async fn loyalty_points_in<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: i32,
+) -> Result<i64, DbErr> {
+    let sum = loyalty_entry::Entity::find()
+        .select_only()
+        .column_as(loyalty_entry::Column::Points.sum(), "total")
+        .filter(loyalty_entry::Column::CustomerId.eq(customer_id))
+        .into_tuple::<Option<i64>>()
+        .one(conn)
+        .await?
+        .flatten();
+    Ok(sum.unwrap_or(0))
+}
+
+/// Credits the spend. Runs inside the checkout/promote transaction, so the sale
+/// and its points commit together.
+async fn earn_loyalty<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: i32,
+    paid_total: Decimal,
+    sale_id: i32,
+) -> CmdResult<()> {
+    let points = i64::try_from((paid_total / Decimal::new(1_000, 0)).floor())
+        .map_err(|_| CmdError::Validation("sale total is out of points range".into()))?
+        * LOYALTY_PER_THOUSAND;
+    if points <= 0 {
+        return Ok(());
+    }
+    loyalty_entry::ActiveModel {
+        customer_id: Set(customer_id),
+        sale_id: Set(Some(sale_id)),
+        kind: Set("Earn".to_owned()),
+        points: Set(points),
+        created_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+    Ok(())
+}
+
+/// Spends points as a tender. No balance cap: the shortfall becomes signed debt
+/// rather than refusing the sale on a stale count — the same choice the credit
+/// limit makes.
+async fn redeem_loyalty<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: i32,
+    amount: Decimal,
+    sale_id: i32,
+) -> CmdResult<()> {
+    let points = i64::try_from(amount)
+        .map_err(|_| CmdError::Validation("a loyalty tender must be whole points".into()))?;
+    loyalty_entry::ActiveModel {
+        customer_id: Set(customer_id),
+        sale_id: Set(Some(sale_id)),
+        kind: Set("Redeem".to_owned()),
+        points: Set(-points),
+        created_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+    Ok(())
+}
+
+/// Reverses what a returned sale earned. Only the earn reverses: redeemed points
+/// stay spent, which is what makes returning points-paid goods a wash.
+async fn void_loyalty<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: i32,
+    sale_id: i32,
+) -> CmdResult<()> {
+    let earned = loyalty_entry::Entity::find()
+        .select_only()
+        .column_as(loyalty_entry::Column::Points.sum(), "total")
+        .filter(loyalty_entry::Column::CustomerId.eq(customer_id))
+        .filter(loyalty_entry::Column::SaleId.eq(Some(sale_id)))
+        .filter(loyalty_entry::Column::Kind.eq("Earn"))
+        .into_tuple::<Option<i64>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(0);
+    if earned <= 0 {
+        return Ok(());
+    }
+    loyalty_entry::ActiveModel {
+        customer_id: Set(customer_id),
+        sale_id: Set(Some(sale_id)),
+        kind: Set("Void".to_owned()),
+        points: Set(-earned),
+        created_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+    Ok(())
+}
+
+/// A member's points history, newest last — the order the till earned them in.
+#[tauri::command]
+pub async fn list_loyalty(customer_id: i32) -> CmdResult<Vec<loyalty_entry::Model>> {
+    // Guarded as customer data rather than its own group: points belong to the
+    // member the way the balance does, and a fourth group buys nothing.
+    crate::commands_auth::require_permission(db(), "customer-show").await?;
+    list_loyalty_in(db(), customer_id).await
+}
+
+pub async fn list_loyalty_in<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: i32,
+) -> CmdResult<Vec<loyalty_entry::Model>> {
+    Ok(loyalty_entry::Entity::find()
+        .filter(loyalty_entry::Column::CustomerId.eq(customer_id))
+        .order_by_asc(loyalty_entry::Column::Id)
+        .all(conn)
+        .await?)
 }
 
 // ---------------------------------------------------------------------------

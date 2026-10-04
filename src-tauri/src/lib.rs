@@ -100,6 +100,7 @@ pub fn run() {
             commands::collect_servicing_payment,
             commands::list_servicings,
             commands::get_servicing,
+            commands::list_loyalty,
             commands::sell_gift_card,
             commands::reload_gift_card,
             commands::list_gift_cards,
@@ -1526,7 +1527,6 @@ mod tests {
             zip: None,
             tax_number: None,
             credit_limit: Decimal::ZERO,
-            loyalty_points: Decimal::ZERO,
             note: None,
         };
         let first = commands::create_customer_in(&db, input()).await.expect("first");
@@ -2260,6 +2260,223 @@ mod tests {
         .await
         .expect_err("cardless gift tender");
         assert!(format!("{err}").contains("needs a card number"));
+    }
+
+    async fn sell_to_customer(
+        db: &DatabaseConnection,
+        item_id: i32,
+        customer_id: i32,
+        payments: Option<Vec<commands::PaymentLine>>,
+    ) -> commands::SaleView {
+        commands::checkout_in(
+            db,
+            commands::CheckoutInput {
+                lines: vec![line(item_id, dec(2), dec(15000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+                customer_id: Some(customer_id),
+                order_type: None,
+                payments,
+            },
+        )
+        .await
+        .expect("customer checkout")
+    }
+
+    async fn loyalty_of(db: &DatabaseConnection, customer_id: i32) -> i64 {
+        commands::list_loyalty_in(db, customer_id).await.expect("history").iter().map(|e| e.points).sum()
+    }
+
+    #[tokio::test]
+    async fn a_named_sale_earns_a_point_per_thousand() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Kiki", Decimal::ZERO).await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+
+        sell_to_customer(&db, mug, customer, None).await;
+
+        // 2 × 15000 = 30000 paid in full, so 30 points.
+        assert_eq!(loyalty_of(&db, customer).await, 30);
+        let input = commands::CustomerInput {
+            name: "Kiki".into(),
+            code: None,
+            email: None,
+            phone: None,
+            address: None,
+            city: None,
+            country: None,
+            zip: None,
+            tax_number: None,
+            credit_limit: Decimal::ZERO,
+            note: None,
+        };
+        let view =
+            commands::update_customer_in(&db, customer, input).await.expect("customer read");
+        assert_eq!(view.loyalty_points, Decimal::from(30));
+    }
+
+    #[tokio::test]
+    async fn a_draft_earns_nothing_until_it_completes() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Lala", Decimal::ZERO).await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+
+        let parked = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![line(mug, dec(2), dec(15000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: Some(false),
+                customer_id: Some(customer),
+                order_type: None,
+                payments: None,
+            },
+        )
+        .await
+        .expect("parking succeeds");
+        assert_eq!(loyalty_of(&db, customer).await, 0, "a draft is not a spend");
+
+        commands::promote_draft_in(&db, parked.sale.id, None, None)
+            .await
+            .expect("promotion succeeds");
+        assert_eq!(loyalty_of(&db, customer).await, 30);
+    }
+
+    #[tokio::test]
+    async fn a_loyalty_tender_spends_points() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Mira", Decimal::ZERO).await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(10)).await;
+
+        sell_to_customer(&db, mug, customer, None).await;
+        assert_eq!(loyalty_of(&db, customer).await, 30);
+
+        // 10 points off a 30000 sale: 29990 cash-equivalent paid, 10 in points.
+        let tender = vec![commands::PaymentLine {
+            method: "Loyalty".into(),
+            amount: Decimal::new(10_000, 3),
+            reference: None,
+            gift_card_no: None,
+            gift_card_pin: None,
+        }];
+        // The tender total must still cover nothing extra: points replace money
+        // one for one, so the sale below pays 29990 in cash and 10 in points.
+        let cash = vec![
+            commands::PaymentLine {
+                method: "Cash".into(),
+                amount: Decimal::new(29_990_000, 3),
+                reference: None,
+                gift_card_no: None,
+                gift_card_pin: None,
+            },
+            tender.into_iter().next().unwrap(),
+        ];
+        sell_to_customer(&db, mug, customer, Some(cash)).await;
+
+        // 30 - 10 redeemed + 30 earned on the second sale.
+        assert_eq!(loyalty_of(&db, customer).await, 50);
+    }
+
+    #[tokio::test]
+    async fn a_return_voids_what_its_sale_earned() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Nina", Decimal::ZERO).await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+
+        let view = sell_to_customer(&db, mug, customer, None).await;
+        assert_eq!(loyalty_of(&db, customer).await, 30);
+
+        let mut input = return_line(view.lines[0].id, dec(2));
+        input.sale_id = view.sale.id;
+        commands::create_return_in(&db, input, None).await.expect("return");
+
+        assert_eq!(loyalty_of(&db, customer).await, 0, "the earn reverses with the goods");
+        let kinds: Vec<String> = commands::list_loyalty_in(&db, customer)
+            .await
+            .expect("history")
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, vec!["Earn".to_owned(), "Void".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_loyalty_tender_must_be_whole_points() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Oscar", Decimal::ZERO).await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+
+        let tender = vec![commands::PaymentLine {
+            method: "Loyalty".into(),
+            amount: Decimal::new(10_500, 3),
+            reference: None,
+            gift_card_no: None,
+            gift_card_pin: None,
+        }];
+        let err = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![line(mug, dec(1), dec(15000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+                customer_id: Some(customer),
+                order_type: None,
+                payments: Some(tender),
+            },
+        )
+        .await
+        .expect_err("fractional points");
+        assert!(format!("{err}").contains("whole points"));
+    }
+
+    #[tokio::test]
+    async fn a_walk_in_cannot_spend_points() {
+        let db = db::init_for_tests().await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+
+        let tender = vec![commands::PaymentLine {
+            method: "Loyalty".into(),
+            amount: Decimal::new(10_000, 0),
+            reference: None,
+            gift_card_no: None,
+            gift_card_pin: None,
+        }];
+        let err = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![line(mug, dec(1), dec(15000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+                customer_id: None,
+                order_type: None,
+                payments: Some(tender),
+            },
+        )
+        .await
+        .expect_err("walk-in loyalty");
+        assert!(format!("{err}").contains("needs a named customer"));
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ pub mod gift_card;
 pub mod gift_card_transaction;
 pub mod installment_sale;
 pub mod installment_sale_detail;
+pub mod loyalty_entry;
 pub mod promotion;
 pub mod quotation;
 pub mod quotation_detail;
