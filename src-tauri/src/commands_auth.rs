@@ -875,8 +875,7 @@ pub async fn my_permissions() -> CmdResult<Vec<String>> {
     permission_names_in(conn, id).await
 }
 
-/// SQLite and Postgres phrase a unique violation differently, and neither uses a
-/// code this crate exposes portably, so both messages are matched by substring.
+/// Backends phrase unique violations differently, so match by substring.
 fn is_unique_violation(err: &sea_orm::RuntimeErr) -> bool {
     let text = err.to_string().to_lowercase();
     text.contains("unique constraint")

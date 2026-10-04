@@ -19,6 +19,10 @@ pub struct Model {
     pub phone: Option<String>,
     pub role: Option<String>,
     pub photo: Option<String>,
+    /// Argon2 PHC string for the manager approval PIN. Same treatment as
+    /// `password_hash`: set through a dedicated command, never on the wire.
+    #[serde(skip_serializing)]
+    pub pin_hash: Option<String>,
     pub del_status: String,
     pub two_factor_enabled: bool,
     pub created_at: chrono::NaiveDateTime,
