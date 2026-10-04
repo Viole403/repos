@@ -242,7 +242,7 @@ pub async fn create_user_in<C: sea_orm::ConnectionTrait>(conn: &C, input: UserIn
     // instead of a raw database error surfacing in a toast.
     let row = match model.clone().insert(conn).await {
         Ok(row) => row,
-        Err(DbErr::Query(err)) if is_unique_violation(&err) => {
+        Err(err) if is_unique_violation(&err) => {
             return Err(CmdError::Conflict(format!(
                 "an account with the email {email} already exists"
             )));
@@ -952,12 +952,32 @@ pub async fn verify_approval_pin_in<C: sea_orm::ConnectionTrait>(
     Err(CmdError::Validation("PIN is incorrect".into()))
 }
 
-/// Backends phrase unique violations differently, so match by substring.
-fn is_unique_violation(err: &sea_orm::RuntimeErr) -> bool {
-    let text = err.to_string().to_lowercase();
+/// Whether a failed write was the unique index rejecting a duplicate.
+///
+/// **Every `DbErr` variant is inspected, not just `DbErr::Query`.** That distinction
+/// was a real cross-backend bug: Postgres and SQLite report a duplicate key as
+/// `DbErr::Query`, while MySQL reports it as `DbErr::Exec` — so a guard written as
+/// `Err(DbErr::Query(e)) if …` silently never fired on MySQL, and a duplicate
+/// account surfaced as a raw driver error instead of the intended conflict.
+///
+/// The message is matched by substring because each backend words it differently:
+/// SQLite `UNIQUE constraint failed`, Postgres `duplicate key value violates unique
+/// constraint`, MySQL `Duplicate entry '…' for key '…'`. sqlx knows the real code
+/// (`1062` on MySQL, `23505` on Postgres) but SeaORM does not surface it without
+/// downcasting through `Box<dyn Error>`; revisit if that becomes cheap.
+fn is_unique_violation(err: &DbErr) -> bool {
+    let text = match err {
+        DbErr::Query(e) | DbErr::Exec(e) | DbErr::Conn(e) => e.to_string(),
+        other => other.to_string(),
+    }
+    .to_lowercase();
+
     text.contains("unique constraint")
-        || text.contains("duplicate key")
         || text.contains("unique violation")
+        || text.contains("duplicate key")
+        || text.contains("duplicate entry")
+        || text.contains("1062")
+        || text.contains("23505")
 }
 
 #[cfg(test)]
