@@ -29,6 +29,7 @@ import { Servicings } from "./screens/Servicings";
 import { GiftCards } from "./screens/GiftCards";
 import { CreditNotes } from "./screens/CreditNotes";
 import { Stock } from "./screens/Stock";
+import { StockOps } from "./screens/StockOps";
 import { Display } from "./screens/Display";
 import { Combos } from "./screens/Combos";
 import { Units } from "./screens/Units";
@@ -52,6 +53,7 @@ const screens: Record<string, ReactNode> = {
     "/sales/gift-cards": <GiftCards />,
     "/sales/credit-notes": <CreditNotes />,
     "/stock": <Stock />,
+    "/stock/operations": <StockOps />,
     "/catalog/combos": <Combos />,
     "/catalog/items": <ItemsList />,
     "/catalog/units": <Units />,
