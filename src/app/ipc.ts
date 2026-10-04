@@ -200,6 +200,8 @@ export interface SaleView {
     lines: SaleDetail[];
     /** Returned so the register can refresh without a second round-trip. */
     stockOnHand: ItemOnHand[];
+    /** One per tender. Empty for a single-method sale recorded the pre-split way. */
+    payments: SalePayment[];
 }
 
 export interface CheckoutLine {
@@ -225,6 +227,25 @@ export interface CheckoutInput {
     promote?: boolean | null;
     /** Who the sale is to. Omit for a walk-in, which is the common case. */
     customerId?: number | null;
+    /** One entry per tender. When present these replace `paidTotal` and `paymentMethod`. */
+    payments?: PaymentLine[] | null;
+}
+
+export interface PaymentLine {
+    method: string;
+    /** Must be greater than zero. */
+    amount: Decimal;
+    /** Gateway reference, receipt number, or whatever the tender produces. */
+    reference?: string | null;
+}
+
+export interface SalePayment {
+    id: number;
+    saleId: number;
+    method: string;
+    amount: Decimal;
+    reference: string | null;
+    createdAt: Timestamp;
 }
 
 /** Closed vocabulary, stored and sent in PascalCase so raw SQL stays readable. */
@@ -367,6 +388,7 @@ export interface SaleFilter {
 export const listSales = (filter: SaleFilter = {}, query: PageQuery = {}) =>
     call<Page<SaleSummary>>("list_sales", { filter, query });
 export const getSale = (id: number) => call<SaleView>("get_sale", { id });
+export const listSalePayments = (saleId: number) => call<SalePayment[]>("list_sale_payments", { saleId });
 
 // ---------------------------------------------------------------- trade
 export interface CustomerView {
