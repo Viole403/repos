@@ -22,6 +22,4 @@ pub enum Relation {
     Item,
 }
 
-
-
 impl ActiveModelBehavior for ActiveModel {}
