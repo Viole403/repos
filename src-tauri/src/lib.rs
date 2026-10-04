@@ -100,6 +100,10 @@ pub fn run() {
             commands::collect_servicing_payment,
             commands::list_servicings,
             commands::get_servicing,
+            commands::sell_gift_card,
+            commands::reload_gift_card,
+            commands::list_gift_cards,
+            commands::get_gift_card,
             commands::list_customers,
             commands::create_customer,
             commands::update_customer,
@@ -2072,6 +2076,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_gift_card_sells_and_reloads() {
+        let db = db::init_for_tests().await;
+
+        let view = commands::sell_gift_card_in(
+            &db,
+            "GC-001".into(),
+            Decimal::new(100_000_000, 3),
+            "Cash".into(),
+            None,
+        )
+        .await
+        .expect("card sold");
+        assert_eq!(view.balance, Decimal::new(100_000_000, 3));
+        assert_eq!(view.transactions.len(), 1);
+
+        // The same number twice is a reload, not a second card.
+        let err = commands::sell_gift_card_in(
+            &db,
+            "GC-001".into(),
+            Decimal::new(10_000_000, 3),
+            "Cash".into(),
+            None,
+        )
+        .await
+        .expect_err("duplicate card number");
+        assert!(format!("{err}").contains("already sold"));
+
+        let view = commands::reload_gift_card_in(
+            &db,
+            "GC-001".into(),
+            Decimal::new(50_000_000, 3),
+            "Cash".into(),
+        )
+        .await
+        .expect("card reloaded");
+        assert_eq!(view.balance, Decimal::new(150_000_000, 3));
+    }
+
+    fn gift_tender(card_no: &str, amount: Decimal) -> Vec<commands::PaymentLine> {
+        vec![commands::PaymentLine {
+            method: "GiftCard".into(),
+            amount,
+            reference: None,
+            gift_card_no: Some(card_no.into()),
+            gift_card_pin: None,
+        }]
+    }
+
+    #[tokio::test]
+    async fn a_gift_card_redeems_at_the_till() {
+        let db = db::init_for_tests().await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+        commands::sell_gift_card_in(&db, "GC-002".into(), Decimal::new(100_000_000, 3), "Cash".into(), None)
+            .await
+            .expect("card sold");
+
+        let view = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![line(mug, dec(2), dec(15000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+                customer_id: None,
+                order_type: None,
+                payments: Some(gift_tender("GC-002", Decimal::new(30_000_000, 3))),
+            },
+        )
+        .await
+        .expect("gift card sale");
+
+        let card = commands::get_gift_card_in(&db, "GC-002").await.expect("card read");
+        assert_eq!(card.balance, Decimal::new(70_000_000, 3));
+        let redeem = card.transactions.iter().find(|t| t.kind == "Redeem").expect("redeem row");
+        assert_eq!(redeem.sale_id, Some(view.sale.id), "the debit names its sale");
+    }
+
+    #[tokio::test]
+    async fn a_gift_card_redeem_above_balance_is_refused() {
+        let db = db::init_for_tests().await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+        commands::sell_gift_card_in(&db, "GC-003".into(), Decimal::new(10_000_000, 3), "Cash".into(), None)
+            .await
+            .expect("card sold");
+
+        let before = commands::list_sales_in(&db, &no_filter(), &page_one()).await.unwrap().total;
+        let err = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![line(mug, dec(2), dec(15000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+                customer_id: None,
+                order_type: None,
+                payments: Some(gift_tender("GC-003", Decimal::new(30_000_000, 3))),
+            },
+        )
+        .await
+        .expect_err("card holds less than the tender");
+        assert!(format!("{err}").contains("holds"));
+
+        // The debit and the sale roll back together — no half-written sale.
+        let after = commands::list_sales_in(&db, &no_filter(), &page_one()).await.unwrap().total;
+        assert_eq!(after, before);
+        let card = commands::get_gift_card_in(&db, "GC-003").await.expect("card read");
+        assert_eq!(card.balance, Decimal::new(10_000_000, 3));
+    }
+
+    #[tokio::test]
+    async fn a_gift_card_pin_is_checked_on_redeem() {
+        let db = db::init_for_tests().await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+        commands::sell_gift_card_in(
+            &db,
+            "GC-004".into(),
+            Decimal::new(100_000_000, 3),
+            "Cash".into(),
+            Some("1234".into()),
+        )
+        .await
+        .expect("card sold");
+
+        let mut tender = gift_tender("GC-004", Decimal::new(30_000_000, 3));
+        tender[0].gift_card_pin = Some("0000".into());
+        let err = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![line(mug, dec(2), dec(15000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+                customer_id: None,
+                order_type: None,
+                payments: Some(tender),
+            },
+        )
+        .await
+        .expect_err("wrong PIN");
+        assert!(format!("{err}").contains("PIN does not match"));
+    }
+
+    #[tokio::test]
+    async fn a_gift_card_tender_needs_a_card_number() {
+        let db = db::init_for_tests().await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+
+        let err = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![line(mug, dec(1), dec(15000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+                customer_id: None,
+                order_type: None,
+                payments: Some(vec![commands::PaymentLine {
+                    method: "GiftCard".into(),
+                    amount: Decimal::new(15_000_000, 3),
+                    reference: None,
+                    gift_card_no: None,
+                    gift_card_pin: None,
+                }]),
+            },
+        )
+        .await
+        .expect_err("cardless gift tender");
+        assert!(format!("{err}").contains("needs a card number"));
+    }
+
+    #[tokio::test]
     async fn collecting_against_a_paid_due_is_refused() {
         let db = db::init_for_tests().await;
         let customer = seed_customer(&db, "Eka", Decimal::ZERO).await;
@@ -2195,11 +2386,15 @@ mod tests {
                     method: "Cash".into(),
                     amount: Decimal::new(60_000, 3),
                     reference: None,
+                    gift_card_no: None,
+                    gift_card_pin: None,
                 },
                 commands::PaymentLine {
                     method: "Card".into(),
                     amount: Decimal::new(40_000, 3),
                     reference: Some("AUTH-9911".into()),
+                    gift_card_no: None,
+                    gift_card_pin: None,
                 },
             ]),
         )
@@ -2241,6 +2436,8 @@ mod tests {
                 method: "Cash".into(),
                 amount: Decimal::new(120_000, 3),
                 reference: None,
+                gift_card_no: None,
+                gift_card_pin: None,
             }]),
         )
         .await
@@ -2272,6 +2469,8 @@ mod tests {
                 method: "Cash".into(),
                 amount: Decimal::ZERO,
                 reference: None,
+                gift_card_no: None,
+                gift_card_pin: None,
             }]),
         )
         .await
@@ -2300,6 +2499,8 @@ mod tests {
                 method: "Cash".into(),
                 amount: Decimal::new(40_000, 3),
                 reference: None,
+                gift_card_no: None,
+                gift_card_pin: None,
             }]),
         )
         .await
@@ -2612,8 +2813,8 @@ mod tests {
             Decimal::new(100_000, 3),
             None,
             Some(vec![
-                commands::PaymentLine { method: "Cash".into(), amount: Decimal::new(30_000, 3), reference: None },
-                commands::PaymentLine { method: "Card".into(), amount: Decimal::new(70_000, 3), reference: None },
+                commands::PaymentLine { method: "Cash".into(), amount: Decimal::new(30_000, 3), reference: None, gift_card_no: None, gift_card_pin: None },
+                commands::PaymentLine { method: "Card".into(), amount: Decimal::new(70_000, 3), reference: None, gift_card_no: None, gift_card_pin: None },
             ]),
         )
         .await

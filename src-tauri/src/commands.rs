@@ -25,7 +25,7 @@ use crate::entities::auth::users;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{booking, combo_item, combo_sale, installment_sale, installment_sale_detail, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, servicing, stock_movement, warranty};
+use crate::entities::sales::{booking, combo_item, combo_sale, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, servicing, stock_movement, warranty};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -1899,6 +1899,12 @@ pub struct PaymentLine {
     pub amount: Decimal,
     /// Gateway reference, receipt number, or whatever the tender produces.
     pub reference: Option<String>,
+    /// Required when the method is stored value. The card to debit.
+    #[serde(default)]
+    pub gift_card_no: Option<String>,
+    /// The card's PIN, when the card has one.
+    #[serde(default)]
+    pub gift_card_pin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2037,6 +2043,14 @@ fn validate_payments(lines: &[PaymentLine]) -> CmdResult<()> {
         if line.amount <= Decimal::ZERO {
             return Err(CmdError::Validation(format!(
                 "{where_}: amount must be greater than zero"
+            )));
+        }
+        // A stored-value tender without a card number has nothing to debit.
+        let cardless = line.method.trim() == GIFT_CARD_METHOD
+            && line.gift_card_no.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_none();
+        if cardless {
+            return Err(CmdError::Validation(format!(
+                "{where_}: a gift card tender needs a card number"
             )));
         }
     }
@@ -2352,6 +2366,13 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     if let Some(lines) = payments.as_ref() {
         for line in lines {
             write_payment(&txn, sale_id, line).await?;
+            // The debit lands in the same transaction as the sale: a retried
+            // checkout writes a new sale, never a second debit for this one.
+            if line.method.trim() == GIFT_CARD_METHOD {
+                let card_no = line.gift_card_no.as_deref().expect("validated above");
+                redeem_gift_card(&txn, card_no, line.gift_card_pin.as_deref(), line.amount, sale_id)
+                    .await?;
+            }
         }
     }
 
@@ -5341,6 +5362,259 @@ pub async fn get_servicing_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResul
         .await?
         .map(|c| c.name);
     Ok(ServicingView { servicing: row, customer_name, due_amount: due })
+}
+
+// ---------------------------------------------------------------------------
+// Gift cards
+// ---------------------------------------------------------------------------
+
+/// The tender method that debits stored value. Exact match, like the payment
+/// vocabulary everywhere else — no case folding, no aliases.
+pub const GIFT_CARD_METHOD: &str = "GiftCard";
+
+/// What a stored-value row can be. Closed so a report can group without string
+/// matching; a refund back to a card is still open (it needs a card target on
+/// the return flow).
+pub const GIFT_CARD_KINDS: &[&str] = &["Sell", "Reload", "Redeem"];
+
+/// The balance is `SUM(amount)` — never a column — so two concurrent redemptions
+/// serialize on the transaction rather than interleaving a read-modify-write.
+async fn gift_card_balance_in<C: ConnectionTrait>(
+    conn: &C,
+    gift_card_id: i32,
+) -> Result<Decimal, DbErr> {
+    let sum = gift_card_transaction::Entity::find()
+        .select_only()
+        .column_as(gift_card_transaction::Column::Amount.sum(), "total")
+        .filter(gift_card_transaction::Column::GiftCardId.eq(gift_card_id))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten();
+    Ok(sum.unwrap_or(Decimal::ZERO))
+}
+
+async fn gift_card_view<C: ConnectionTrait>(
+    conn: &C,
+    card: gift_card::Model,
+) -> CmdResult<GiftCardView> {
+    let transactions = gift_card_transaction::Entity::find()
+        .filter(gift_card_transaction::Column::GiftCardId.eq(card.id))
+        .order_by_asc(gift_card_transaction::Column::Id)
+        .all(conn)
+        .await?;
+    let balance = transactions.iter().map(|t| t.amount).sum();
+    Ok(GiftCardView { card, balance, transactions })
+}
+
+/// A card with its derived balance and full history.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiftCardView {
+    pub card: gift_card::Model,
+    pub balance: Decimal,
+    pub transactions: Vec<gift_card_transaction::Model>,
+}
+
+/// A card row with its derived balance, so the list shows no computation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiftCardSummary {
+    pub id: i32,
+    pub card_no: String,
+    pub balance: Decimal,
+    pub created_at: NaiveDateTime,
+}
+
+#[tauri::command]
+pub async fn sell_gift_card(
+    card_no: String,
+    amount: Decimal,
+    payment_method: String,
+    pin: Option<String>,
+) -> CmdResult<GiftCardView> {
+    crate::commands_auth::require_permission(db(), "giftcard-sell").await?;
+    sell_gift_card_in(db(), card_no, amount, payment_method, pin).await
+}
+
+pub(crate) async fn sell_gift_card_in<C: ConnectionTrait>(
+    conn: &C,
+    card_no: String,
+    amount: Decimal,
+    payment_method: String,
+    pin: Option<String>,
+) -> CmdResult<GiftCardView> {
+    let card_no = required(&card_no, "card number")?;
+    if amount <= Decimal::ZERO {
+        return Err(CmdError::Validation("amount must be greater than zero".into()));
+    }
+    let payment_method = required(&payment_method, "payment method")?;
+    if gift_card::Entity::find()
+        .filter(gift_card::Column::CardNo.eq(&card_no))
+        .one(conn)
+        .await?
+        .is_some()
+    {
+        return Err(CmdError::Conflict(format!(
+            "card {card_no} is already sold — reload it instead"
+        )));
+    }
+
+    let now = crate::migration::now();
+    let card = gift_card::ActiveModel {
+        card_no: Set(card_no.clone()),
+        pin: Set(text(pin)),
+        created_by: Set(crate::auth::current_user_id()),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+    gift_card_transaction::ActiveModel {
+        gift_card_id: Set(card.id),
+        sale_id: Set(None),
+        kind: Set("Sell".to_owned()),
+        amount: Set(amount),
+        balance_after: Set(amount),
+        payment_method: Set(Some(payment_method)),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+    gift_card_view(conn, card).await
+}
+
+#[tauri::command]
+pub async fn reload_gift_card(
+    card_no: String,
+    amount: Decimal,
+    payment_method: String,
+) -> CmdResult<GiftCardView> {
+    crate::commands_auth::require_permission(db(), "giftcard-reload").await?;
+    reload_gift_card_in(db(), card_no, amount, payment_method).await
+}
+
+pub(crate) async fn reload_gift_card_in<C: ConnectionTrait>(
+    conn: &C,
+    card_no: String,
+    amount: Decimal,
+    payment_method: String,
+) -> CmdResult<GiftCardView> {
+    let card_no = required(&card_no, "card number")?;
+    if amount <= Decimal::ZERO {
+        return Err(CmdError::Validation("amount must be greater than zero".into()));
+    }
+    let payment_method = required(&payment_method, "payment method")?;
+    let card = live_gift_card(conn, &card_no).await?;
+
+    let balance = gift_card_balance_in(conn, card.id).await? + amount;
+    gift_card_transaction::ActiveModel {
+        gift_card_id: Set(card.id),
+        sale_id: Set(None),
+        kind: Set("Reload".to_owned()),
+        amount: Set(amount),
+        balance_after: Set(balance),
+        payment_method: Set(Some(payment_method)),
+        created_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+    gift_card_view(conn, card).await
+}
+
+async fn live_gift_card<C: ConnectionTrait>(conn: &C, card_no: &str) -> CmdResult<gift_card::Model> {
+    gift_card::Entity::find()
+        .filter(gift_card::Column::CardNo.eq(card_no.trim()))
+        .filter(gift_card::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("gift card".into()))
+}
+
+/// Debits stored value for a till sale. Runs inside the checkout transaction, so
+/// the sale and the debit commit together — a retried checkout writes a new sale,
+/// never a second debit for the one that succeeded.
+async fn redeem_gift_card<C: ConnectionTrait>(
+    conn: &C,
+    card_no: &str,
+    pin: Option<&str>,
+    amount: Decimal,
+    sale_id: i32,
+) -> CmdResult<()> {
+    let card = live_gift_card(conn, card_no).await?;
+    if let Some(expected) = card.pin.as_deref() {
+        if pin.map(str::trim).filter(|p| !p.is_empty()) != Some(expected) {
+            return Err(CmdError::Validation("gift card PIN does not match".into()));
+        }
+    }
+    let balance = gift_card_balance_in(conn, card.id).await?;
+    if amount > balance {
+        return Err(CmdError::Validation(format!(
+            "gift card {card_no} holds {balance}, not {amount}"
+        )));
+    }
+    gift_card_transaction::ActiveModel {
+        gift_card_id: Set(card.id),
+        sale_id: Set(Some(sale_id)),
+        kind: Set("Redeem".to_owned()),
+        amount: Set(-amount),
+        balance_after: Set(balance - amount),
+        payment_method: Set(None),
+        created_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_gift_cards(query: PageQuery) -> CmdResult<Page<GiftCardSummary>> {
+    crate::commands_auth::require_permission(db(), "giftcard-list").await?;
+    list_gift_cards_in(db(), &query).await
+}
+
+pub async fn list_gift_cards_in<C: ConnectionTrait>(
+    conn: &C,
+    query: &PageQuery,
+) -> CmdResult<Page<GiftCardSummary>> {
+    let base = gift_card::Entity::find().filter(gift_card::Column::DelStatus.eq(LIVE));
+    let total = base.clone().count(conn).await?;
+    let rows = base
+        .order_by_desc(gift_card::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        views.push(GiftCardSummary {
+            id: row.id,
+            card_no: row.card_no,
+            balance: gift_card_balance_in(conn, row.id).await?,
+            created_at: row.created_at,
+        });
+    }
+    Ok(Page::new(views, total, query))
+}
+
+#[tauri::command]
+pub async fn get_gift_card(card_no: String) -> CmdResult<GiftCardView> {
+    crate::commands_auth::require_permission(db(), "giftcard-show").await?;
+    get_gift_card_in(db(), &card_no).await
+}
+
+pub async fn get_gift_card_in<C: ConnectionTrait>(
+    conn: &C,
+    card_no: &str,
+) -> CmdResult<GiftCardView> {
+    let card_no = required(&card_no.to_owned(), "card number")?;
+    let card = live_gift_card(conn, &card_no).await?;
+    gift_card_view(conn, card).await
 }
 
 // ---------------------------------------------------------------------------
