@@ -24,7 +24,7 @@ use crate::db::db;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{sale, sale_detail, stock_movement};
+use crate::entities::sales::{sale, sale_detail, sale_payment, stock_movement};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -774,7 +774,7 @@ pub async fn get_sale_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResult<Sal
         stock_on_hand.push(ItemOnHand { item_id, quantity: on_hand_in(conn, item_id).await? });
     }
 
-    Ok(SaleView { sale, lines, stock_on_hand })
+    Ok(SaleView { sale, lines, stock_on_hand, payments: list_payments_in(conn, id).await? })
 }
 
 /// A sale row with the customer named, so the list does not show ids.
@@ -1549,6 +1549,22 @@ pub struct CheckoutInput {
     /// counter and must not be forced through a customer row.
     #[serde(default)]
     pub customer_id: Option<i32>,
+    /// One entry per tender, for a split payment. When present these *replace*
+    /// `paid_total` and `payment_method` rather than sitting beside them, so the
+    /// figure can only come from one place.
+    #[serde(default)]
+    pub payments: Option<Vec<PaymentLine>>,
+}
+
+/// One tender against a sale.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentLine {
+    pub method: String,
+    /// Must be greater than zero. A zero "tender" is not a tender.
+    pub amount: Decimal,
+    /// Gateway reference, receipt number, or whatever the tender produces.
+    pub reference: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1567,6 +1583,55 @@ pub struct SaleView {
     pub lines: Vec<sale_detail::Model>,
     /// One entry per distinct item touched by this sale.
     pub stock_on_hand: Vec<ItemOnHand>,
+    /// One entry per tender. Empty for a sale paid in a single method recorded the
+    /// pre-split way, and for a draft that has not been paid.
+    pub payments: Vec<sale_payment::Model>,
+}
+
+/// One word for a split sale: `"Cash + Card"` beats `"Split"` because a receipt or a
+/// report then names what actually happened.
+fn summarise_methods(lines: &[PaymentLine]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for line in lines {
+        let method = line.method.trim();
+        if !seen.contains(&method) {
+            seen.push(method);
+        }
+    }
+    seen.join(" + ")
+}
+
+async fn write_payment<C: ConnectionTrait>(
+    conn: &C,
+    sale_id: i32,
+    line: &PaymentLine,
+) -> CmdResult<()> {
+    sale_payment::ActiveModel {
+        sale_id: Set(sale_id),
+        method: Set(line.method.trim().to_owned()),
+        amount: Set(line.amount),
+        reference: Set(text(line.reference.clone())),
+        created_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_sale_payments(sale_id: i32) -> CmdResult<Vec<sale_payment::Model>> {
+    crate::commands_auth::require_permission(db(), "sale-show").await?;
+    list_payments_in(db(), sale_id).await
+}
+
+pub async fn list_payments_in<C: ConnectionTrait>(conn: &C, sale_id: i32) -> CmdResult<Vec<sale_payment::Model>> {
+    Ok(sale_payment::Entity::find()
+        .filter(sale_payment::Column::SaleId.eq(sale_id))
+        .order_by_asc(sale_payment::Column::Id)
+        .all(conn)
+        .await?)
 }
 
 fn validate_checkout(input: &CheckoutInput) -> CmdResult<()> {
@@ -1616,7 +1681,30 @@ fn validate_checkout(input: &CheckoutInput) -> CmdResult<()> {
     if let Some(method) = input.payment_method.as_deref() {
         required(method, "payment method")?;
     }
+    if let Some(lines) = input.payments.as_ref() {
+        validate_payments(lines)?;
+    }
 
+    Ok(())
+}
+
+/// Every tender must name a method and carry a positive amount. The total is checked
+/// against the sale once the grand total is known, not here.
+fn validate_payments(lines: &[PaymentLine]) -> CmdResult<()> {
+    if lines.is_empty() {
+        return Err(CmdError::Validation(
+            "no payment lines given — omit the field entirely for a single tender".into(),
+        ));
+    }
+    for (i, line) in lines.iter().enumerate() {
+        let where_ = format!("payment {}", i + 1);
+        required(&line.method, &format!("{where_} method"))?;
+        if line.amount <= Decimal::ZERO {
+            return Err(CmdError::Validation(format!(
+                "{where_}: amount must be greater than zero"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1862,16 +1950,38 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     header.discount_total = Set(discount_total);
     header.tax_total = Set(tax_total);
     header.grand_total = Set(grand_total);
-    header.paid_total = Set(input.paid_total.unwrap_or(grand_total));
+    // Taken from the tenders when they are given, so the figure has one source. A
+    // tender list summing above the total is change the cashier holds, not a payment,
+    // so that is refused rather than recorded as a negative sale.
+    let payments = input.payments.filter(|lines| !lines.is_empty());
+    if let Some(lines) = payments.as_ref() {
+        let tendered: Decimal = lines.iter().map(|l| l.amount).sum();
+        if tendered > grand_total {
+            return Err(CmdError::Validation(format!(
+                "payments total {tendered}, which is more than the sale total {grand_total}"
+            )));
+        }
+        header.paid_total = Set(tendered);
+        header.payment_method = Set(summarise_methods(lines));
+    } else {
+        header.paid_total = Set(input.paid_total.unwrap_or(grand_total));
+    }
     // Only the `Set` fields above reach the SET clause — the rest came in as
     // `Unchanged` from the `Model -> ActiveModel` conversion — so this is a
     // six-column UPDATE keyed on the primary key, not a rewrite of the row.
     let row = header.update(&txn).await?;
 
+    if let Some(lines) = payments.as_ref() {
+        for line in lines {
+            write_payment(&txn, sale_id, line).await?;
+        }
+    }
+
     let view = SaleView {
         sale: row,
         lines,
         stock_on_hand,
+        payments: list_payments_in(&txn, sale_id).await?,
     };
     // Committed last: everything above is invisible to other readers until here.
     txn.commit().await?;
@@ -2052,6 +2162,7 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
         note: header.note.clone(),
         promote: None,
         customer_id: None,
+        payments: None,
     })?;
     guard_discount_within_subtotal(discount_total, subtotal)?;
 
@@ -2140,6 +2251,7 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
         sale: row,
         lines,
         stock_on_hand,
+        payments: list_payments_in(&txn, sale_id).await?,
     };
     // Committed last: the movements and the status flip become visible together, or
     // neither does.

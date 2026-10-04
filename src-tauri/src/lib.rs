@@ -61,6 +61,7 @@ pub fn run() {
             commands_auth::set_role_permissions,
             commands_auth::delete_role,
             commands::list_sales,
+            commands::list_sale_payments,
             commands::get_sale,
             commands::list_customers,
             commands::create_customer,
@@ -326,6 +327,38 @@ mod tests {
         .expect("seed opening balance");
     }
 
+    /// A checkout that totals `unit_price * quantity` on one item, with the caller
+    /// supplying the payment shape. Keeps the split-payment tests to the part they are
+    /// actually about.
+    async fn sell_one_item(
+        db: &DatabaseConnection,
+        item_id: i32,
+        unit_price: Decimal,
+        paid_total: Option<Decimal>,
+        payments: Option<Vec<commands::PaymentLine>>,
+    ) -> Result<commands::SaleView, commands::CmdError> {
+        commands::checkout_in(
+            db,
+            commands::CheckoutInput {
+                lines: vec![commands::CheckoutLine {
+                    item_id,
+                    quantity: Decimal::new(1_000, 3),
+                    unit_price,
+                    discount: None,
+                }],
+                discount_total: Some(Decimal::ZERO),
+                tax_total: Some(Decimal::ZERO),
+                paid_total,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: Some(true),
+                customer_id: None,
+                payments,
+            },
+        )
+        .await
+    }
+
     fn line(item_id: i32, quantity: Decimal, unit_price: Decimal) -> CheckoutLine {
         CheckoutLine {
             item_id,
@@ -353,6 +386,7 @@ mod tests {
                 note: None,
                 promote: Some(false),
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -399,6 +433,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -485,6 +520,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                payments: None,
             },
         )
         .await;
@@ -531,6 +567,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -576,6 +613,7 @@ mod tests {
                     note: None,
                     promote: None,
                     customer_id: None,
+                    payments: None,
                 },
             )
             .await
@@ -598,6 +636,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                payments: None,
             }
         )
         .await
@@ -623,6 +662,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -658,6 +698,7 @@ mod tests {
                 note: None,
                 promote: Some(false),
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -697,6 +738,7 @@ mod tests {
                 note: None,
                 promote: Some(false),
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -725,6 +767,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -788,6 +831,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -939,6 +983,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -981,6 +1026,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -1153,6 +1199,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -1405,6 +1452,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: Some(customer),
+                payments: None,
             },
         )
         .await
@@ -1439,6 +1487,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: Some(4242),
+                payments: None,
             },
         )
         .await
@@ -1474,6 +1523,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -1609,6 +1659,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: None,
+                payments: None,
             },
         )
         .await
@@ -1642,5 +1693,135 @@ mod tests {
             commands::get_sale_in(&db, 9999).await,
             Err(commands::CmdError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_split_payment_writes_one_row_per_tender() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+
+        let view = sell_one_item(
+            &db,
+            item,
+            Decimal::new(100_000, 3),
+            None,
+            Some(vec![
+                commands::PaymentLine {
+                    method: "Cash".into(),
+                    amount: Decimal::new(60_000, 3),
+                    reference: None,
+                },
+                commands::PaymentLine {
+                    method: "Card".into(),
+                    amount: Decimal::new(40_000, 3),
+                    reference: Some("AUTH-9911".into()),
+                },
+            ]),
+        )
+        .await
+        .expect("split checkout");
+
+        assert_eq!(view.payments.len(), 2, "the tenders are not recorded");
+        assert_eq!(
+            view.sale.paid_total,
+            Decimal::new(100_000, 3),
+            "the paid figure comes from the tenders, not the input"
+        );
+        assert_eq!(
+            view.sale.payment_method, "Cash + Card",
+            "the header should name what happened, not \"Cash\" from the input"
+        );
+
+        let stored = commands::list_payments_in(&db, view.sale.id).await.unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(
+            stored.iter().map(|p| p.amount).sum::<Decimal>(),
+            view.sale.grand_total,
+            "the tenders and the header disagree"
+        );
+    }
+
+    #[tokio::test]
+    async fn payments_above_the_total_are_refused() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+
+        let err = sell_one_item(
+            &db,
+            item,
+            Decimal::new(100_000, 3),
+            None,
+            Some(vec![commands::PaymentLine {
+                method: "Cash".into(),
+                amount: Decimal::new(120_000, 3),
+                reference: None,
+            }]),
+        )
+        .await
+        .expect_err("the tenders exceed the sale");
+
+        assert!(
+            matches!(err, commands::CmdError::Validation(ref m) if m.contains("more than the sale total")),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            sale::Entity::find().count(&db).await.unwrap(),
+            0,
+            "a refused payment left a sale behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_tender_is_refused() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+
+        let err = sell_one_item(
+            &db,
+            item,
+            Decimal::new(100_000, 3),
+            None,
+            Some(vec![commands::PaymentLine {
+                method: "Cash".into(),
+                amount: Decimal::ZERO,
+                reference: None,
+            }]),
+        )
+        .await
+        .expect_err("a zero tender is not a tender");
+
+        assert!(
+            matches!(err, commands::CmdError::Validation(ref m) if m.contains("greater than zero")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_part_paid_split_sale_is_allowed() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+
+        // Less than the total is a customer paying part of it, which is legal and is
+        // the same shape as a on-account sale.
+        let view = sell_one_item(
+            &db,
+            item,
+            Decimal::new(100_000, 3),
+            None,
+            Some(vec![commands::PaymentLine {
+                method: "Cash".into(),
+                amount: Decimal::new(40_000, 3),
+                reference: None,
+            }]),
+        )
+        .await
+        .expect("part-paid checkout");
+
+        assert_eq!(view.sale.paid_total, Decimal::new(40_000, 3));
+        assert!(view.sale.paid_total < view.sale.grand_total);
     }
 }
