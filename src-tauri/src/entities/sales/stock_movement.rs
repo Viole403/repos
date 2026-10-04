@@ -61,6 +61,8 @@ pub enum MovementType {
     TransferIn,
     /// First ever count for an item, e.g. migrating in opening stock.
     OpeningBalance,
+    /// Stock left because it was handed over on a credit sale.
+    InstallmentSale,
 }
 
 impl MovementType {
@@ -76,6 +78,7 @@ impl MovementType {
             MovementType::TransferOut => "TransferOut",
             MovementType::TransferIn => "TransferIn",
             MovementType::OpeningBalance => "OpeningBalance",
+            MovementType::InstallmentSale => "InstallmentSale",
         }
     }
 }

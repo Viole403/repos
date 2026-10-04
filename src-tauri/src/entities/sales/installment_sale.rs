@@ -26,6 +26,7 @@ pub struct Model {
     pub total: Decimal,
     /// Paid up front. Counts toward the derived paid figure like a schedule row.
     pub down_payment: Decimal,
+    pub down_payment_method: Option<String>,
     pub number_of_installments: i32,
     /// Days between dues. The reference calls this `installment_type`.
     pub interval_days: i32,
