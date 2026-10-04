@@ -56,6 +56,11 @@ pub fn run() {
             commands::record_damage,
             commands::create_item_batch,
             commands::list_item_batches,
+            commands::create_fixed_asset,
+            commands::list_fixed_assets,
+            commands::record_asset_movement,
+            commands::list_asset_movements,
+            commands::delete_fixed_asset,
             commands::checkout,
             commands::list_draft_sales,
             commands::promote_draft,
@@ -4645,6 +4650,98 @@ mod tests {
             "an expired lot must not sell"
         );
         assert_eq!(commands::batch_on_hand_in(&db, dead_id).await.unwrap(), dec(99));
+    }
+
+    async fn seed_asset(db: &DatabaseConnection, name: &str) -> i32 {
+        commands::create_fixed_asset_in(
+            db,
+            commands::FixedAssetInput {
+                name: name.to_owned(),
+                code: format!("asset-{name}"),
+                description: None,
+                purchase_price: Decimal::ZERO,
+                sale_price: Decimal::ZERO,
+            },
+        )
+        .await
+        .expect("seed asset")
+        .id
+    }
+
+    fn asset_move(
+        asset_id: i32,
+        quantity: Decimal,
+        unit_price: Decimal,
+        kind: commands::AssetMovementKind,
+    ) -> commands::AssetMoveInput {
+        commands::AssetMoveInput {
+            asset_id,
+            quantity,
+            unit_price,
+            kind,
+            reference_no: None,
+            note: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_assets_holdings_and_cost_basis_are_derived_from_its_movements() {
+        let db = db::init_for_tests().await;
+        let fridge = seed_asset(&db, "Fridge").await;
+
+        use commands::AssetMovementKind::{In, Out};
+
+        // Nothing has moved, so the shop owns none — not a stored zero.
+        let empty = commands::list_fixed_assets_in(&db, &page_one()).await.expect("list");
+        assert_eq!(empty.rows[0].on_hand, Decimal::ZERO);
+        assert_eq!(empty.rows[0].cost_basis, Decimal::ZERO);
+
+        commands::record_asset_movement_in(&db, asset_move(fridge, dec(2), dec(1_500), In))
+            .await
+            .expect("bought two");
+        commands::record_asset_movement_in(&db, asset_move(fridge, dec(1), dec(2_000), In))
+            .await
+            .expect("bought another at a different price");
+
+        let after = commands::list_fixed_assets_in(&db, &page_one()).await.expect("list");
+        assert_eq!(after.rows[0].on_hand, dec(3));
+        // Two at 1500 and one at 2000, summed from the movements.
+        assert_eq!(after.rows[0].cost_basis, dec(5_000));
+
+        // Selling one leaves the cost basis alone: a disposal is not a refund of
+        // money that was spent, and a valuation wants both figures.
+        commands::record_asset_movement_in(&db, asset_move(fridge, dec(1), dec(2_500), Out))
+            .await
+            .expect("sold one");
+        let sold = commands::list_fixed_assets_in(&db, &page_one()).await.expect("list");
+        assert_eq!(sold.rows[0].on_hand, dec(2));
+        assert_eq!(sold.rows[0].cost_basis, dec(5_000));
+
+        // The ledger is the only record: three movements, one arrival and one
+        // departure, both signed.
+        let history = commands::list_asset_movements_in(&db, fridge, &page_one())
+            .await
+            .expect("history");
+        assert_eq!(history.total, 3);
+        assert!(history.rows.iter().any(|m| m.quantity < Decimal::ZERO));
+
+        // Assets are counted whole, and cannot leave what the shop does not have.
+        assert!(
+            commands::record_asset_movement_in(
+                &db,
+                asset_move(fridge, Decimal::new(500, 3), dec(100), In)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            commands::record_asset_movement_in(
+                &db,
+                asset_move(fridge, dec(9), dec(100), Out)
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

@@ -22,7 +22,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::db;
 use crate::entities::auth::users;
-use crate::entities::catalog::{brand, item, item_batch, item_category, item_sub_category, unit};
+pub use crate::entities::catalog::fixed_asset_movement::AssetMovementKind;
+
+use crate::entities::catalog::{brand, fixed_asset_item, fixed_asset_movement, item, item_batch, item_category, item_sub_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
 use crate::entities::sales::{booking, combo_item, combo_sale, credit_note, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, loyalty_entry, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, service_rating, servicing, stock_movement, warranty};
@@ -1525,6 +1527,265 @@ pub async fn delete_item_category(id: i32) -> CmdResult<()> {
     model.del_status = Set(DELETED.to_owned());
     model.updated_at = Set(crate::migration::now());
     model.update(db).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fixed assets
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixedAssetInput {
+    pub name: String,
+    pub code: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub purchase_price: Decimal,
+    #[serde(default)]
+    pub sale_price: Decimal,
+}
+
+#[tauri::command]
+pub async fn create_fixed_asset(input: FixedAssetInput) -> CmdResult<fixed_asset_item::Model> {
+    crate::commands_auth::require_permission(db(), "fixed_asset-create").await?;
+    create_fixed_asset_in(db(), input).await
+}
+
+pub(crate) async fn create_fixed_asset_in<C: ConnectionTrait>(
+    conn: &C,
+    input: FixedAssetInput,
+) -> CmdResult<fixed_asset_item::Model> {
+    let name = required(&input.name, "asset name")?;
+    let code = required(&input.code, "asset code")?;
+    // Below cost is legal, negative is not — same rule as catalog items.
+    if input.purchase_price < Decimal::ZERO || input.sale_price < Decimal::ZERO {
+        return Err(CmdError::Validation("asset prices cannot be negative".into()));
+    }
+    let existing = fixed_asset_item::Entity::find()
+        .filter(fixed_asset_item::Column::Code.eq(&code))
+        .one(conn)
+        .await?;
+    if existing.is_some() {
+        return Err(CmdError::Conflict(format!("asset code '{code}' already exists")));
+    }
+    let now = crate::migration::now();
+    Ok(fixed_asset_item::ActiveModel {
+        name: Set(name),
+        code: Set(code),
+        description: Set(input.description),
+        purchase_price: Set(input.purchase_price),
+        sale_price: Set(input.sale_price),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?)
+}
+
+/// An asset with its derived holdings: how many the shop owns and what they cost at
+/// the prices recorded on the movements that produced them.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixedAssetRow {
+    pub asset_id: i32,
+    pub name: String,
+    pub code: String,
+    pub description: Option<String>,
+    pub purchase_price: Decimal,
+    pub sale_price: Decimal,
+    /// `SUM(quantity)` over the movement ledger. Never stored.
+    pub on_hand: Decimal,
+    /// `SUM(quantity * unit_price)` for arrivals — what the shop has put in.
+    pub cost_basis: Decimal,
+}
+
+#[tauri::command]
+pub async fn list_fixed_assets(query: PageQuery) -> CmdResult<Page<FixedAssetRow>> {
+    crate::commands_auth::require_permission(db(), "fixed_asset-list").await?;
+    list_fixed_assets_in(db(), &query).await
+}
+
+pub(crate) async fn list_fixed_assets_in<C: ConnectionTrait>(
+    conn: &C,
+    query: &PageQuery,
+) -> CmdResult<Page<FixedAssetRow>> {
+    let mut q =
+        fixed_asset_item::Entity::find().filter(fixed_asset_item::Column::DelStatus.eq(LIVE));
+    if let Some(term) = query.term() {
+        q = q.filter(fixed_asset_item::Column::Name.contains(like_term(&term)));
+    }
+    let rows = q.order_by_asc(fixed_asset_item::Column::Name).all(conn).await?;
+
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        views.push(FixedAssetRow {
+            asset_id: row.id,
+            name: row.name,
+            code: row.code,
+            description: row.description,
+            purchase_price: row.purchase_price,
+            sale_price: row.sale_price,
+            on_hand: asset_on_hand_in(conn, row.id).await?,
+            cost_basis: asset_cost_basis_in(conn, row.id).await?,
+        });
+    }
+
+    let total = views.len() as u64;
+    let rows = views
+        .into_iter()
+        .skip(query.offset() as usize)
+        .take(query.per_page() as usize)
+        .collect();
+    Ok(Page::new(rows, total, query))
+}
+
+/// How many of an asset the shop owns: `SUM(quantity)` over its movements.
+pub(crate) async fn asset_on_hand_in<C: ConnectionTrait>(
+    conn: &C,
+    asset_id: i32,
+) -> Result<Decimal, DbErr> {
+    let sum = fixed_asset_movement::Entity::find()
+        .select_only()
+        .column_as(fixed_asset_movement::Column::Quantity.sum(), "total")
+        .filter(fixed_asset_movement::Column::AssetItemId.eq(asset_id))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten();
+    Ok(sum.unwrap_or(Decimal::ZERO).round_dp(MONEY_SCALE))
+}
+
+/// What the shop has put into an asset: the arrivals only, at the price each went
+/// at. Disposals do not reduce the cost basis — an asset that was written off is
+/// still money that was spent, and a valuation wants both figures.
+async fn asset_cost_basis_in<C: ConnectionTrait>(
+    conn: &C,
+    asset_id: i32,
+) -> Result<Decimal, DbErr> {
+    let sum = fixed_asset_movement::Entity::find()
+        .select_only()
+        .column_as(fixed_asset_movement::Column::Amount.sum(), "total")
+        .filter(fixed_asset_movement::Column::AssetItemId.eq(asset_id))
+        .filter(fixed_asset_movement::Column::Quantity.gt(Decimal::ZERO))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten();
+    Ok(sum.unwrap_or(Decimal::ZERO).round_dp(MONEY_SCALE))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetMoveInput {
+    pub asset_id: i32,
+    /// Positive count; the movement's direction comes from `kind`, so the caller
+    /// cannot post an arrival and a departure in one field.
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    /// `In` (bought, donated, found) or `Out` (sold, scrapped, written off).
+    pub kind: AssetMovementKind,
+    pub reference_no: Option<String>,
+    pub note: Option<String>,
+}
+
+#[tauri::command]
+pub async fn record_asset_movement(input: AssetMoveInput) -> CmdResult<fixed_asset_movement::Model> {
+    crate::commands_auth::require_permission(db(), "fixed_asset-create").await?;
+    record_asset_movement_in(db(), input).await
+}
+
+pub(crate) async fn record_asset_movement_in<C: ConnectionTrait>(
+    conn: &C,
+    input: AssetMoveInput,
+) -> CmdResult<fixed_asset_movement::Model> {
+    let Some(asset) = fixed_asset_item::Entity::find_by_id(input.asset_id)
+        .filter(fixed_asset_item::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+    else {
+        return Err(CmdError::NotFound("fixed asset".into()));
+    };
+    // Assets are counted in whole units — a shop does not own two-thirds of a
+    // forklift — so a fraction here is a data-entry slip, not a quantity.
+    if input.quantity <= Decimal::ZERO {
+        return Err(CmdError::Validation("quantity must be greater than zero".into()));
+    }
+    if input.quantity != input.quantity.round_dp(0) {
+        return Err(CmdError::Validation("asset quantity must be a whole number".into()));
+    }
+    if input.unit_price < Decimal::ZERO {
+        return Err(CmdError::Validation("unit price cannot be negative".into()));
+    }
+    if input.kind == AssetMovementKind::Out {
+        let on_hand = asset_on_hand_in(conn, asset.id).await?;
+        if input.quantity > on_hand {
+            return Err(CmdError::Validation(format!(
+                "asset '{}' has {on_hand} on hand but {} was requested out",
+                asset.name, input.quantity
+            )));
+        }
+    }
+
+    let signed = input.quantity * input.kind.sign();
+    Ok(fixed_asset_movement::ActiveModel {
+        asset_item_id: Set(asset.id),
+        movement_kind: Set(input.kind.as_str().to_owned()),
+        quantity: Set(signed),
+        unit_price: Set(input.unit_price),
+        amount: Set((input.quantity * input.unit_price).round_dp(MONEY_SCALE)),
+        reference_no: Set(input.reference_no),
+        note: Set(input.note),
+        created_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?)
+}
+
+#[tauri::command]
+pub async fn list_asset_movements(
+    asset_id: i32,
+    query: PageQuery,
+) -> CmdResult<Page<fixed_asset_movement::Model>> {
+    crate::commands_auth::require_permission(db(), "fixed_asset-list").await?;
+    list_asset_movements_in(db(), asset_id, &query).await
+}
+
+pub(crate) async fn list_asset_movements_in<C: ConnectionTrait>(
+    conn: &C,
+    asset_id: i32,
+    query: &PageQuery,
+) -> CmdResult<Page<fixed_asset_movement::Model>> {
+    let q = fixed_asset_movement::Entity::find()
+        .filter(fixed_asset_movement::Column::AssetItemId.eq(asset_id));
+    let total = q.clone().count(conn).await?;
+    let rows = q
+        .order_by_desc(fixed_asset_movement::Column::CreatedAt)
+        .order_by_desc(fixed_asset_movement::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+    Ok(Page::new(rows, total, query))
+}
+
+#[tauri::command]
+pub async fn delete_fixed_asset(id: i32) -> CmdResult<()> {
+    crate::commands_auth::require_permission(db(), "fixed_asset-destroy").await?;
+    delete_fixed_asset_in(db(), id).await
+}
+
+pub(crate) async fn delete_fixed_asset_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResult<()> {
+    let Some(found) = fixed_asset_item::Entity::find_by_id(id).one(conn).await? else {
+        return Err(CmdError::NotFound("fixed asset".into()));
+    };
+    let mut model: fixed_asset_item::ActiveModel = found.into();
+    model.del_status = Set(DELETED.to_owned());
+    model.updated_at = Set(crate::migration::now());
+    model.update(conn).await?;
     Ok(())
 }
 
