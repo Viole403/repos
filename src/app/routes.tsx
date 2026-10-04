@@ -23,6 +23,8 @@ import { Quotations } from "./screens/Quotations";
 import { Bookings } from "./screens/Bookings";
 import { Promotions } from "./screens/Promotions";
 import { Installments } from "./screens/Installments";
+import { Warranties } from "./screens/Warranties";
+import { Servicings } from "./screens/Servicings";
 import { Combos } from "./screens/Combos";
 import { Units } from "./screens/Units";
 import { enabledRoutes, navItems } from "./nav-config";
@@ -40,6 +42,8 @@ const screens: Record<string, ReactNode> = {
     "/sales/bookings": <Bookings />,
     "/sales/promotions": <Promotions />,
     "/sales/installments": <Installments />,
+    "/sales/warranties": <Warranties />,
+    "/sales/servicings": <Servicings />,
     "/catalog/combos": <Combos />,
     "/catalog/items": <ItemsList />,
     "/catalog/units": <Units />,

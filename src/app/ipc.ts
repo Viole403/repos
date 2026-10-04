@@ -829,6 +829,120 @@ export const listInstallments = (customerId: number | null = null, query: PageQu
     call<Page<InstallmentSummary>>("list_installments", { customerId, query });
 export const getInstallmentSale = (id: number) => call<InstallmentSaleView>("get_installment_sale", { id });
 
+/** A repair ticket moving through the customer → vendor → customer pipeline. */
+export interface WarrantyInput {
+    customerId: number;
+    productName: string;
+    productSerialNo?: string | null;
+    description?: string | null;
+    /** `YYYY-MM-DD`. */
+    receivingDate: string;
+    /** `YYYY-MM-DD`, at or after receiving. */
+    deliveryDate?: string | null;
+    technicianId?: number | null;
+    presentLocation?: string | null;
+    senderServiceCenter?: string | null;
+    receiverServiceCenter?: string | null;
+}
+
+export interface WarrantySummary {
+    id: number;
+    customerName: string | null;
+    productName: string;
+    productSerialNo: string | null;
+    receivingDate: string;
+    deliveryDate: string | null;
+    /** `R_F_C` | `S_T_V` | `R_T_V` | `D_T_C`. */
+    currentStatus: string;
+    createdAt: string;
+}
+
+export interface WarrantyView {
+    warranty: {
+        id: number;
+        customerId: number;
+        productName: string;
+        productSerialNo: string | null;
+        description: string | null;
+        receivingDate: string;
+        deliveryDate: string | null;
+        currentStatus: string;
+        technicianId: number | null;
+        presentLocation: string | null;
+        senderServiceCenter: string | null;
+        receiverServiceCenter: string | null;
+        createdAt: string;
+    };
+    customerName: string | null;
+}
+
+export const WARRANTY_STATUSES = [
+    { id: "R_F_C", label: "Received from customer" },
+    { id: "S_T_V", label: "Sent to vendor" },
+    { id: "R_T_V", label: "Received from vendor" },
+    { id: "D_T_C", label: "Delivered to customer" },
+] as const;
+
+export const createWarranty = (input: WarrantyInput) => call<WarrantyView>("create_warranty", { input });
+export const setWarrantyStatus = (id: number, status: string) =>
+    call<WarrantyView>("set_warranty_status", { id, status });
+export const listWarranties = (customerId: number | null = null, query: PageQuery = {}) =>
+    call<Page<WarrantySummary>>("list_warranties", { customerId, query });
+export const getWarranty = (id: number) => call<WarrantyView>("get_warranty", { id });
+
+/** A paid repair job. The due is derived (`charge - paid`), never stored. */
+export interface ServicingInput {
+    customerId: number;
+    productName: string;
+    productModel?: string | null;
+    problemDescription?: string | null;
+    /** `YYYY-MM-DD`. */
+    receivingDate: string;
+    /** `YYYY-MM-DD`, at or after receiving. */
+    deliveryDate?: string | null;
+    servicingCharge: Decimal;
+    technicianId?: number | null;
+}
+
+export interface ServicingSummary {
+    id: number;
+    customerName: string | null;
+    productName: string;
+    servicingCharge: Decimal;
+    paidAmount: Decimal;
+    dueAmount: Decimal;
+    /** `Received` | `InRepair` | `Ready` | `Delivered`. */
+    currentStatus: string;
+    createdAt: string;
+}
+
+export interface ServicingView {
+    servicing: {
+        id: number;
+        customerId: number;
+        productName: string;
+        productModel: string | null;
+        problemDescription: string | null;
+        receivingDate: string;
+        deliveryDate: string | null;
+        servicingCharge: Decimal;
+        paidAmount: Decimal;
+        currentStatus: string;
+        technicianId: number | null;
+        createdAt: string;
+    };
+    customerName: string | null;
+    dueAmount: Decimal;
+}
+
+export const createServicing = (input: ServicingInput) =>
+    call<ServicingView>("create_servicing", { input });
+export const collectServicingPayment = (id: number, amount: Decimal) =>
+    call<ServicingView>("collect_servicing_payment", { id, amount });
+export const listServicings = (customerId: number | null = null, query: PageQuery = {}) =>
+    call<Page<ServicingSummary>>("list_servicings", { customerId, query });
+export const getServicing = (id: number) => call<ServicingView>("get_servicing", { id });
+
 export const discardDraft = (saleId: number) => call<void>("discard_draft", { saleId });
 
 export interface MethodTotal {
