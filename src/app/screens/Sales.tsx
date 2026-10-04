@@ -18,6 +18,14 @@ const STATUSES: SelectItemType[] = [
     { id: "Draft", label: "Draft" },
 ];
 
+const ORDER_TYPES: SelectItemType[] = [
+    { id: "", label: "Any type" },
+    { id: "InStore", label: "In-store" },
+    { id: "Pickup", label: "Pickup" },
+    { id: "Delivery", label: "Delivery" },
+    { id: "Online", label: "Online" },
+];
+
 const today = () => new Date().toISOString().slice(0, 10);
 
 export const Sales = () => {
@@ -26,6 +34,7 @@ export const Sales = () => {
     const [total, setTotal] = useState(0);
     const [page, setPage] = useState(1);
     const [status, setStatus] = useState("");
+    const [orderType, setOrderType] = useState("");
     const [from, setFrom] = useState(today());
     const [to, setTo] = useState(today());
     const [error, setError] = useState<string | null>(null);
@@ -35,7 +44,7 @@ export const Sales = () => {
     const refresh = useCallback(async () => {
         try {
             const found = await listSales(
-                { status: status || null, from: from || null, to: to || null },
+                { status: status || null, orderType: orderType || null, from: from || null, to: to || null },
                 { page, perPage },
             );
             setRows(found.rows);
@@ -44,7 +53,7 @@ export const Sales = () => {
         } catch (cause) {
             setError(messageOf(cause));
         }
-    }, [page, status, from, to]);
+    }, [page, status, orderType, from, to]);
 
     useEffect(() => {
         void refresh();
@@ -67,6 +76,22 @@ export const Sales = () => {
                     onSelectionChange={(key) => {
                         setPage(1);
                         setStatus(String(key ?? ""));
+                    }}
+                    className="w-full md:w-44"
+                >
+                    {(row) => (
+                        <Select.Item id={row.id} textValue={row.label}>
+                            {row.label}
+                        </Select.Item>
+                    )}
+                </Select>
+                <Select
+                    label="Type"
+                    items={ORDER_TYPES}
+                    selectedKey={orderType}
+                    onSelectionChange={(key) => {
+                        setPage(1);
+                        setOrderType(String(key ?? ""));
                     }}
                     className="w-full md:w-44"
                 >
@@ -123,6 +148,7 @@ export const Sales = () => {
                             <Table.Head label="Invoice" />
                             <Table.Head label="When" />
                             <Table.Head label="Customer" />
+                            <Table.Head label="Type" />
                             <Table.Head label="Method" />
                             <Table.Head label="Total" />
                             <Table.Head label="Status" />
@@ -136,6 +162,7 @@ export const Sales = () => {
                                     </Table.Cell>
                                     <Table.Cell className="text-tertiary">{formatTimestamp(row.createdAt)}</Table.Cell>
                                     <Table.Cell>{row.customerName ?? "Walk-in"}</Table.Cell>
+                                    <Table.Cell className="text-tertiary">{row.orderType}</Table.Cell>
                                     <Table.Cell>{row.paymentMethod}</Table.Cell>
                                     <Table.Cell className="tabular-nums">{formatMoney(row.grandTotal)}</Table.Cell>
                                     <Table.Cell className="text-tertiary">{row.status}</Table.Cell>

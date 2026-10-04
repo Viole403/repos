@@ -52,8 +52,8 @@ export const SaleDetail = () => {
                             </Button>
                         </div>
                         <p className="text-md text-tertiary">
-                            {formatTimestamp(view.sale.createdAt)} · {view.sale.paymentMethod} ·{" "}
-                            {view.sale.status}
+                            {formatTimestamp(view.sale.createdAt)} · {view.sale.orderType} ·{" "}
+                            {view.sale.paymentMethod} · {view.sale.status}
                         </p>
                         {view.sale.note && <p className="text-md text-secondary">{view.sale.note}</p>}
                     </div>

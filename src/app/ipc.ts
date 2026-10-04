@@ -169,6 +169,7 @@ export interface Sale {
     paidTotal: Decimal;
     paymentMethod: string;
     customerId: number | null;
+    orderType: string;
     note: string | null;
     createdAt: Timestamp;
     updatedAt: Timestamp;
@@ -227,6 +228,8 @@ export interface CheckoutInput {
     promote?: boolean | null;
     /** Who the sale is to. Omit for a walk-in, which is the common case. */
     customerId?: number | null;
+    /** How the sale leaves the shop. Omit for a counter sale. */
+    orderType?: string | null;
     /** One entry per tender. When present these replace `paidTotal` and `paymentMethod`. */
     payments?: PaymentLine[] | null;
 }
@@ -373,6 +376,7 @@ export interface SaleSummary {
     customerId: number | null;
     /** Null for a walk-in sale, which is not a missing value — it is the common case. */
     customerName: string | null;
+    orderType: string;
     note: string | null;
     createdAt: string;
 }
@@ -380,6 +384,8 @@ export interface SaleSummary {
 export interface SaleFilter {
     status?: string | null;
     customerId?: number | null;
+    /** One of the closed order types. An unknown value matches nothing. */
+    orderType?: string | null;
     /** `YYYY-MM-DD`, inclusive. An unparseable value narrows nothing. */
     from?: string | null;
     to?: string | null;

@@ -27,6 +27,13 @@ const PAYMENT_METHODS: SelectItemType[] = [
     { id: "Qris", label: "QRIS" },
 ];
 
+const ORDER_TYPES: SelectItemType[] = [
+    { id: "InStore", label: "In-store" },
+    { id: "Pickup", label: "Pickup" },
+    { id: "Delivery", label: "Delivery" },
+    { id: "Online", label: "Online" },
+];
+
 /**
  * A code search can match on name, alternative name or generic name too, so the
  * result set can be long and the exact code can be pushed out of the first page.
@@ -80,6 +87,9 @@ const RegisterScreen = () => {
     const [lookup, setLookup] = useState<Lookup>({ kind: "idle" });
     const [sale, setSale] = useState<SaleState>({ kind: "idle" });
     const [paymentMethod, setPaymentMethod] = useState("Cash");
+    // Counter sale until the cashier says otherwise — and back to it after every
+    // sale, so a delivery does not silently re-tag the next walk-in.
+    const [orderType, setOrderType] = useState("InStore");
     // Split is opt-in. The single-tender path is one field and one keypress, and
     // should not become two rows to fill in for the common case.
     const [split, setSplit] = useState(false);
@@ -260,6 +270,7 @@ const RegisterScreen = () => {
             // Always promote. A draft that moves no stock is a separate flow.
             promote: true,
             customerId: customerKey === "" ? null : Number(customerKey),
+            orderType,
         };
 
         setSale({ kind: "saving" });
@@ -268,6 +279,7 @@ const RegisterScreen = () => {
             setSale({ kind: "done", view });
             setPaid("");
             setNote("");
+            setOrderType("InStore");
             // The backend returns the balances it committed, so take those over
             // what was cached, then forget them so the next scan refetches.
             for (const entry of view.stockOnHand) requested.current.delete(entry.itemId);
@@ -283,7 +295,7 @@ const RegisterScreen = () => {
             setSale({ kind: "failed", message: messageOf(error) });
             focusCode();
         }
-    }, [canCheckout, paidInvalid, paidDigits, sale.kind, lines, taxTotal, paymentMethod, customerKey, split, tenderSum, grandTotal, note, clearCart, focusCode]);
+    }, [canCheckout, paidInvalid, paidDigits, sale.kind, lines, taxTotal, paymentMethod, orderType, customerKey, split, tenderSum, grandTotal, note, clearCart, focusCode]);
 
     /**
      * Parks the cart as a draft: same lines, customer and note, but `promote: false`
@@ -309,6 +321,7 @@ const RegisterScreen = () => {
             promote: false,
             payments: null,
             customerId: customerKey === "" ? null : Number(customerKey),
+            orderType,
         };
 
         setSale({ kind: "saving" });
@@ -317,6 +330,7 @@ const RegisterScreen = () => {
             setSale({ kind: "held", invoiceNo: view.sale.invoiceNo });
             setPaid("");
             setNote("");
+            setOrderType("InStore");
             setCustomerKey("");
             clearCart();
             setSelectedItemId(null);
@@ -325,7 +339,7 @@ const RegisterScreen = () => {
             setSale({ kind: "failed", message: messageOf(error) });
             focusCode();
         }
-    }, [lines, sale.kind, taxTotal, paymentMethod, note, customerKey, clearCart, focusCode]);
+    }, [lines, sale.kind, taxTotal, paymentMethod, orderType, note, customerKey, clearCart, focusCode]);
 
     useEffect(() => {
         const onKeyDown = (event: KeyboardEvent) => {
@@ -642,6 +656,18 @@ const RegisterScreen = () => {
                         </div>
                     ) : (
                         <>
+                            <Select
+                                label="Order type"
+                                items={ORDER_TYPES}
+                                selectedKey={orderType}
+                                onSelectionChange={(key) => setOrderType(String(key ?? "InStore"))}
+                            >
+                                {(row) => (
+                                    <Select.Item id={row.id} textValue={row.label}>
+                                        {row.label}
+                                    </Select.Item>
+                                )}
+                            </Select>
                             <Select
                                 label="Payment method"
                                 items={PAYMENT_METHODS}
