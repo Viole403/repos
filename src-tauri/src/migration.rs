@@ -33,6 +33,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::CustomersAndSuppliers),
             Box::new(Migrations::TradeCredit),
             Box::new(Migrations::SalePayments),
+            Box::new(Migrations::SaleReturns),
         ]
     }
 }
@@ -47,6 +48,7 @@ pub enum Migrations {
     CustomersAndSuppliers,
     TradeCredit,
     SalePayments,
+    SaleReturns,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -91,6 +93,7 @@ impl MigrationName for Migrations {
             Migrations::CustomersAndSuppliers => "customers_and_suppliers",
             Migrations::TradeCredit => "trade_credit",
             Migrations::SalePayments => "sale_payments",
+            Migrations::SaleReturns => "sale_returns",
         }
     }
 }
@@ -107,6 +110,7 @@ impl MigrationTrait for Migrations {
             Migrations::CustomersAndSuppliers => customers_and_suppliers(manager).await?,
             Migrations::TradeCredit => trade_credit(manager).await?,
             Migrations::SalePayments => sale_payments(manager).await?,
+            Migrations::SaleReturns => sale_returns(manager).await?,
         }
         Ok(())
     }
@@ -114,6 +118,14 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::SaleReturns => {
+                for t in [
+                    SaleReturnDetails::Table.into_iden(),
+                    SaleReturns::Table.into_iden(),
+                ] {
+                    manager.drop_table(Table::drop().table(t).if_exists().to_owned()).await?;
+                }
+            }
             Migrations::SalePayments => {
                 manager
                     .drop_table(Table::drop().table(SalePayments::Table).if_exists().to_owned())
@@ -659,6 +671,82 @@ async fn customers_and_suppliers(manager: &SchemaManager<'_>) -> Result<(), DbEr
     Ok(())
 }
 
+/// Goods handed back against a sale.
+///
+/// A return is its own document rather than an edit of the sale: the sale is financial
+/// history and stays as it was, and the return is what reverses it. Nothing here
+/// subtracts from `sales` — the money comes off the customer through a receipt.
+async fn sale_returns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(SaleReturns::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(SaleReturns::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(SaleReturns::SaleId).integer().not_null())
+                // Derived from this row's own primary key, for the same reason
+                // `sales.invoice_no` is: `MAX() + 1` collides under concurrency.
+                .col(ColumnDef::new(SaleReturns::ReturnNo).string().not_null().unique_key())
+                .col(ColumnDef::new(SaleReturns::Reason).string().not_null())
+                .col(ColumnDef::new(SaleReturns::RefundedTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(SaleReturns::ReturnedBy).integer().null())
+                .col(ColumnDef::new(SaleReturns::Note).string().null())
+                .col(ColumnDef::new(SaleReturns::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_sale_returns_sale")
+                        .from(SaleReturns::Table, SaleReturns::SaleId)
+                        .to(Sales::Table, Sales::Id)
+                        // Restrict: a sale is financial history and is never deleted, so
+                        // this can only fire if that rule is broken.
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_sale_returns_sale_id")
+                .table(SaleReturns::Table)
+                .col(SaleReturns::SaleId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(SaleReturnDetails::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(SaleReturnDetails::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(SaleReturnDetails::SaleReturnId).integer().not_null())
+                // The line being returned, so "already returned" is a sum over these
+                // rather than a number someone has to keep in step.
+                .col(ColumnDef::new(SaleReturnDetails::SaleDetailId).integer().not_null())
+                .col(ColumnDef::new(SaleReturnDetails::ItemId).integer().not_null())
+                .col(ColumnDef::new(SaleReturnDetails::ItemName).string().not_null())
+                .col(ColumnDef::new(SaleReturnDetails::Quantity).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(SaleReturnDetails::UnitPrice).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(SaleReturnDetails::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_sale_return_details_return")
+                        .from(SaleReturnDetails::Table, SaleReturnDetails::SaleReturnId)
+                        .to(SaleReturns::Table, SaleReturns::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
+}
+
 /// How one sale was paid, once per tender.
 ///
 /// A sale paid half card and half cash writes two rows. `sales.paid_total` stays as the
@@ -839,6 +927,32 @@ async fn permission_catalog(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     }
 
     Ok(())
+}
+
+#[derive(Iden)]
+enum SaleReturns {
+    Table,
+    Id,
+    SaleId,
+    ReturnNo,
+    Reason,
+    RefundedTotal,
+    ReturnedBy,
+    Note,
+    CreatedAt,
+}
+
+#[derive(Iden)]
+enum SaleReturnDetails {
+    Table,
+    Id,
+    SaleReturnId,
+    SaleDetailId,
+    ItemId,
+    ItemName,
+    Quantity,
+    UnitPrice,
+    Amount,
 }
 
 #[derive(Iden)]
