@@ -1,12 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/base/buttons/button";
 import { Input } from "@/components/base/input/input";
 import { Select } from "@/components/base/select/select";
 import type { SelectItemType } from "@/components/base/select/select-shared";
 import { Dialog, Modal, ModalOverlay } from "@/components/application/modals/modal";
 import { toDecimal } from "@/app/format";
-import type { ItemInput, ItemView } from "@/app/ipc";
-import { createItem, listBrands, listItemCategories, listUnits, updateItem } from "@/app/ipc";
+import type { ItemInput, ItemSubCategory, ItemView } from "@/app/ipc";
+import { createItem, listBrands, listItemCategories, listItemSubCategories, listUnits, SYMBOLOGIES, updateItem } from "@/app/ipc";
 
 /** Decimal fields stay as text so the exact digits the user typed reach Rust. */
 interface FormState {
@@ -16,6 +16,7 @@ interface FormState {
     genericName: string;
     description: string;
     categoryId: string;
+    subCategoryId: string;
     brandId: string;
     purchaseUnitId: string;
     saleUnitId: string;
@@ -25,6 +26,9 @@ interface FormState {
     wholeSalePrice: string;
     alertQuantity: string;
     loyaltyPoint: string;
+    photo: string;
+    symbology: string;
+    weighed: string;
 }
 
 const empty: FormState = {
@@ -34,6 +38,7 @@ const empty: FormState = {
     genericName: "",
     description: "",
     categoryId: "",
+    subCategoryId: "",
     brandId: "",
     purchaseUnitId: "",
     saleUnitId: "",
@@ -43,6 +48,9 @@ const empty: FormState = {
     wholeSalePrice: "",
     alertQuantity: "",
     loyaltyPoint: "0",
+    photo: "",
+    symbology: "",
+    weighed: "no",
 };
 
 const fromItem = (item: ItemView): FormState => ({
@@ -52,6 +60,7 @@ const fromItem = (item: ItemView): FormState => ({
     genericName: item.genericName ?? "",
     description: item.description ?? "",
     categoryId: item.categoryId === null ? "" : String(item.categoryId),
+    subCategoryId: item.subCategoryId === null ? "" : String(item.subCategoryId),
     brandId: item.brandId === null ? "" : String(item.brandId),
     purchaseUnitId: item.purchaseUnitId === null ? "" : String(item.purchaseUnitId),
     saleUnitId: item.saleUnitId === null ? "" : String(item.saleUnitId),
@@ -61,6 +70,9 @@ const fromItem = (item: ItemView): FormState => ({
     wholeSalePrice: item.wholeSalePrice ?? "",
     alertQuantity: item.alertQuantity ?? "",
     loyaltyPoint: item.loyaltyPoint,
+    photo: item.photo ?? "",
+    symbology: item.symbology ?? "",
+    weighed: item.weighed ? "yes" : "no",
 });
 
 type Errors = Partial<Record<keyof FormState, string>>;
@@ -113,6 +125,7 @@ export const ItemForm = ({ item, onClose, onSaved }: ItemFormProps) => {
     const [saving, setSaving] = useState(false);
 
     const [categories, setCategories] = useState<SelectItemType[]>([]);
+    const [subCategories, setSubCategories] = useState<ItemSubCategory[]>([]);
     const [brands, setBrands] = useState<SelectItemType[]>([]);
     const [units, setUnits] = useState<SelectItemType[]>([]);
 
@@ -126,11 +139,13 @@ export const ItemForm = ({ item, onClose, onSaved }: ItemFormProps) => {
         // offer nothing and the field stays unset.
         Promise.all([
             listItemCategories({ perPage: 500 }),
+            listItemSubCategories(null, { perPage: 500 }),
             listBrands({ perPage: 500 }),
             listUnits({ perPage: 500 }),
         ])
-            .then(([c, b, u]) => {
+            .then(([c, s, b, u]) => {
                 setCategories(c.rows.map((row) => ({ id: row.id, label: row.name })));
+                setSubCategories(s.rows);
                 setBrands(b.rows.map((row) => ({ id: row.id, label: row.name })));
                 setUnits(u.rows.map((row) => ({ id: row.id, label: row.unitName })));
             })
@@ -138,6 +153,18 @@ export const ItemForm = ({ item, onClose, onSaved }: ItemFormProps) => {
                 setSubmitError("Could not load categories, brands and units.");
             });
     }, []);
+
+    // A sub-category belongs to one category, so the picker narrows to the chosen
+    // parent's children and clears itself when the parent changes.
+    const subCategoryOptions = useMemo(() => {
+        const options = subCategories.map((row) => ({ id: row.id, label: row.name }));
+        if (form.categoryId === "") return options;
+        const parent = Number(form.categoryId);
+        return options.filter((option) => {
+            const match = subCategories.find((row) => row.id === option.id);
+            return match === undefined || match.categoryId === parent;
+        });
+    }, [form.categoryId, subCategories]);
 
     const submit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -152,6 +179,7 @@ export const ItemForm = ({ item, onClose, onSaved }: ItemFormProps) => {
             genericName: optionalText(form.genericName),
             description: optionalText(form.description),
             categoryId: optionalId(form.categoryId),
+            subCategoryId: optionalId(form.subCategoryId),
             brandId: optionalId(form.brandId),
             purchaseUnitId: optionalId(form.purchaseUnitId),
             saleUnitId: optionalId(form.saleUnitId),
@@ -161,6 +189,9 @@ export const ItemForm = ({ item, onClose, onSaved }: ItemFormProps) => {
             wholeSalePrice: optionalDecimal(form.wholeSalePrice),
             alertQuantity: optionalDecimal(form.alertQuantity),
             loyaltyPoint: toDecimal(form.loyaltyPoint),
+            photo: optionalText(form.photo),
+            symbology: optionalText(form.symbology),
+            weighed: form.weighed === "yes",
         };
 
         setSaving(true);
@@ -179,6 +210,11 @@ export const ItemForm = ({ item, onClose, onSaved }: ItemFormProps) => {
     const optional = [{ id: "", label: "None" }, ...categories];
     const optionalBrands = [{ id: "", label: "None" }, ...brands];
     const optionalUnits = [{ id: "", label: "None" }, ...units];
+    const symbologyOptions = [{ id: "", label: "Internal code" }, ...SYMBOLOGIES.map((s) => ({ id: s, label: s }))];
+    const yesNoOptions = [
+        { id: "no", label: "No" },
+        { id: "yes", label: "Yes" },
+    ];
 
     return (
         <ModalOverlay isOpen onOpenChange={(open) => !open && onClose()}>
@@ -198,6 +234,15 @@ export const ItemForm = ({ item, onClose, onSaved }: ItemFormProps) => {
                             <Input label="Alternative name" value={form.alternativeName} onChange={set("alternativeName")} />
                             <Input label="Generic name" value={form.genericName} onChange={set("genericName")} />
                             <Select label="Category" items={optional} selectedKey={form.categoryId} onSelectionChange={(k) => set("categoryId")(String(k ?? ""))}>
+                                {(row) => <Select.Item id={row.id} textValue={row.label}>{row.label}</Select.Item>}
+                            </Select>
+                            <Select
+                                label="Sub-category"
+                                items={subCategoryOptions}
+                                selectedKey={form.subCategoryId}
+                                onSelectionChange={(k) => set("subCategoryId")(String(k ?? ""))}
+                                hint="Belongs to the chosen category"
+                            >
                                 {(row) => <Select.Item id={row.id} textValue={row.label}>{row.label}</Select.Item>}
                             </Select>
                             <Select label="Brand" items={optionalBrands} selectedKey={form.brandId} onSelectionChange={(k) => set("brandId")(String(k ?? ""))}>
@@ -232,6 +277,30 @@ export const ItemForm = ({ item, onClose, onSaved }: ItemFormProps) => {
                             />
                             <Input label="Alert quantity" value={form.alertQuantity} onChange={set("alertQuantity")} />
                             <Input label="Loyalty point" value={form.loyaltyPoint} onChange={set("loyaltyPoint")} />
+                            <Select
+                                label="Barcode symbology"
+                                items={symbologyOptions}
+                                selectedKey={form.symbology}
+                                onSelectionChange={(k) => set("symbology")(String(k ?? ""))}
+                                hint="Blank means an internal code"
+                            >
+                                {(row) => <Select.Item id={row.id} textValue={row.label}>{row.label}</Select.Item>}
+                            </Select>
+                            <Select
+                                label="Sold by weight"
+                                items={yesNoOptions}
+                                selectedKey={form.weighed}
+                                onSelectionChange={(k) => set("weighed")(String(k ?? ""))}
+                                hint="Price per kg — quantity comes from a scale"
+                            >
+                                {(row) => <Select.Item id={row.id} textValue={row.label}>{row.label}</Select.Item>}
+                            </Select>
+                            <Input
+                                label="Photo"
+                                value={form.photo}
+                                onChange={set("photo")}
+                                hint="Data URI image, under 1 MB"
+                            />
                         </div>
 
                         <Input label="Description" value={form.description} onChange={set("description")} />
