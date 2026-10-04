@@ -39,9 +39,18 @@ export const SaleDetail = () => {
             {view && (
                 <>
                     <div className="flex flex-col gap-1">
-                        <h1 className="text-display-xs font-semibold tabular-nums text-primary">
-                            {view.sale.invoiceNo}
-                        </h1>
+                        <div className="flex items-center gap-3">
+                            <h1 className="text-display-xs font-semibold tabular-nums text-primary">
+                                {view.sale.invoiceNo}
+                            </h1>
+                            <Button
+                                color="secondary"
+                                size="sm"
+                                onPress={() => navigate(`/sales/${view.sale.id}/returns`)}
+                            >
+                                Return items
+                            </Button>
+                        </div>
                         <p className="text-md text-tertiary">
                             {formatTimestamp(view.sale.createdAt)} · {view.sale.paymentMethod} ·{" "}
                             {view.sale.status}

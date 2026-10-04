@@ -13,6 +13,7 @@ import { Accounts } from "./screens/Accounts";
 import { Roles } from "./screens/Roles";
 import { Sales } from "./screens/Sales";
 import { SaleDetail } from "./screens/SaleDetail";
+import { Returns } from "./screens/Returns";
 import { Customers } from "./screens/Customers";
 import { Suppliers } from "./screens/Suppliers";
 import { Register } from "./screens/Register";
@@ -34,6 +35,7 @@ const screens: Record<string, ReactNode> = {
     "/catalog/categories": <ItemCategories />,
     "/sales": <Sales />,
     "/sales/:id": <SaleDetail />,
+    "/sales/:id/returns": <Returns />,
     "/customers": <Customers />,
     "/purchase/suppliers": <Suppliers />,
     "/settings/accounts": <Accounts />,
@@ -62,7 +64,7 @@ const children: RouteObject[] = navItems.flatMap((item) => {
  * from the sidebar. Still listed through `screens`, so the "enabled entry has no
  * screen" check below covers them too.
  */
-const detailRoutes: string[] = ["/sales/:id"];
+const detailRoutes: string[] = ["/sales/:id", "/sales/:id/returns"];
 
 const withoutNavEntry: RouteObject[] = detailRoutes.map((path) => {
     const screen = screens[path];
