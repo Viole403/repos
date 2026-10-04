@@ -28,6 +28,9 @@ pub struct Model {
     pub sale_id: Option<i32>,
     /// Same, for a credit sale written as installments.
     pub installment_sale_id: Option<i32>,
+    /// Which lot this row moved, when the item is tracked by batch. Null for the
+    /// overwhelming majority of goods, which have no expiry at all.
+    pub batch_id: Option<i32>,
     /// [`MovementType`] serialized as its string form, so the ledger stays
     /// readable in raw SQL.
     pub movement_type: String,
