@@ -36,6 +36,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::SaleReturns),
             Box::new(Migrations::Registers),
             Box::new(Migrations::Quotations),
+            Box::new(Migrations::Bookings),
         ]
     }
 }
@@ -53,6 +54,7 @@ pub enum Migrations {
     SaleReturns,
     Registers,
     Quotations,
+    Bookings,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -100,6 +102,7 @@ impl MigrationName for Migrations {
             Migrations::SaleReturns => "sale_returns",
         Migrations::Registers => "registers",
         Migrations::Quotations => "quotations",
+        Migrations::Bookings => "bookings",
         }
     }
 }
@@ -119,6 +122,7 @@ impl MigrationTrait for Migrations {
             Migrations::SaleReturns => sale_returns(manager).await?,
             Migrations::Registers => registers(manager).await?,
             Migrations::Quotations => quotations(manager).await?,
+            Migrations::Bookings => bookings(manager).await?,
         }
         Ok(())
     }
@@ -126,6 +130,16 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::Bookings => {
+                manager.drop_table(Table::drop().table(Bookings::Table).if_exists().to_owned()).await?;
+                let conn = manager.get_connection();
+                for name in BOOKING_PERMISSIONS {
+                    permissions::Entity::delete_many()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .exec(conn)
+                        .await?;
+                }
+            }
             Migrations::Quotations => {
                 for t in [
                     QuotationDetails::Table.into_iden(),
@@ -860,6 +874,82 @@ async fn sale_returns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// A customer appointment: who, with which staff member, when. No outlet column —
+/// outlets arrive in Stage 9 and columns pointing at missing tables fork the schema.
+async fn bookings(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(Bookings::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Bookings::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(Bookings::CustomerId).integer().not_null())
+                .col(ColumnDef::new(Bookings::ServiceSellerId).integer().null())
+                .col(ColumnDef::new(Bookings::CreatedBy).integer().null())
+                .col(ColumnDef::new(Bookings::Status).string().not_null().default("Booked"))
+                .col(ColumnDef::new(Bookings::StartAt).custom(TIMESTAMP).not_null())
+                .col(ColumnDef::new(Bookings::EndAt).custom(TIMESTAMP).not_null())
+                .col(ColumnDef::new(Bookings::Note).string().null())
+                .col(ColumnDef::new(Bookings::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(Bookings::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Bookings::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_bookings_customer")
+                        .from(Bookings::Table, Bookings::CustomerId)
+                        .to(Customers::Table, Customers::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_bookings_service_seller")
+                        .from(Bookings::Table, Bookings::ServiceSellerId)
+                        .to(Users::Table, Users::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_bookings_start_at")
+                .table(Bookings::Table)
+                .col(Bookings::StartAt)
+                .to_owned(),
+        )
+        .await?;
+
+    let conn = manager.get_connection();
+    let now = now();
+    for name in BOOKING_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set("booking".to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// A price offer to a customer. Moves no stock and takes no payment — that is
 /// what separates it from a draft, which is a sale waiting to happen. Totals are
 /// derived from the lines by the commands, never trusted from the client.
@@ -1139,6 +1229,31 @@ async fn permission_catalog(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
     Ok(())
 }
+
+#[derive(Iden)]
+enum Bookings {
+    Table,
+    Id,
+    CustomerId,
+    ServiceSellerId,
+    CreatedBy,
+    Status,
+    StartAt,
+    EndAt,
+    Note,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+/// Permissions this migration owns, for the down arm above.
+const BOOKING_PERMISSIONS: &[&str] = &[
+    "booking-list",
+    "booking-create",
+    "booking-edit",
+    "booking-show",
+    "booking-destroy",
+];
 
 #[derive(Iden)]
 enum Quotations {
