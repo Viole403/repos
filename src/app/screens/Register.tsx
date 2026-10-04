@@ -34,6 +34,7 @@ const PAYMENT_METHODS: SelectItemType[] = [
     { id: "Card", label: "Card" },
     { id: "Qris", label: "QRIS" },
     { id: "GiftCard", label: "Gift card" },
+    { id: "Loyalty", label: "Loyalty points" },
 ];
 
 const ORDER_TYPES: SelectItemType[] = [

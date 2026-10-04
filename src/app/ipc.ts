@@ -641,7 +641,6 @@ export interface CustomerInput {
     zip?: string | null;
     taxNumber?: string | null;
     creditLimit: Decimal;
-    loyaltyPoints: Decimal;
     note?: string | null;
 }
 

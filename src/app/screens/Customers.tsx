@@ -22,7 +22,6 @@ const blank: CustomerInput = {
     zip: null,
     taxNumber: null,
     creditLimit: "0",
-    loyaltyPoints: "0",
     note: null,
 };
 
@@ -91,7 +90,6 @@ export const Customers = () => {
                 email: form.email?.trim() || null,
                 phone: form.phone?.trim() || null,
                 creditLimit: toDecimal(form.creditLimit),
-                loyaltyPoints: toDecimal(form.loyaltyPoints),
             });
             setCreating(false);
             setForm(blank);
@@ -178,6 +176,7 @@ export const Customers = () => {
                             <Table.Head label="Phone" />
                             <Table.Head label="Balance" />
                             <Table.Head label="Credit left" />
+                            <Table.Head label="Points" />
                             <Table.Head label="Added" />
                             <Table.Head label="" className="w-28" />
                         </Table.Header>
@@ -195,6 +194,9 @@ export const Customers = () => {
                                     >
                                         {formatMoney(row.creditAvailable)}
                                     </Table.Cell>
+                                    {/* Derived from the points ledger, so it moves with every
+                                        earn and redeem rather than whatever was typed last. */}
+                                    <Table.Cell className="tabular-nums">{row.loyaltyPoints}</Table.Cell>
                                     <Table.Cell className="text-tertiary">{formatTimestamp(row.createdAt)}</Table.Cell>
                                     <Table.Cell>
                                         <div className="flex items-center gap-2">
@@ -267,11 +269,6 @@ export const Customers = () => {
                                         label="Credit limit"
                                         value={form.creditLimit}
                                         onChange={set("creditLimit")}
-                                    />
-                                    <Field
-                                        label="Loyalty points"
-                                        value={form.loyaltyPoints}
-                                        onChange={set("loyaltyPoints")}
                                     />
                                 </div>
                                 <Field label="Tax number" value={form.taxNumber ?? ""} onChange={set("taxNumber")} />
