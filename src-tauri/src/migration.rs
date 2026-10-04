@@ -32,6 +32,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::PermissionCatalog),
             Box::new(Migrations::CustomersAndSuppliers),
             Box::new(Migrations::TradeCredit),
+            Box::new(Migrations::SalePayments),
         ]
     }
 }
@@ -45,6 +46,7 @@ pub enum Migrations {
     PermissionCatalog,
     CustomersAndSuppliers,
     TradeCredit,
+    SalePayments,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -88,6 +90,7 @@ impl MigrationName for Migrations {
             Migrations::PermissionCatalog => "permission_catalog",
             Migrations::CustomersAndSuppliers => "customers_and_suppliers",
             Migrations::TradeCredit => "trade_credit",
+            Migrations::SalePayments => "sale_payments",
         }
     }
 }
@@ -103,6 +106,7 @@ impl MigrationTrait for Migrations {
             Migrations::PermissionCatalog => permission_catalog(manager).await?,
             Migrations::CustomersAndSuppliers => customers_and_suppliers(manager).await?,
             Migrations::TradeCredit => trade_credit(manager).await?,
+            Migrations::SalePayments => sale_payments(manager).await?,
         }
         Ok(())
     }
@@ -110,6 +114,11 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::SalePayments => {
+                manager
+                    .drop_table(Table::drop().table(SalePayments::Table).if_exists().to_owned())
+                    .await?;
+            }
             Migrations::TradeCredit => {
                 for t in [
                     SupplierPayments::Table.into_iden(),
@@ -650,6 +659,53 @@ async fn customers_and_suppliers(manager: &SchemaManager<'_>) -> Result<(), DbEr
     Ok(())
 }
 
+/// How one sale was paid, once per tender.
+///
+/// A sale paid half card and half cash writes two rows. `sales.paid_total` stays as the
+/// single figure queries read; this table is the detail behind it, so "which card" and
+/// "which QRIS reference" are answerable after the fact rather than lost in one string.
+async fn sale_payments(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(SalePayments::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(SalePayments::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(SalePayments::SaleId).integer().not_null())
+                .col(ColumnDef::new(SalePayments::Method).string().not_null())
+                .col(ColumnDef::new(SalePayments::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                // Gateway reference, receipt number, or whatever the tender produces.
+                .col(ColumnDef::new(SalePayments::Reference).string().null())
+                .col(ColumnDef::new(SalePayments::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_sale_payments_sale")
+                        .from(SalePayments::Table, SalePayments::SaleId)
+                        .to(Sales::Table, Sales::Id)
+                        // A sale is financial history and is never deleted, so this can
+                        // cascade without losing anything. It exists so a torn-down draft
+                        // does not leave tenders pointing at nothing.
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_sale_payments_sale_id")
+                .table(SalePayments::Table)
+                .col(SalePayments::SaleId)
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
+}
+
 /// What a customer paid and what was paid to a supplier.
 ///
 /// Append-only, like `stock_movements`: a balance is the sum over these and the
@@ -783,6 +839,17 @@ async fn permission_catalog(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     }
 
     Ok(())
+}
+
+#[derive(Iden)]
+enum SalePayments {
+    Table,
+    Id,
+    SaleId,
+    Method,
+    Amount,
+    Reference,
+    CreatedAt,
 }
 
 #[derive(Iden)]
