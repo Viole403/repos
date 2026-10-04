@@ -7,6 +7,7 @@ import { Dashboard } from "./screens/Dashboard";
 import { ItemsList } from "./screens/ItemsList";
 import { Brands } from "./screens/Brands";
 import { ItemCategories } from "./screens/ItemCategories";
+import { ItemSubCategories } from "./screens/ItemSubCategories";
 import { Login, SessionLoading } from "./screens/Login";
 import { Setup } from "./screens/Setup";
 import { Accounts } from "./screens/Accounts";
@@ -56,6 +57,7 @@ const screens: Record<string, ReactNode> = {
     "/catalog/units": <Units />,
     "/catalog/brands": <Brands />,
     "/catalog/categories": <ItemCategories />,
+    "/catalog/sub-categories": <ItemSubCategories />,
     "/sales": <Sales />,
     "/sales/:id": <SaleDetail />,
     "/sales/:id/returns": <Returns />,

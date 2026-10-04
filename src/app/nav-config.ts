@@ -46,7 +46,7 @@ const allowed = (permissions: string[], permission?: string): boolean =>
     !permission || permissions.length === 0 || permissions.includes(permission);
 
 /** Screens that exist. Anything else in the tree is inert until built. */
-export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/sales/registers", "/sales/quotations", "/sales/bookings", "/sales/promotions", "/sales/installments", "/sales/warranties", "/sales/servicings", "/sales/gift-cards", "/sales/credit-notes", "/stock", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/catalog/combos", "/settings/accounts", "/settings/roles", "/customers", "/purchase/suppliers", "/sales"]);
+export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/sales/registers", "/sales/quotations", "/sales/bookings", "/sales/promotions", "/sales/installments", "/sales/warranties", "/sales/servicings", "/sales/gift-cards", "/sales/credit-notes", "/stock", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/catalog/sub-categories", "/catalog/combos", "/settings/accounts", "/settings/roles", "/customers", "/purchase/suppliers", "/sales"]);
 
 export const navItems: NavEntry[] = [
     { label: "Dashboard", href: "#/", icon: Home01 },
@@ -58,6 +58,7 @@ export const navItems: NavEntry[] = [
         items: [
             { label: "Items", href: "#/catalog/items", icon: Tag01 },
             { label: "Categories", href: "#/catalog/categories", icon: LayersTwo01 },
+            { label: "Sub-Categories", href: "#/catalog/sub-categories", icon: LayersTwo01 },
             { label: "Brands", href: "#/catalog/brands" },
             { label: "Units", href: "#/catalog/units" },
             { label: "Combos", href: "#/catalog/combos" },

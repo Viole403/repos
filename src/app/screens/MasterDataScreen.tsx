@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { Plus, SearchLg, Trash01 } from "@untitledui/icons";
 import { Button } from "@/components/base/buttons/button";
 import { Input } from "@/components/base/input/input";
+import { Select } from "@/components/base/select/select";
+import type { SelectItemType } from "@/components/base/select/select-shared";
 import { Table, TableCard } from "@/components/application/table/table";
 import { Dialog, Modal, ModalOverlay } from "@/components/application/modals/modal";
 import { formatTimestamp } from "@/app/format";
@@ -26,10 +28,21 @@ export interface MasterConfig {
     nameLabel: string;
     /** Must be a stable module-level reference: it is an effect dependency. */
     load: (query: PageQuery) => Promise<Page<MasterEntity>>;
-    create: (input: { name: string; description?: string | null; sortId?: number }) => Promise<unknown>;
+    create: (input: { name: string; description?: string | null; sortId?: number; parentId?: number }) => Promise<unknown>;
     remove: (id: number) => Promise<void>;
     /** Categories carry a sort order; the others do not. */
     withSort?: boolean;
+    /**
+     * Set when the entity hangs off another one — a sub-category belongs to a
+     * category. The picker loads its options once and its selection is handed to
+     * `create` as `parentId`.
+     */
+    parent?: ParentField;
+}
+
+export interface ParentField {
+    label: string;
+    load: () => Promise<SelectItemType[]>;
 }
 
 type State =
@@ -37,10 +50,12 @@ type State =
     | { status: "error"; message: string }
     | { status: "ready"; rows: MasterEntity[]; total: number };
 
-export const MasterDataScreen = ({ entity, nameLabel, load, create, remove, withSort }: MasterConfig) => {
+export const MasterDataScreen = ({ entity, nameLabel, load, create, remove, withSort, parent }: MasterConfig) => {
     const [search, setSearch] = useState("");
     const [term, setTerm] = useState("");
     const [state, setState] = useState<State>({ status: "loading" });
+    const [parentKey, setParentKey] = useState<string>("");
+    const [parentOptions, setParentOptions] = useState<SelectItemType[]>([]);
     const [reload, setReload] = useState(0);
 
     const [creating, setCreating] = useState(false);
@@ -74,6 +89,24 @@ export const MasterDataScreen = ({ entity, nameLabel, load, create, remove, with
         };
     }, [term, reload, load]);
 
+    // The parent's options are needed by the create form, so they load once rather
+    // than per search keystroke.
+    useEffect(() => {
+        if (!parent) return;
+        let cancelled = false;
+        parent
+            .load()
+            .then((options) => {
+                if (!cancelled) setParentOptions(options);
+            })
+            .catch(() => {
+                if (!cancelled) setSaveError(`Could not load ${parent.label.toLowerCase()}.`);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [parent]);
+
     const resetForm = () => {
         setName("");
         setDescription("");
@@ -87,11 +120,20 @@ export const MasterDataScreen = ({ entity, nameLabel, load, create, remove, with
             setSaveError(`${nameLabel} is required`);
             return;
         }
+        if (parent && !parentKey) {
+            setSaveError(`${parent.label} is required`);
+            return;
+        }
 
         setSaving(true);
         setSaveError(null);
         try {
-            await create({ name: name.trim(), description: description.trim() || null, sortId: withSort ? Number(sortId) || 0 : undefined });
+            await create({
+                name: name.trim(),
+                description: description.trim() || null,
+                sortId: withSort ? Number(sortId) || 0 : undefined,
+                parentId: parent ? Number(parentKey) : undefined,
+            });
             setCreating(false);
             resetForm();
             setReload((n) => n + 1);
@@ -185,6 +227,21 @@ export const MasterDataScreen = ({ entity, nameLabel, load, create, remove, with
                                 <Input label={nameLabel} value={name} onChange={setName} isRequired />
                                 <Input label="Description" value={description} onChange={setDescription} />
                                 {withSort && <Input label="Sort order" type="number" value={sortId} onChange={setSortId} />}
+                                {parent && (
+                                    <Select
+                                        label={parent.label}
+                                        items={parentOptions}
+                                        selectedKey={parentKey}
+                                        onSelectionChange={(key) => setParentKey(String(key ?? ""))}
+                                        isRequired
+                                    >
+                                        {(row) => (
+                                            <Select.Item id={row.id} textValue={row.label}>
+                                                {row.label}
+                                            </Select.Item>
+                                        )}
+                                    </Select>
+                                )}
                                 <div className="flex justify-end gap-2">
                                     <Button color="secondary" onPress={() => setCreating(false)}>
                                         Cancel
