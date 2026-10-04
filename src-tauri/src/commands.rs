@@ -21,10 +21,11 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::db::db;
+use crate::entities::auth::users;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
+use crate::entities::sales::{booking, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -3316,6 +3317,324 @@ pub async fn delete_quotation_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdRe
     if deleted.rows_affected == 0 {
         return Err(CmdError::NotFound("quotation".into()));
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bookings
+// ---------------------------------------------------------------------------
+
+pub const BOOKING_STATUSES: &[&str] = &["Booked", "Waiting", "Completed", "Cancelled"];
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookingInput {
+    pub customer_id: i32,
+    pub service_seller_id: Option<i32>,
+    pub status: Option<String>,
+    /// `YYYY-MM-DDTHH:MM`, as a datetime-local field sends it.
+    pub start_at: String,
+    pub end_at: String,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookingFilter {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub customer_id: Option<i32>,
+    /// `YYYY-MM-DD`, inclusive. Unparseable narrows nothing, like the sales filter.
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookingView {
+    pub id: i32,
+    pub customer_id: i32,
+    pub customer_name: Option<String>,
+    pub service_seller_id: Option<i32>,
+    pub service_seller_name: Option<String>,
+    pub status: String,
+    pub start_at: NaiveDateTime,
+    pub end_at: NaiveDateTime,
+    pub note: Option<String>,
+    pub created_at: NaiveDateTime,
+}
+
+fn parse_booking_moment(raw: &str, field: &str) -> CmdResult<NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%dT%H:%M")
+        .map_err(|_| CmdError::Validation(format!("{field} is not a valid date and time")))
+}
+
+fn booking_view(
+    row: booking::Model,
+    customer_name: Option<String>,
+    seller_name: Option<String>,
+) -> BookingView {
+    BookingView {
+        id: row.id,
+        customer_id: row.customer_id,
+        customer_name,
+        service_seller_id: row.service_seller_id,
+        service_seller_name: seller_name,
+        status: row.status,
+        start_at: row.start_at,
+        end_at: row.end_at,
+        note: row.note,
+        created_at: row.created_at,
+    }
+}
+
+async fn booking_names<C: ConnectionTrait>(
+    conn: &C,
+    rows: &[booking::Model],
+) -> CmdResult<(HashMap<i32, String>, HashMap<i32, String>)> {
+    let customer_ids: Vec<i32> = rows.iter().map(|r| r.customer_id).collect();
+    let customers: HashMap<i32, String> = if customer_ids.is_empty() {
+        HashMap::new()
+    } else {
+        customer::Entity::find()
+            .filter(customer::Column::Id.is_in(customer_ids))
+            .all(conn)
+            .await?
+            .into_iter()
+            .map(|c| (c.id, c.name))
+            .collect()
+    };
+    let seller_ids: Vec<i32> = rows.iter().filter_map(|r| r.service_seller_id).collect();
+    let sellers: HashMap<i32, String> = if seller_ids.is_empty() {
+        HashMap::new()
+    } else {
+        users::Entity::find()
+            .filter(users::Column::Id.is_in(seller_ids))
+            .all(conn)
+            .await?
+            .into_iter()
+            .map(|u| (u.id, u.name))
+            .collect()
+    };
+    Ok((customers, sellers))
+}
+
+async fn resolve_booking_parties<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: i32,
+    service_seller_id: Option<i32>,
+) -> CmdResult<()> {
+    customer::Entity::find_by_id(customer_id)
+        .filter(customer::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("customer".into()))
+        .map(|_| ())?;
+    if let Some(seller_id) = service_seller_id {
+        users::Entity::find_by_id(seller_id)
+            .filter(users::Column::DelStatus.eq(LIVE))
+            .one(conn)
+            .await?
+            .ok_or_else(|| CmdError::NotFound("service seller".into()))
+            .map(|_| ())?;
+    }
+    Ok(())
+}
+
+fn resolve_booking_status(raw: Option<&str>) -> CmdResult<String> {
+    match raw.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok("Booked".to_owned()),
+        Some(status) if BOOKING_STATUSES.contains(&status) => Ok(status.to_owned()),
+        Some(status) => Err(CmdError::Validation(format!("{status} is not a booking status"))),
+    }
+}
+
+#[tauri::command]
+pub async fn create_booking(input: BookingInput) -> CmdResult<BookingView> {
+    crate::commands_auth::require_permission(db(), "booking-create").await?;
+    create_booking_in(db(), input, crate::auth::current_user_id()).await
+}
+
+pub async fn create_booking_in<C: ConnectionTrait>(
+    conn: &C,
+    input: BookingInput,
+    created_by: Option<i32>,
+) -> CmdResult<BookingView> {
+    let status = resolve_booking_status(input.status.as_deref())?;
+    let start_at = parse_booking_moment(&input.start_at, "start")?;
+    let end_at = parse_booking_moment(&input.end_at, "end")?;
+    // A booking starts today or later: backdating one invents history the shop
+    // cannot verify, and the date comparison is on the day, not the clock.
+    let today = crate::migration::now().date();
+    if start_at.date() < today {
+        return Err(CmdError::Validation("a booking cannot start in the past".into()));
+    }
+    if end_at < start_at {
+        return Err(CmdError::Validation("the booking cannot end before it starts".into()));
+    }
+    resolve_booking_parties(conn, input.customer_id, input.service_seller_id).await?;
+
+    let now = crate::migration::now();
+    let row = booking::ActiveModel {
+        customer_id: Set(input.customer_id),
+        service_seller_id: Set(input.service_seller_id),
+        created_by: Set(created_by),
+        status: Set(status),
+        start_at: Set(start_at),
+        end_at: Set(end_at),
+        note: Set(text(input.note.clone())),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+
+    let (customers, sellers) = booking_names(conn, std::slice::from_ref(&row)).await?;
+    Ok(booking_view(
+        row.clone(),
+        customers.get(&row.customer_id).cloned(),
+        row.service_seller_id.and_then(|id| sellers.get(&id).cloned()),
+    ))
+}
+
+#[tauri::command]
+pub async fn list_bookings(filter: BookingFilter, query: PageQuery) -> CmdResult<Page<BookingView>> {
+    crate::commands_auth::require_permission(db(), "booking-list").await?;
+    list_bookings_in(db(), &filter, &query).await
+}
+
+pub async fn list_bookings_in<C: ConnectionTrait>(
+    conn: &C,
+    filter: &BookingFilter,
+    query: &PageQuery,
+) -> CmdResult<Page<BookingView>> {
+    let mut q = booking::Entity::find().filter(booking::Column::DelStatus.eq(LIVE));
+
+    if let Some(status) = filter.status.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        q = q.filter(booking::Column::Status.eq(status));
+    }
+    if let Some(customer_id) = filter.customer_id {
+        q = q.filter(booking::Column::CustomerId.eq(customer_id));
+    }
+    if let Some((start, _)) = filter.from.as_deref().and_then(day_bounds) {
+        q = q.filter(booking::Column::StartAt.gte(start));
+    }
+    if let Some((_, next)) = filter.to.as_deref().and_then(day_bounds) {
+        q = q.filter(booking::Column::StartAt.lt(next));
+    }
+
+    let total = q.clone().count(conn).await?;
+    // Soonest first: a booking list is a schedule, not an archive.
+    let rows = q
+        .order_by_asc(booking::Column::StartAt)
+        .order_by_asc(booking::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+
+    let (customers, sellers) = booking_names(conn, &rows).await?;
+    let views = rows
+        .into_iter()
+        .map(|row| {
+            let name = customers.get(&row.customer_id).cloned();
+            let seller = row.service_seller_id.and_then(|id| sellers.get(&id).cloned());
+            booking_view(row, name, seller)
+        })
+        .collect();
+    Ok(Page::new(views, total, query))
+}
+
+#[tauri::command]
+pub async fn get_booking(id: i32) -> CmdResult<BookingView> {
+    crate::commands_auth::require_permission(db(), "booking-show").await?;
+    let db = db();
+    let row = booking::Entity::find_by_id(id)
+        .filter(booking::Column::DelStatus.eq(LIVE))
+        .one(db)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("booking".into()))?;
+    let (customers, sellers) = booking_names(db, std::slice::from_ref(&row)).await?;
+    Ok(booking_view(
+        row.clone(),
+        customers.get(&row.customer_id).cloned(),
+        row.service_seller_id.and_then(|id| sellers.get(&id).cloned()),
+    ))
+}
+
+#[tauri::command]
+pub async fn update_booking(id: i32, input: BookingInput) -> CmdResult<BookingView> {
+    crate::commands_auth::require_permission(db(), "booking-edit").await?;
+    update_booking_in(db(), id, input).await
+}
+
+pub async fn update_booking_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+    input: BookingInput,
+) -> CmdResult<BookingView> {
+    let found = booking::Entity::find_by_id(id)
+        .filter(booking::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("booking".into()))?;
+
+    let status = resolve_booking_status(input.status.as_deref())?;
+    let start_at = parse_booking_moment(&input.start_at, "start")?;
+    let end_at = parse_booking_moment(&input.end_at, "end")?;
+    // A past booking can still be edited, but not moved further back: the floor is
+    // whichever is earlier, its original start or today.
+    let floor = found.start_at.date().min(crate::migration::now().date());
+    if start_at.date() < floor {
+        return Err(CmdError::Validation("the booking cannot be moved before it was".into()));
+    }
+    if end_at < start_at {
+        return Err(CmdError::Validation("the booking cannot end before it starts".into()));
+    }
+    resolve_booking_parties(conn, input.customer_id, input.service_seller_id).await?;
+
+    let mut am: booking::ActiveModel = found.into();
+    am.customer_id = Set(input.customer_id);
+    am.service_seller_id = Set(input.service_seller_id);
+    am.status = Set(status);
+    am.start_at = Set(start_at);
+    am.end_at = Set(end_at);
+    am.note = Set(text(input.note.clone()));
+    am.updated_at = Set(crate::migration::now());
+    let row = am.update(conn).await?;
+
+    let (customers, sellers) = booking_names(conn, std::slice::from_ref(&row)).await?;
+    Ok(booking_view(
+        row.clone(),
+        customers.get(&row.customer_id).cloned(),
+        row.service_seller_id.and_then(|id| sellers.get(&id).cloned()),
+    ))
+}
+
+#[tauri::command]
+pub async fn delete_booking(id: i32) -> CmdResult<()> {
+    crate::commands_auth::require_permission(db(), "booking-destroy").await?;
+    delete_booking_in(db(), id).await
+}
+
+pub async fn delete_booking_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResult<()> {
+    // Soft-delete: an appointment is revocable, not financial history, so unlike a
+    // sale there is nothing to preserve — but unlike a draft it was visible to a
+    // customer, so unlike a draft it is not erased.
+    let found = booking::Entity::find_by_id(id)
+        .filter(booking::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("booking".into()))?;
+    let mut am: booking::ActiveModel = found.into();
+    am.del_status = Set(DELETED.to_owned());
+    am.updated_at = Set(crate::migration::now());
+    am.update(conn).await?;
     Ok(())
 }
 

@@ -53,6 +53,11 @@ pub fn run() {
             commands::list_registers,
             commands::register_summary,
             commands::close_register,
+            commands::create_booking,
+            commands::list_bookings,
+            commands::get_booking,
+            commands::update_booking,
+            commands::delete_booking,
             commands::create_quotation,
             commands::list_quotations,
             commands::get_quotation,
@@ -109,7 +114,7 @@ mod tests {
     use crate::migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use crate::entities::sales::stock_movement::MovementType;
-    use crate::entities::sales::{quotation, quotation_detail, sale, sale_detail, stock_movement};
+    use crate::entities::sales::{booking, quotation, quotation_detail, sale, sale_detail, stock_movement};
     use crate::entities::trade::{customer, supplier, supplier_payment};
 
     fn days_ago(n: i64) -> chrono::NaiveDateTime {
@@ -2420,6 +2425,194 @@ mod tests {
             commands::delete_quotation_in(&db, created.id).await,
             Err(commands::CmdError::NotFound(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Bookings
+    // -----------------------------------------------------------------------
+
+    fn at(days_ahead: i64, hour: u32, min: u32) -> String {
+        let day = crate::migration::now().date() + chrono::Duration::days(days_ahead);
+        format!("{}T{:02}:{:02}", day.format("%Y-%m-%d"), hour, min)
+    }
+
+    fn book_input(customer_id: i32) -> commands::BookingInput {
+        commands::BookingInput {
+            customer_id,
+            service_seller_id: None,
+            status: None,
+            start_at: at(1, 10, 0),
+            end_at: at(1, 11, 0),
+            note: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_booking_names_customer_and_seller() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let seller = seed_user(&db).await;
+        let mut input = book_input(customer);
+        input.service_seller_id = Some(seller);
+
+        let view = commands::create_booking_in(&db, input, Some(seller)).await.expect("create");
+        assert_eq!(view.status, "Booked");
+        assert_eq!(view.customer_name.as_deref(), Some("Regular"));
+        assert_eq!(view.service_seller_name.as_deref(), Some("Cashier"));
+    }
+
+    #[tokio::test]
+    async fn booking_cannot_start_in_the_past() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let mut input = book_input(customer);
+        input.start_at = at(-1, 10, 0);
+        input.end_at = at(-1, 11, 0);
+        assert!(
+            matches!(
+                commands::create_booking_in(&db, input, None).await,
+                Err(commands::CmdError::Validation(_))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn booking_cannot_end_before_it_starts() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let mut input = book_input(customer);
+        input.end_at = at(1, 9, 0);
+        assert!(
+            matches!(
+                commands::create_booking_in(&db, input, None).await,
+                Err(commands::CmdError::Validation(_))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn booking_rejects_an_unknown_status_or_party() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+
+        let mut input = book_input(customer);
+        input.status = Some("Someday".into());
+        assert!(
+            matches!(
+                commands::create_booking_in(&db, input, None).await,
+                Err(commands::CmdError::Validation(_))
+            )
+        );
+
+        let input = book_input(4242);
+        assert!(
+            matches!(
+                commands::create_booking_in(&db, input, None).await,
+                Err(commands::CmdError::NotFound(_))
+            )
+        );
+
+        let mut input = book_input(customer);
+        input.service_seller_id = Some(4242);
+        assert!(
+            matches!(
+                commands::create_booking_in(&db, input, None).await,
+                Err(commands::CmdError::NotFound(_))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn update_booking_cannot_move_a_past_booking_further_back() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let view = commands::create_booking_in(&db, book_input(customer), None)
+            .await
+            .expect("create");
+
+        // Backdate the row directly: create refuses the past, so only an edit path
+        // or a database write can put one there.
+        let past = days_ago(2);
+        let mut am: booking::ActiveModel = booking::Entity::find_by_id(view.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .expect("seeded")
+            .into();
+        am.start_at = Set(past);
+        am.end_at = Set(past);
+        am.update(&db).await.unwrap();
+
+        let mut input = book_input(customer);
+        input.start_at = at(-3, 10, 0);
+        input.end_at = at(-3, 11, 0);
+        assert!(
+            matches!(
+                commands::update_booking_in(&db, view.id, input).await,
+                Err(commands::CmdError::Validation(_))
+            )
+        );
+
+        // Forward is always fine, and so is the original slot.
+        let mut input = book_input(customer);
+        input.start_at = at(5, 10, 0);
+        input.end_at = at(5, 11, 0);
+        let moved = commands::update_booking_in(&db, view.id, input).await.expect("move forward");
+        assert_eq!(moved.status, "Booked");
+    }
+
+    #[tokio::test]
+    async fn delete_booking_soft_deletes() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let view = commands::create_booking_in(&db, book_input(customer), None)
+            .await
+            .expect("create");
+
+        commands::delete_booking_in(&db, view.id).await.expect("delete");
+        assert_eq!(booking::Entity::find().count(&db).await.unwrap(), 1);
+        assert!(
+            matches!(
+                commands::delete_booking_in(&db, view.id).await,
+                Err(commands::CmdError::NotFound(_))
+            )
+        );
+        assert!(
+            commands::list_bookings_in(&db, &commands::BookingFilter::default(), &page_one())
+                .await
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_bookings_is_soonest_first_and_filters_by_status() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let mut later = book_input(customer);
+        later.start_at = at(3, 10, 0);
+        later.end_at = at(3, 11, 0);
+        commands::create_booking_in(&db, later, None).await.expect("later");
+        let mut sooner = book_input(customer);
+        sooner.status = Some("Waiting".into());
+        commands::create_booking_in(&db, sooner, None).await.expect("sooner");
+
+        let all = commands::list_bookings_in(&db, &commands::BookingFilter::default(), &page_one())
+            .await
+            .expect("list");
+        assert_eq!(all.total, 2);
+        assert_eq!(all.rows[0].status, "Waiting");
+
+        let filtered = commands::list_bookings_in(
+            &db,
+            &commands::BookingFilter { status: Some("Booked".into()), ..Default::default() },
+            &page_one(),
+        )
+        .await
+        .expect("filtered");
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.rows[0].status, "Booked");
     }
 
     #[tokio::test]
