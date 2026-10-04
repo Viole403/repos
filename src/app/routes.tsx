@@ -19,6 +19,7 @@ import { Suppliers } from "./screens/Suppliers";
 import { Register } from "./screens/Register";
 import { Drafts } from "./screens/Drafts";
 import { Registers } from "./screens/Registers";
+import { Quotations } from "./screens/Quotations";
 import { Units } from "./screens/Units";
 import { enabledRoutes, navItems } from "./nav-config";
 
@@ -31,6 +32,7 @@ const screens: Record<string, ReactNode> = {
     "/pos": <Register />,
     "/sales/holds": <Drafts />,
     "/sales/registers": <Registers />,
+    "/sales/quotations": <Quotations />,
     "/catalog/items": <ItemsList />,
     "/catalog/units": <Units />,
     "/catalog/brands": <Brands />,

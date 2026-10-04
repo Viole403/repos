@@ -46,7 +46,7 @@ const allowed = (permissions: string[], permission?: string): boolean =>
     !permission || permissions.length === 0 || permissions.includes(permission);
 
 /** Screens that exist. Anything else in the tree is inert until built. */
-export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/sales/registers", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/settings/accounts", "/settings/roles", "/customers", "/purchase/suppliers", "/sales"]);
+export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/sales/registers", "/sales/quotations", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/settings/accounts", "/settings/roles", "/customers", "/purchase/suppliers", "/sales"]);
 
 export const navItems: NavEntry[] = [
     { label: "Dashboard", href: "#/", icon: Home01 },
@@ -69,7 +69,7 @@ export const navItems: NavEntry[] = [
             { label: "All Sales", href: "#/sales" },
             { label: "Returns", href: "#/sales/returns", disabled: true },
             { label: "Holds", href: "#/sales/holds" },
-            { label: "Quotations", href: "#/sales/quotations", disabled: true },
+            { label: "Quotations", href: "#/sales/quotations" },
             { label: "Registers", href: "#/sales/registers" },
         ],
     },
