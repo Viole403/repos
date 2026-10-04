@@ -53,6 +53,11 @@ pub fn run() {
             commands::list_registers,
             commands::register_summary,
             commands::close_register,
+            commands::create_quotation,
+            commands::list_quotations,
+            commands::get_quotation,
+            commands::update_quotation,
+            commands::delete_quotation,
             commands_auth::login,
             commands_auth::logout,
             commands_auth::current_user,
@@ -104,7 +109,7 @@ mod tests {
     use crate::migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use crate::entities::sales::stock_movement::MovementType;
-    use crate::entities::sales::{sale, sale_detail, stock_movement};
+    use crate::entities::sales::{quotation, quotation_detail, sale, sale_detail, stock_movement};
     use crate::entities::trade::{customer, supplier, supplier_payment};
 
     fn days_ago(n: i64) -> chrono::NaiveDateTime {
@@ -2238,7 +2243,7 @@ mod tests {
         let user = seed_user(&db).await;
         let err = commands::open_register_in(
             &db,
-            7,
+            user,
             commands::OpenRegisterInput {
                 opening_balance: Decimal::new(100_000, 3),
                 opening_details: Some(vec![commands::MethodTotal {
@@ -2265,5 +2270,169 @@ mod tests {
                 Err(commands::CmdError::Validation(_))
             )
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Quotations
+    // -----------------------------------------------------------------------
+
+    fn quote_input(customer_id: i32, item_id: i32) -> commands::QuotationInput {
+        commands::QuotationInput {
+            customer_id,
+            quoted_at: None,
+            reference_no: None,
+            discount_total: Some(Decimal::new(5_000, 3)),
+            note: None,
+            lines: vec![
+                commands::QuotationLine {
+                    item_id,
+                    quantity: dec(2),
+                    unit_price: Decimal::new(25_000, 3),
+                    discount: Some(Decimal::new(1_000, 3)),
+                },
+                commands::QuotationLine {
+                    item_id,
+                    quantity: dec(1),
+                    unit_price: Decimal::new(10_000, 3),
+                    discount: None,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn create_quotation_derives_totals_and_number() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let widget = seed_item(&db, "Widget").await;
+
+        let view = commands::create_quotation_in(&db, quote_input(customer, widget))
+            .await
+            .expect("create");
+        // 2×25 − 1 discount, plus 1×10: subtotal 60, discounts 6, grand 54.
+        assert_eq!(view.subtotal, Decimal::new(60_000, 3));
+        assert_eq!(view.discount_total, Decimal::new(6_000, 3));
+        assert_eq!(view.grand_total, Decimal::new(54_000, 3));
+        assert!(view.quotation_no.starts_with("QT-"), "got {}", view.quotation_no);
+        assert_eq!(view.customer_name.as_deref(), Some("Regular"));
+        assert_eq!(view.lines.len(), 2);
+        assert!(view.lines.iter().all(|l| l.item_name == "Widget"));
+    }
+
+    #[tokio::test]
+    async fn quotation_requires_a_live_customer() {
+        let db = db::init_for_tests().await;
+        let widget = seed_item(&db, "Widget").await;
+        let customer = seed_customer(&db, "Gone", Decimal::ZERO).await;
+        let mut gone: customer::ActiveModel = customer::Entity::find_by_id(customer)
+            .one(&db)
+            .await
+            .unwrap()
+            .expect("seeded")
+            .into();
+        gone.del_status = Set("Deleted".into());
+        gone.update(&db).await.unwrap();
+
+        for id in [4242, customer] {
+            let err = commands::create_quotation_in(&db, quote_input(id, widget)).await;
+            assert!(
+                matches!(err, Err(commands::CmdError::NotFound(_))),
+                "an offer to nobody is a row nothing can collect on"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quotation_rejects_an_unknown_item_without_leaving_a_header() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let mut input = quote_input(customer, 4242);
+        input.lines[0].item_id = 4242;
+
+        assert!(
+            matches!(
+                commands::create_quotation_in(&db, input).await,
+                Err(commands::CmdError::NotFound(_))
+            )
+        );
+        assert_eq!(
+            quotation::Entity::find().count(&db).await.unwrap(),
+            0,
+            "the header survived the failed line write"
+        );
+    }
+
+    #[tokio::test]
+    async fn quotation_rejects_a_bad_date() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let widget = seed_item(&db, "Widget").await;
+        let mut input = quote_input(customer, widget);
+        input.quoted_at = Some("03/10/2026".into());
+        assert!(
+            matches!(
+                commands::create_quotation_in(&db, input).await,
+                Err(commands::CmdError::Validation(_))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn update_quotation_replaces_lines() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let widget = seed_item(&db, "Widget").await;
+        let gadget = seed_item(&db, "Gadget").await;
+
+        let created = commands::create_quotation_in(&db, quote_input(customer, widget))
+            .await
+            .expect("create");
+        let mut input = quote_input(customer, gadget);
+        input.discount_total = None;
+        let updated = commands::update_quotation_in(&db, created.id, input)
+            .await
+            .expect("update");
+
+        assert_eq!(updated.lines.len(), 2);
+        assert!(updated.lines.iter().all(|l| l.item_name == "Gadget"));
+        assert_eq!(updated.subtotal, Decimal::new(60_000, 3));
+        assert_eq!(updated.grand_total, Decimal::new(59_000, 3));
+        assert_eq!(
+            quotation_detail::Entity::find().count(&db).await.unwrap(),
+            2,
+            "the old lines were appended to, not replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_quotation_removes_header_and_lines() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let widget = seed_item(&db, "Widget").await;
+        let created = commands::create_quotation_in(&db, quote_input(customer, widget))
+            .await
+            .expect("create");
+
+        commands::delete_quotation_in(&db, created.id).await.expect("delete");
+        assert_eq!(quotation::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(quotation_detail::Entity::find().count(&db).await.unwrap(), 0);
+        assert!(matches!(
+            commands::delete_quotation_in(&db, created.id).await,
+            Err(commands::CmdError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_quotations_is_newest_first_with_customer_names() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        let widget = seed_item(&db, "Widget").await;
+        commands::create_quotation_in(&db, quote_input(customer, widget)).await.expect("first");
+        let second = commands::create_quotation_in(&db, quote_input(customer, widget)).await.expect("second");
+
+        let page = commands::list_quotations_in(&db, &page_one()).await.expect("list");
+        assert_eq!(page.total, 2);
+        assert_eq!(page.rows[0].id, second.id);
+        assert!(page.rows.iter().all(|r| r.customer_name.as_deref() == Some("Regular")));
     }
 }

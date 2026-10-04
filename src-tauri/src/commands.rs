@@ -24,7 +24,7 @@ use crate::db::db;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
+use crate::entities::sales::{quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -2967,6 +2967,356 @@ pub async fn close_register_in<C: ConnectionTrait + TransactionTrait>(
     txn.commit().await?;
 
     RegisterView::from_row(row)
+}
+
+// ---------------------------------------------------------------------------
+// Quotations
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotationLine {
+    pub item_id: i32,
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    pub discount: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotationInput {
+    pub customer_id: i32,
+    /// `YYYY-MM-DD`. Defaults to today: an offer is priced as of when it is written.
+    pub quoted_at: Option<String>,
+    pub reference_no: Option<String>,
+    pub discount_total: Option<Decimal>,
+    pub note: Option<String>,
+    pub lines: Vec<QuotationLine>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotationView {
+    pub id: i32,
+    pub quotation_no: String,
+    pub customer_id: i32,
+    pub customer_name: Option<String>,
+    pub quoted_at: NaiveDateTime,
+    pub reference_no: Option<String>,
+    pub subtotal: Decimal,
+    pub discount_total: Decimal,
+    pub grand_total: Decimal,
+    pub note: Option<String>,
+    pub created_at: NaiveDateTime,
+    pub lines: Vec<quotation_detail::Model>,
+}
+
+fn quotation_no_for(id: i32) -> String {
+    format!("QT-{id:06}")
+}
+
+/// Unique within the process only — the column's own uniqueness comes from the
+/// real number, derived from the primary key like every other document number.
+fn provisional_quotation_no() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "PENDING-{}-{}",
+        crate::migration::now().and_utc().timestamp_micros(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn parse_quote_day(raw: Option<&str>) -> CmdResult<NaiveDateTime> {
+    match raw.map(str::trim).filter(|t| !t.is_empty()) {
+        // A wrong date on an issued offer matters, so this refuses where the sales
+        // list filter merely ignores: one is a write, the other a read.
+        None => Ok(crate::migration::now()),
+        Some(text) => chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .ok_or_else(|| CmdError::Validation(format!("{text} is not a YYYY-MM-DD date"))),
+    }
+}
+
+fn validate_quotation_lines(lines: &[QuotationLine]) -> CmdResult<()> {
+    if lines.is_empty() {
+        return Err(CmdError::Validation("a quotation needs at least one line".into()));
+    }
+    for (i, line) in lines.iter().enumerate() {
+        let where_ = format!("line {}", i + 1);
+        if line.quantity <= Decimal::ZERO {
+            return Err(CmdError::Validation(format!("{where_}: quantity must be greater than zero")));
+        }
+        if line.unit_price < Decimal::ZERO {
+            return Err(CmdError::Validation(format!("{where_}: unit price cannot be negative")));
+        }
+        let discount = line.discount.unwrap_or(Decimal::ZERO);
+        if discount < Decimal::ZERO {
+            return Err(CmdError::Validation(format!("{where_}: discount cannot be negative")));
+        }
+        if discount > line.unit_price * line.quantity {
+            return Err(CmdError::Validation(format!("{where_}: discount is larger than the line total")));
+        }
+    }
+    Ok(())
+}
+
+fn quotation_totals(lines: &[QuotationLine], discount_total: Decimal) -> CmdResult<(Decimal, Decimal, Decimal)> {
+    let mut subtotal = Decimal::ZERO;
+    let mut line_discount = Decimal::ZERO;
+    for line in lines {
+        subtotal += line.unit_price * line.quantity;
+        line_discount += line.discount.unwrap_or(Decimal::ZERO);
+    }
+    if discount_total < Decimal::ZERO {
+        return Err(CmdError::Validation("discount total cannot be negative".into()));
+    }
+    let discount_all = line_discount + discount_total;
+    if discount_all > subtotal {
+        return Err(CmdError::Validation(format!(
+            "discount {discount_all} is larger than the subtotal {subtotal}"
+        )));
+    }
+    Ok((
+        subtotal.round_dp(MONEY_SCALE),
+        discount_all.round_dp(MONEY_SCALE),
+        (subtotal - discount_all).round_dp(MONEY_SCALE),
+    ))
+}
+
+async fn write_quotation_lines<C: ConnectionTrait>(
+    conn: &C,
+    quotation_id: i32,
+    lines: &[QuotationLine],
+) -> CmdResult<Vec<quotation_detail::Model>> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let item = item::Entity::find_by_id(line.item_id)
+            .filter(item::Column::DelStatus.eq(LIVE))
+            .one(conn)
+            .await?
+            .ok_or_else(|| CmdError::NotFound(format!("item {}", line.item_id)))?;
+        let discount = line.discount.unwrap_or(Decimal::ZERO);
+        out.push(
+            quotation_detail::ActiveModel {
+                quotation_id: Set(quotation_id),
+                item_id: Set(line.item_id),
+                item_name: Set(item.name),
+                quantity: Set(line.quantity),
+                unit_price: Set(line.unit_price),
+                discount: Set(discount),
+                line_total: Set((line.unit_price * line.quantity - discount).round_dp(MONEY_SCALE)),
+                ..Default::default()
+            }
+            .insert(conn)
+            .await?,
+        );
+    }
+    Ok(out)
+}
+
+async fn resolve_quote_customer<C: ConnectionTrait>(conn: &C, customer_id: i32) -> CmdResult<()> {
+    customer::Entity::find_by_id(customer_id)
+        .filter(customer::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("customer".into()))
+        .map(|_| ())
+}
+
+fn quotation_view(
+    row: quotation::Model,
+    customer_name: Option<String>,
+    lines: Vec<quotation_detail::Model>,
+) -> QuotationView {
+    QuotationView {
+        id: row.id,
+        quotation_no: row.quotation_no,
+        customer_id: row.customer_id,
+        customer_name,
+        quoted_at: row.quoted_at,
+        reference_no: row.reference_no,
+        subtotal: row.subtotal,
+        discount_total: row.discount_total,
+        grand_total: row.grand_total,
+        note: row.note,
+        created_at: row.created_at,
+        lines,
+    }
+}
+
+#[tauri::command]
+pub async fn create_quotation(input: QuotationInput) -> CmdResult<QuotationView> {
+    crate::commands_auth::require_permission(db(), "quotation-create").await?;
+    create_quotation_in(db(), input).await
+}
+
+pub async fn create_quotation_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    input: QuotationInput,
+) -> CmdResult<QuotationView> {
+    validate_quotation_lines(&input.lines)?;
+    let quoted_at = parse_quote_day(input.quoted_at.as_deref())?;
+    let order_discount = input.discount_total.unwrap_or(Decimal::ZERO);
+
+    let txn = conn.begin().await?;
+    resolve_quote_customer(&txn, input.customer_id).await?;
+    let (subtotal, discount_total, grand_total) = quotation_totals(&input.lines, order_discount)?;
+
+    let now = crate::migration::now();
+    let header = quotation::ActiveModel {
+        customer_id: Set(input.customer_id),
+        quotation_no: Set(provisional_quotation_no()),
+        quoted_at: Set(quoted_at),
+        reference_no: Set(text(input.reference_no.clone())),
+        subtotal: Set(subtotal),
+        discount_total: Set(discount_total),
+        grand_total: Set(grand_total),
+        created_by: Set(crate::auth::current_user_id()),
+        note: Set(text(input.note.clone())),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
+    let quotation_id = header.id;
+    let lines = write_quotation_lines(&txn, quotation_id, &input.lines).await?;
+
+    let mut am: quotation::ActiveModel = header.into();
+    am.quotation_no = Set(quotation_no_for(quotation_id));
+    let row = am.update(&txn).await?;
+    txn.commit().await?;
+
+    let name = customer::Entity::find_by_id(row.customer_id)
+        .one(conn)
+        .await?
+        .map(|c| c.name);
+    Ok(quotation_view(row, name, lines))
+}
+
+#[tauri::command]
+pub async fn list_quotations(query: PageQuery) -> CmdResult<Page<QuotationView>> {
+    crate::commands_auth::require_permission(db(), "quotation-list").await?;
+    list_quotations_in(db(), &query).await
+}
+
+pub async fn list_quotations_in<C: ConnectionTrait>(
+    conn: &C,
+    query: &PageQuery,
+) -> CmdResult<Page<QuotationView>> {
+    let total = quotation::Entity::find().count(conn).await?;
+    let rows = quotation::Entity::find()
+        .order_by_desc(quotation::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+
+    let ids: Vec<i32> = rows.iter().map(|r| r.customer_id).collect();
+    let names: HashMap<i32, String> = if ids.is_empty() {
+        HashMap::new()
+    } else {
+        customer::Entity::find()
+            .filter(customer::Column::Id.is_in(ids))
+            .all(conn)
+            .await?
+            .into_iter()
+            .map(|c| (c.id, c.name))
+            .collect()
+    };
+    let views = rows
+        .into_iter()
+        .map(|row| {
+            let name = names.get(&row.customer_id).cloned();
+            quotation_view(row, name, Vec::new())
+        })
+        .collect();
+    Ok(Page::new(views, total, query))
+}
+
+#[tauri::command]
+pub async fn get_quotation(id: i32) -> CmdResult<QuotationView> {
+    crate::commands_auth::require_permission(db(), "quotation-show").await?;
+    let db = db();
+    let row = quotation::Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("quotation".into()))?;
+    let lines = quotation_detail::Entity::find()
+        .filter(quotation_detail::Column::QuotationId.eq(id))
+        .order_by_asc(quotation_detail::Column::Id)
+        .all(db)
+        .await?;
+    let name = customer::Entity::find_by_id(row.customer_id)
+        .one(db)
+        .await?
+        .map(|c| c.name);
+    Ok(quotation_view(row, name, lines))
+}
+
+#[tauri::command]
+pub async fn update_quotation(id: i32, input: QuotationInput) -> CmdResult<QuotationView> {
+    crate::commands_auth::require_permission(db(), "quotation-edit").await?;
+    update_quotation_in(db(), id, input).await
+}
+
+pub async fn update_quotation_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    id: i32,
+    input: QuotationInput,
+) -> CmdResult<QuotationView> {
+    validate_quotation_lines(&input.lines)?;
+    let quoted_at = parse_quote_day(input.quoted_at.as_deref())?;
+    let order_discount = input.discount_total.unwrap_or(Decimal::ZERO);
+
+    let txn = conn.begin().await?;
+    let found = quotation::Entity::find_by_id(id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("quotation".into()))?;
+    resolve_quote_customer(&txn, input.customer_id).await?;
+    let (subtotal, discount_total, grand_total) = quotation_totals(&input.lines, order_discount)?;
+
+    // Replaced, not appended: the pivot rule applies to any child collection with
+    // no uniqueness beyond its parent.
+    quotation_detail::Entity::delete_many()
+        .filter(quotation_detail::Column::QuotationId.eq(id))
+        .exec(&txn)
+        .await?;
+    let lines = write_quotation_lines(&txn, id, &input.lines).await?;
+
+    let mut am: quotation::ActiveModel = found.into();
+    am.customer_id = Set(input.customer_id);
+    am.quoted_at = Set(quoted_at);
+    am.reference_no = Set(text(input.reference_no.clone()));
+    am.subtotal = Set(subtotal);
+    am.discount_total = Set(discount_total);
+    am.grand_total = Set(grand_total);
+    am.note = Set(text(input.note.clone()));
+    let row = am.update(&txn).await?;
+    txn.commit().await?;
+
+    let name = customer::Entity::find_by_id(row.customer_id)
+        .one(conn)
+        .await?
+        .map(|c| c.name);
+    Ok(quotation_view(row, name, lines))
+}
+
+#[tauri::command]
+pub async fn delete_quotation(id: i32) -> CmdResult<()> {
+    crate::commands_auth::require_permission(db(), "quotation-destroy").await?;
+    delete_quotation_in(db(), id).await
+}
+
+pub async fn delete_quotation_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResult<()> {
+    // Hard delete: an offer carries no money and moves no stock, so unlike a sale
+    // there is no financial history to preserve. Details cascade from the FK.
+    let deleted = quotation::Entity::delete_by_id(id).exec(conn).await?;
+    if deleted.rows_affected == 0 {
+        return Err(CmdError::NotFound("quotation".into()));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
