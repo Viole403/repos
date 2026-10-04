@@ -88,6 +88,10 @@ pub fn run() {
             commands::get_sale,
             commands::create_return,
             commands::list_returns,
+            commands::create_installment_sale,
+            commands::collect_installment_payment,
+            commands::list_installments,
+            commands::get_installment_sale,
             commands::list_customers,
             commands::create_customer,
             commands::update_customer,
@@ -1816,6 +1820,152 @@ mod tests {
             .await
             .expect("promotion succeeds");
         assert_eq!(view.sale.order_type, "Online", "promoting must not reset the channel");
+    }
+
+    fn installment_input(
+        customer_id: i32,
+        item_id: i32,
+    ) -> commands::CreateInstallmentInput {
+        commands::CreateInstallmentInput {
+            customer_id,
+            item_id,
+            quantity: Decimal::new(1_000, 3),
+            unit_price: Decimal::new(100_000_000, 3),
+            discount_amount: None,
+            interest_percent: Some(Decimal::new(10_000, 3)),
+            other_charges: Some(Decimal::new(5_000_000, 3)),
+            down_payment: Some(Decimal::new(20_000_000, 3)),
+            down_payment_method: Some("Cash".into()),
+            number_of_installments: 3,
+            interval_days: None,
+            note: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_installment_sale_splits_the_balance_into_dues() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Ani", Decimal::ZERO).await;
+        let fridge = seed_item(&db, "fridge").await;
+        seed_stock(&db, fridge, dec(5)).await;
+
+        let view = commands::create_installment_sale_in(&db, 1, installment_input(customer, fridge))
+            .await
+            .expect("installment sale");
+
+        // (100 - 0) + 10% + 5 = 115 total, 20 down, 95 across 3 dues.
+        assert_eq!(view.sale.total, Decimal::new(115_000_000, 3));
+        assert_eq!(view.paid_total, Decimal::new(20_000_000, 3));
+        assert_eq!(view.due_total, Decimal::new(95_000_000, 3));
+        assert_eq!(view.status, "Active");
+        assert!(view.sale.reference_no.starts_with("INST-"), "got {}", view.sale.reference_no);
+        assert_eq!(view.details.len(), 3);
+        let due_sum: Decimal = view.details.iter().map(|d| d.amount).sum();
+        assert_eq!(due_sum, Decimal::new(95_000_000, 3), "the dues add up to the balance");
+        for due in &view.details {
+            assert_eq!(due.paid_status, "Unpaid");
+        }
+        let gap = view.details[1].due_date - view.details[0].due_date;
+        assert_eq!(gap, chrono::TimeDelta::days(30), "dues a month apart by default");
+
+        let left = commands::stock_on_hand_in(&db, fridge).await.unwrap();
+        assert_eq!(left, dec(4), "the goods leave the shelf on day one");
+    }
+
+    #[tokio::test]
+    async fn an_installment_sale_refuses_a_down_payment_above_the_total() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Budi", Decimal::ZERO).await;
+        let tv = seed_item(&db, "tv").await;
+        seed_stock(&db, tv, dec(5)).await;
+
+        let mut input = installment_input(customer, tv);
+        input.down_payment = Some(Decimal::new(200_000_000, 3));
+        let err = commands::create_installment_sale_in(&db, 1, input)
+            .await
+            .expect_err("down payment above total");
+        assert!(format!("{err}").contains("down payment is larger than the total"));
+    }
+
+    #[tokio::test]
+    async fn an_installment_sale_needs_stock_on_the_shelf() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Cici", Decimal::ZERO).await;
+        let oven = seed_item(&db, "oven").await;
+
+        let err = commands::create_installment_sale_in(&db, 1, installment_input(customer, oven))
+            .await
+            .expect_err("no stock, no credit sale");
+        assert!(format!("{err}").contains("in stock"));
+    }
+
+    #[tokio::test]
+    async fn collecting_dues_marks_them_paid_and_closes_the_plan() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Dedi", Decimal::ZERO).await;
+        let bike = seed_item(&db, "bike").await;
+        seed_stock(&db, bike, dec(5)).await;
+
+        let view = commands::create_installment_sale_in(&db, 1, installment_input(customer, bike))
+            .await
+            .expect("installment sale");
+        let first = view.details[0].id;
+        let first_amount = view.details[0].amount;
+
+        // A partial payment leaves the due open and the plan active.
+        let half = first_amount / Decimal::new(2, 0);
+        let view = commands::collect_installment_payment_in(&db, first, half, Some("Cash".into()))
+            .await
+            .expect("partial collection");
+        assert_eq!(view.details[0].paid_status, "Partial");
+        assert_eq!(view.status, "Active");
+
+        // Refusing the overpayment, not rolling it onto the next due.
+        let too_much = first_amount;
+        let err = commands::collect_installment_payment_in(&db, first, too_much, None)
+            .await
+            .expect_err("overpayment refused");
+        assert!(format!("{err}").contains("outstanding"));
+
+        // The rest of this due plus every other one closes the plan.
+        let rest = first_amount - half;
+        let mut view =
+            commands::collect_installment_payment_in(&db, first, rest, Some("Cash".into()))
+                .await
+                .expect("remainder collected");
+        assert_eq!(view.details[0].paid_status, "Paid");
+        assert!(view.details[0].paid_date.is_some());
+        let rest_of_plan: Vec<(i32, Decimal)> =
+            view.details.iter().skip(1).map(|d| (d.id, d.amount)).collect();
+        for (id, amount) in rest_of_plan {
+            view = commands::collect_installment_payment_in(&db, id, amount, Some("Cash".into()))
+                .await
+                .expect("due collected");
+        }
+        assert_eq!(view.status, "Completed");
+        assert_eq!(view.due_total, Decimal::ZERO);
+        assert_eq!(view.paid_total, view.sale.total);
+    }
+
+    #[tokio::test]
+    async fn collecting_against_a_paid_due_is_refused() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Eka", Decimal::ZERO).await;
+        let radio = seed_item(&db, "radio").await;
+        seed_stock(&db, radio, dec(5)).await;
+
+        let view = commands::create_installment_sale_in(&db, 1, installment_input(customer, radio))
+            .await
+            .expect("installment sale");
+        let first = view.details[0].id;
+        let amount = view.details[0].amount;
+        commands::collect_installment_payment_in(&db, first, amount, None)
+            .await
+            .expect("first collection");
+        let err = commands::collect_installment_payment_in(&db, first, Decimal::new(1, 0), None)
+            .await
+            .expect_err("a paid due holds nothing");
+        assert!(format!("{err}").contains("outstanding"));
     }
 
     #[tokio::test]

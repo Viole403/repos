@@ -25,7 +25,7 @@ use crate::entities::auth::users;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{booking, combo_item, combo_sale, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
+use crate::entities::sales::{booking, combo_item, combo_sale, installment_sale, installment_sale_detail, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -4416,6 +4416,459 @@ pub async fn delete_combo_item_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdR
         return Err(CmdError::NotFound("combo item".into()));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Installments
+// ---------------------------------------------------------------------------
+
+/// A credit sale: one item handed over now, the balance split into dated dues.
+/// Totals are derived server-side — the client sends the knobs, never the answer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateInstallmentInput {
+    pub customer_id: i32,
+    pub item_id: i32,
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    #[serde(default)]
+    pub discount_amount: Option<Decimal>,
+    /// Percent on the discounted price, e.g. `10` for ten percent.
+    #[serde(default)]
+    pub interest_percent: Option<Decimal>,
+    #[serde(default)]
+    pub other_charges: Option<Decimal>,
+    #[serde(default)]
+    pub down_payment: Option<Decimal>,
+    #[serde(default)]
+    pub down_payment_method: Option<String>,
+    pub number_of_installments: i32,
+    /// Days between dues. Defaults to 30, the reference's `installment_type`.
+    #[serde(default)]
+    pub interval_days: Option<i32>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+fn installment_totals(input: &CreateInstallmentInput) -> CmdResult<(Decimal, Decimal, Decimal)> {
+    if input.quantity <= Decimal::ZERO {
+        return Err(CmdError::Validation("quantity must be greater than zero".into()));
+    }
+    if input.unit_price < Decimal::ZERO {
+        return Err(CmdError::Validation("unit price cannot be negative".into()));
+    }
+    let subtotal = input.quantity * input.unit_price;
+    let discount = input.discount_amount.unwrap_or(Decimal::ZERO);
+    if discount < Decimal::ZERO {
+        return Err(CmdError::Validation("discount cannot be negative".into()));
+    }
+    if discount > subtotal {
+        return Err(CmdError::Validation("discount is larger than the price".into()));
+    }
+    let interest_percent = input.interest_percent.unwrap_or(Decimal::ZERO);
+    if interest_percent < Decimal::ZERO {
+        return Err(CmdError::Validation("interest cannot be negative".into()));
+    }
+    let other = input.other_charges.unwrap_or(Decimal::ZERO);
+    if other < Decimal::ZERO {
+        return Err(CmdError::Validation("other charges cannot be negative".into()));
+    }
+    // `(price - discount) + interest + other`, like the reference — except every
+    // figure is `Decimal`, so `0.1 + 0.2` never reaches the ledger.
+    let interest = (subtotal - discount) * interest_percent / Decimal::new(100, 0);
+    let total = subtotal - discount + interest + other;
+
+    let down = input.down_payment.unwrap_or(Decimal::ZERO);
+    if down < Decimal::ZERO {
+        return Err(CmdError::Validation("down payment cannot be negative".into()));
+    }
+    if down > total {
+        return Err(CmdError::Validation("down payment is larger than the total".into()));
+    }
+    if input.number_of_installments < 1 {
+        return Err(CmdError::Validation("at least one installment is required".into()));
+    }
+    if input.interval_days.unwrap_or(30) < 1 {
+        return Err(CmdError::Validation("the interval must be at least a day".into()));
+    }
+    Ok((total, down, interest))
+}
+
+/// One due with its derived remainder and status, so the screen never computes money.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallmentDetailView {
+    pub id: i32,
+    pub due_date: NaiveDateTime,
+    pub amount: Decimal,
+    pub paid_amount: Decimal,
+    pub remaining_amount: Decimal,
+    /// `Unpaid`, `Partial` or `Paid` — derived from `amount - paid_amount`.
+    pub paid_status: String,
+    pub paid_date: Option<NaiveDateTime>,
+    pub payment_method: Option<String>,
+}
+
+fn detail_view(row: installment_sale_detail::Model) -> InstallmentDetailView {
+    let remaining = row.amount - row.paid_amount;
+    let paid_status = if row.paid_amount <= Decimal::ZERO {
+        "Unpaid"
+    } else if remaining <= Decimal::ZERO {
+        "Paid"
+    } else {
+        "Partial"
+    };
+    InstallmentDetailView {
+        id: row.id,
+        due_date: row.due_date,
+        amount: row.amount,
+        paid_amount: row.paid_amount,
+        remaining_amount: remaining.max(Decimal::ZERO),
+        paid_status: paid_status.to_owned(),
+        paid_date: row.paid_date,
+        payment_method: row.payment_method,
+    }
+}
+
+/// An installment sale with its schedule and derived paid/due figures.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallmentView {
+    pub sale: installment_sale::Model,
+    pub details: Vec<InstallmentDetailView>,
+    pub customer_name: Option<String>,
+    pub item_name: String,
+    /// `down_payment + SUM(details.paid_amount)`. Derived, never stored.
+    pub paid_total: Decimal,
+    pub due_total: Decimal,
+    /// `Active` while anything is due, `Completed` once it is all paid.
+    pub status: String,
+}
+
+async fn installment_view<C: ConnectionTrait>(
+    conn: &C,
+    header: installment_sale::Model,
+) -> CmdResult<InstallmentView> {
+    let rows = installment_sale_detail::Entity::find()
+        .filter(installment_sale_detail::Column::InstallmentSaleId.eq(header.id))
+        .filter(installment_sale_detail::Column::DelStatus.eq(LIVE))
+        .order_by_asc(installment_sale_detail::Column::DueDate)
+        .all(conn)
+        .await?;
+
+    let customer_name = customer::Entity::find_by_id(header.customer_id)
+        .one(conn)
+        .await?
+        .map(|c| c.name);
+    let item_name = item::Entity::find_by_id(header.item_id)
+        .one(conn)
+        .await?
+        .map(|i| i.name)
+        .unwrap_or_default();
+
+    let mut paid = header.down_payment;
+    let mut details = Vec::with_capacity(rows.len());
+    for row in rows {
+        paid += row.paid_amount;
+        details.push(detail_view(row));
+    }
+    let due = (header.total - paid).max(Decimal::ZERO);
+    let status = if due > Decimal::ZERO { "Active" } else { "Completed" };
+    Ok(InstallmentView {
+        sale: header,
+        details,
+        customer_name,
+        item_name,
+        paid_total: paid,
+        due_total: due,
+        status: status.to_owned(),
+    })
+}
+
+#[tauri::command]
+pub async fn create_installment_sale(input: CreateInstallmentInput) -> CmdResult<InstallmentView> {
+    crate::commands_auth::require_permission(db(), "installment-create").await?;
+    let Some(user_id) = crate::auth::current_user_id() else {
+        return Err(CmdError::Forbidden("you are not signed in".into()));
+    };
+    create_installment_sale_in(db(), user_id, input).await
+}
+
+pub(crate) async fn create_installment_sale_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    user_id: i32,
+    input: CreateInstallmentInput,
+) -> CmdResult<InstallmentView> {
+    let (total, down, interest) = installment_totals(&input)?;
+    let interval = input.interval_days.unwrap_or(30);
+    let now = crate::migration::now();
+
+    let txn = conn.begin().await?;
+
+    customer::Entity::find_by_id(input.customer_id)
+        .filter(customer::Column::DelStatus.eq(LIVE))
+        .one(&txn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("customer".into()))?;
+
+    let item = item::Entity::find_by_id(input.item_id)
+        .filter(item::Column::DelStatus.eq(LIVE))
+        .one(&txn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound(format!("item {}", input.item_id)))?;
+
+    // Same hard block as checkout: the shelf cannot go negative until the
+    // `allow_negative_stock` setting exists to say otherwise.
+    let available = on_hand_in(&txn, input.item_id).await?;
+    if input.quantity > available {
+        return Err(CmdError::Validation(format!(
+            "item '{}' has {available} in stock but {} was requested",
+            item.name, input.quantity
+        )));
+    }
+
+    let header = installment_sale::ActiveModel {
+        reference_no: Set(String::new()),
+        customer_id: Set(input.customer_id),
+        item_id: Set(input.item_id),
+        quantity: Set(input.quantity),
+        unit_price: Set(input.unit_price),
+        discount_amount: Set(input.discount_amount.unwrap_or(Decimal::ZERO)),
+        interest_percent: Set(input.interest_percent.unwrap_or(Decimal::ZERO)),
+        interest_amount: Set(interest),
+        other_charges: Set(input.other_charges.unwrap_or(Decimal::ZERO)),
+        total: Set(total),
+        down_payment: Set(down),
+        down_payment_method: Set(input.down_payment_method),
+        number_of_installments: Set(input.number_of_installments),
+        interval_days: Set(interval),
+        created_by: Set(Some(user_id)),
+        note: Set(input.note),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
+
+    // The reference number is a function of the primary key, so it cannot collide
+    // under concurrency — same derivation as the sale invoice number.
+    let reference_no = format!("INST-{:06}", header.id);
+    let mut header_am: installment_sale::ActiveModel = header.into();
+    header_am.reference_no = Set(reference_no.clone());
+    let header = header_am.update(&txn).await?;
+
+    // Auto-split, floor division with the remainder on the first due — the
+    // reference's split, so the dues always add up to the remaining figure.
+    let remaining = total - down;
+    let count = input.number_of_installments;
+    let divided =
+        (remaining / Decimal::from(count)).trunc_with_scale(crate::migration::DECIMAL_SCALE);
+    for i in 1..=count {
+        let amount = if i == 1 { remaining - divided * Decimal::from(count - 1) } else { divided };
+        let due_date = now
+            .checked_add_days(chrono::Days::new(interval as u64 * i as u64))
+            .ok_or_else(|| CmdError::Validation("due date is out of range".to_owned()))?;
+        installment_sale_detail::ActiveModel {
+            installment_sale_id: Set(header.id),
+            due_date: Set(due_date),
+            amount: Set(amount),
+            paid_amount: Set(Decimal::ZERO),
+            paid_date: Set(None),
+            payment_method: Set(None),
+            del_status: Set(LIVE.to_owned()),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+    }
+
+    // The goods leave now, not when the last due clears — a handover is a handover.
+    let balance_after = on_hand_in(&txn, input.item_id).await? - input.quantity;
+    stock_movement::ActiveModel {
+        item_id: Set(input.item_id),
+        sale_id: Set(None),
+        installment_sale_id: Set(Some(header.id)),
+        movement_type: Set(MovementType::InstallmentSale.as_str().to_owned()),
+        quantity: Set(-input.quantity),
+        reference: Set(Some(reference_no)),
+        balance_after: Set(balance_after),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
+
+    txn.commit().await?;
+    installment_view(conn, header).await
+}
+
+#[tauri::command]
+pub async fn collect_installment_payment(
+    detail_id: i32,
+    amount: Decimal,
+    payment_method: Option<String>,
+) -> CmdResult<InstallmentView> {
+    crate::commands_auth::require_permission(db(), "installment-collect").await?;
+    collect_installment_payment_in(db(), detail_id, amount, payment_method).await
+}
+
+pub(crate) async fn collect_installment_payment_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    detail_id: i32,
+    amount: Decimal,
+    payment_method: Option<String>,
+) -> CmdResult<InstallmentView> {
+    if amount <= Decimal::ZERO {
+        return Err(CmdError::Validation("payment must be greater than zero".into()));
+    }
+    if let Some(method) = payment_method.as_deref() {
+        required(method, "payment method")?;
+    }
+
+    let txn = conn.begin().await?;
+    let due = installment_sale_detail::Entity::find_by_id(detail_id)
+        .filter(installment_sale_detail::Column::DelStatus.eq(LIVE))
+        .one(&txn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("installment due".into()))?;
+    // The header going soft-deleted closes the plan; collecting against a closed
+    // plan would take money for a sale that no longer exists.
+    let header = installment_sale::Entity::find_by_id(due.installment_sale_id)
+        .filter(installment_sale::Column::DelStatus.eq(LIVE))
+        .one(&txn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("installment sale".into()))?;
+
+    // Refused, not applied to the next due: an overpayment is change the cashier
+    // holds, same rule as tenders above the total at the till.
+    let outstanding = due.amount - due.paid_amount;
+    if amount > outstanding {
+        return Err(CmdError::Validation(format!(
+            "that due has {outstanding} outstanding, not {amount}"
+        )));
+    }
+
+    let paid = due.paid_amount + amount;
+    let fully_paid = paid >= due.amount;
+    let mut due_am: installment_sale_detail::ActiveModel = due.into();
+    due_am.paid_amount = Set(paid);
+    if fully_paid {
+        due_am.paid_date = Set(Some(crate::migration::now()));
+    }
+    due_am.payment_method = Set(payment_method);
+    due_am.update(&txn).await?;
+
+    txn.commit().await?;
+    installment_view(conn, header).await
+}
+
+/// A credit sale row with the customer and item named, so the list shows no ids.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallmentSummary {
+    pub id: i32,
+    pub reference_no: String,
+    pub customer_id: i32,
+    pub customer_name: Option<String>,
+    pub item_name: String,
+    pub total: Decimal,
+    pub paid_total: Decimal,
+    pub due_total: Decimal,
+    pub status: String,
+    pub created_at: NaiveDateTime,
+}
+
+#[tauri::command]
+pub async fn list_installments(
+    customer_id: Option<i32>,
+    query: PageQuery,
+) -> CmdResult<Page<InstallmentSummary>> {
+    crate::commands_auth::require_permission(db(), "installment-list").await?;
+    list_installments_in(db(), customer_id, &query).await
+}
+
+pub async fn list_installments_in<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: Option<i32>,
+    query: &PageQuery,
+) -> CmdResult<Page<InstallmentSummary>> {
+    let mut q = installment_sale::Entity::find()
+        .filter(installment_sale::Column::DelStatus.eq(LIVE));
+    if let Some(customer_id) = customer_id {
+        q = q.filter(installment_sale::Column::CustomerId.eq(customer_id));
+    }
+
+    let total = q.clone().count(conn).await?;
+    let rows = q
+        .order_by_desc(installment_sale::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+
+    // One query for the names on the page rather than one per row.
+    let customer_ids: Vec<i32> = rows.iter().map(|r| r.customer_id).collect();
+    let customers = customer::Entity::find()
+        .filter(customer::Column::Id.is_in(customer_ids))
+        .all(conn)
+        .await?;
+    let customer_names: std::collections::HashMap<i32, String> =
+        customers.into_iter().map(|c| (c.id, c.name)).collect();
+    let item_ids: Vec<i32> = rows.iter().map(|r| r.item_id).collect();
+    let items = item::Entity::find()
+        .filter(item::Column::Id.is_in(item_ids))
+        .all(conn)
+        .await?;
+    let item_names: std::collections::HashMap<i32, String> =
+        items.into_iter().map(|i| (i.id, i.name)).collect();
+
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let detail_paid: Decimal = installment_sale_detail::Entity::find()
+            .filter(installment_sale_detail::Column::InstallmentSaleId.eq(row.id))
+            .filter(installment_sale_detail::Column::DelStatus.eq(LIVE))
+            .all(conn)
+            .await?
+            .iter()
+            .map(|d| d.paid_amount)
+            .sum();
+        let paid = row.down_payment + detail_paid;
+        let due = (row.total - paid).max(Decimal::ZERO);
+        views.push(InstallmentSummary {
+            id: row.id,
+            reference_no: row.reference_no,
+            customer_id: row.customer_id,
+            customer_name: customer_names.get(&row.customer_id).cloned(),
+            item_name: item_names.get(&row.item_id).cloned().unwrap_or_default(),
+            total: row.total,
+            paid_total: paid,
+            due_total: due,
+            status: if due > Decimal::ZERO { "Active".to_owned() } else { "Completed".to_owned() },
+            created_at: row.created_at,
+        });
+    }
+    Ok(Page::new(views, total, query))
+}
+
+#[tauri::command]
+pub async fn get_installment_sale(id: i32) -> CmdResult<InstallmentView> {
+    crate::commands_auth::require_permission(db(), "installment-show").await?;
+    get_installment_sale_in(db(), id).await
+}
+
+pub async fn get_installment_sale_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+) -> CmdResult<InstallmentView> {
+    let header = installment_sale::Entity::find_by_id(id)
+        .filter(installment_sale::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("installment sale".into()))?;
+    installment_view(conn, header).await
 }
 
 // ---------------------------------------------------------------------------
