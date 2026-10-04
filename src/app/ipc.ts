@@ -440,6 +440,67 @@ export const updateQuotation = (id: number, input: QuotationInput) =>
     call<QuotationView>("update_quotation", { id, input });
 export const deleteQuotation = (id: number) => call<void>("delete_quotation", { id });
 
+export interface PromotionInput {
+    title: string;
+    kind: string;
+    targetItemId?: number | null;
+    rewardItemId?: number | null;
+    percent?: Decimal | null;
+    amount?: Decimal | null;
+    minTotal?: Decimal | null;
+    buyQty?: Decimal | null;
+    getQty?: Decimal | null;
+    /** `YYYY-MM-DD`, inclusive on both ends. */
+    startAt: string;
+    endAt: string;
+}
+
+export interface Promotion {
+    id: number;
+    title: string;
+    kind: string;
+    targetItemId: number | null;
+    rewardItemId: number | null;
+    percent: Decimal | null;
+    amount: Decimal | null;
+    minTotal: Decimal | null;
+    buyQty: Decimal | null;
+    getQty: Decimal | null;
+    startAt: Timestamp;
+    endAt: Timestamp;
+    delStatus: DelStatus;
+    createdAt: Timestamp;
+    updatedAt: Timestamp;
+}
+
+/** Closed vocabulary, mirrored from the server. Anything else is refused. */
+export const PROMOTION_KINDS = ["ItemPercent", "ItemFixed", "OrderPercent", "OrderFixed", "BuyGet"] as const;
+
+export const listPromotions = (query: PageQuery = {}) => call<Page<Promotion>>("list_promotions", { query });
+export const getPromotion = (id: number) => call<Promotion>("get_promotion", { id });
+export const createPromotion = (input: PromotionInput) => call<Promotion>("create_promotion", { input });
+export const updatePromotion = (id: number, input: PromotionInput) =>
+    call<Promotion>("update_promotion", { id, input });
+export const deletePromotion = (id: number) => call<void>("delete_promotion", { id });
+
+export interface ComboItemInput {
+    comboItemId: number;
+    itemId: number;
+    quantity: Decimal;
+}
+
+export interface ComboItem {
+    id: number;
+    comboItemId: number;
+    itemId: number;
+    quantity: Decimal;
+}
+
+export const listComboItems = (comboItemId: number | null, query: PageQuery = {}) =>
+    call<Page<ComboItem>>("list_combo_items", { comboItemId, query });
+export const createComboItem = (input: ComboItemInput) => call<ComboItem>("create_combo_item", { input });
+export const deleteComboItem = (id: number) => call<void>("delete_combo_item", { id });
+
 export interface BookingInput {
     customerId: number;
     serviceSellerId?: number | null;
