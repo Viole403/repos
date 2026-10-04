@@ -5,10 +5,104 @@ import { Input } from "@/components/base/input/input";
 import { Dialog, Modal, ModalOverlay } from "@/components/application/modals/modal";
 import { Table, TableCard } from "@/components/application/table/table";
 import { formatQuantity, formatTimestamp } from "@/app/format";
-import type { StockMovement, StockRow } from "@/app/ipc";
-import { listStock, listStockMovements } from "@/app/ipc";
+import type { BatchRow, StockMovement, StockRow } from "@/app/ipc";
+import { createItemBatch, listItemBatches, listStock, listStockMovements } from "@/app/ipc";
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/**
+ * Lots for a perishable. `is_expired` is computed server-side against today's date
+ * rather than stored, so no flag has to be rewritten at midnight to stay honest — and
+ * a lot expiring *today* is still sellable, which is why the badge reads "expired"
+ * rather than the row being hidden.
+ */
+const BatchPanel = ({ itemId, batches, onChanged }: { itemId: number; batches: BatchRow[]; onChanged: () => void }) => {
+    const [adding, setAdding] = useState(false);
+    const [batchNo, setBatchNo] = useState("");
+    const [expiry, setExpiry] = useState("");
+    const [error, setError] = useState<string | null>(null);
+    const [busy, setBusy] = useState(false);
+
+    const submit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setBusy(true);
+        setError(null);
+        try {
+            await createItemBatch({ itemId, batchNo: batchNo.trim(), expiryDate: expiry.trim() || null });
+            setBatchNo("");
+            setExpiry("");
+            setAdding(false);
+            onChanged();
+        } catch (cause) {
+            setError(messageOf(cause));
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    return (
+        <div className="flex flex-col gap-3">
+            <div className="flex items-center justify-between">
+                <h3 className="text-title-sm font-semibold text-primary">Lots</h3>
+                <Button size="sm" color="secondary" onPress={() => setAdding((open) => !open)}>
+                    {adding ? "Cancel" : "Add lot"}
+                </Button>
+            </div>
+
+            {adding && (
+                <form onSubmit={submit} className="flex flex-col gap-3 rounded-lg bg-secondary px-4 py-4">
+                    {error && <p className="rounded-lg bg-error-secondary px-3 py-2 text-sm text-error-primary">{error}</p>}
+                    <div className="grid gap-3 md:grid-cols-2">
+                        <Input label="Batch number" value={batchNo} onChange={setBatchNo} isRequired />
+                        <Input
+                            label="Expiry date"
+                            type="date"
+                            value={expiry}
+                            onChange={setExpiry}
+                            hint="Blank for a lot that does not expire"
+                        />
+                    </div>
+                    <div className="flex justify-end">
+                        <Button type="submit" size="sm" isLoading={busy} isDisabled={batchNo.trim() === ""}>
+                            Save lot
+                        </Button>
+                    </div>
+                </form>
+            )}
+
+            {batches.length > 0 && (
+                <TableCard.Root>
+                    <Table aria-label="Lots">
+                        <Table.Header>
+                            <Table.Head label="Batch" />
+                            <Table.Head label="Expires" />
+                            <Table.Head label="On hand" />
+                            <Table.Head label="Status" />
+                        </Table.Header>
+                        <Table.Body>
+                            {batches.map((batch) => (
+                                <Table.Row key={batch.batchId} id={batch.batchId}>
+                                    <Table.Cell className="font-medium text-primary">{batch.batchNo}</Table.Cell>
+                                    <Table.Cell className="text-tertiary">{batch.expiryDate ?? "—"}</Table.Cell>
+                                    <Table.Cell className="tabular-nums">{formatQuantity(batch.onHand)}</Table.Cell>
+                                    <Table.Cell>
+                                        {batch.isExpired ? (
+                                            <span className="rounded-md bg-error-secondary px-2 py-0.5 text-sm font-medium text-error-primary">
+                                                Expired
+                                            </span>
+                                        ) : (
+                                            <span className="text-tertiary">OK</span>
+                                        )}
+                                    </Table.Cell>
+                                </Table.Row>
+                            ))}
+                        </Table.Body>
+                    </Table>
+                </TableCard.Root>
+            )}
+        </div>
+    );
+};
 
 /**
  * What is on the shelf, derived from the ledger — never stored, never stale.
@@ -25,6 +119,7 @@ export const Stock = () => {
 
     const [detail, setDetail] = useState<StockRow | null>(null);
     const [movements, setMovements] = useState<StockMovement[]>([]);
+    const [batches, setBatches] = useState<BatchRow[]>([]);
     const [detailError, setDetailError] = useState<string | null>(null);
 
     const perPage = 20;
@@ -51,6 +146,14 @@ export const Stock = () => {
     const openDetail = useCallback(async (row: StockRow) => {
         setDetail(row);
         setDetailError(null);
+        try {
+            // Batches come back empty for the overwhelming majority of items, so a
+            // failure here must not hide the movement history underneath.
+            const lots = await listItemBatches(row.itemId);
+            setBatches(lots.rows);
+        } catch {
+            setBatches([]);
+        }
         try {
             const found = await listStockMovements(row.itemId, { page: 1, perPage: 20 });
             setMovements(found.rows);
@@ -186,6 +289,12 @@ export const Stock = () => {
                                         {detailError}
                                     </p>
                                 )}
+
+                                <BatchPanel
+                                    itemId={detail.itemId}
+                                    batches={batches}
+                                    onChanged={() => void openDetail(detail)}
+                                />
 
                                 <TableCard.Root>
                                     <TableCard.Header title="Movements" description="newest first" />
