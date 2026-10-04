@@ -191,6 +191,22 @@ impl MigrationTrait for Migrations {
                             .to_owned(),
                     )
                     .await?;
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(Sales::Table)
+                            .drop_column(Sales::ApprovedBy)
+                            .to_owned(),
+                    )
+                    .await?;
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(SaleReturns::Table)
+                            .drop_column(SaleReturns::ApprovedBy)
+                            .to_owned(),
+                    )
+                    .await?;
                 let conn = manager.get_connection();
                 for name in APPROVAL_PERMISSIONS {
                     permissions::Entity::delete_many()
@@ -1437,13 +1453,36 @@ async fn loyalty(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 ///
 /// `pin_hash` mirrors `password_hash` (Argon2 PHC string, never on the wire),
 /// because a 4-digit secret stored in cleartext is a gift to anyone who reads
-/// the database file.
+/// the database file. The `approved_by` columns record who authorised a risky
+/// row; plain integers, no FK, so the audit trail outlives account hygiene.
 async fn manager_approvals(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     manager
         .alter_table(
             Table::alter()
                 .table(Users::Table)
                 .add_column(ColumnDef::new(Users::PinHash).string().null().to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    // Who approved the risky row. Plain integer, no FK — same as `created_by` on
+    // the installment and credit-note tables: the audit trail outlives account
+    // hygiene, and a hard link would force a choice between deleting history or
+    // keeping dead accounts.
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Sales::Table)
+                .add_column(ColumnDef::new(Sales::ApprovedBy).integer().null().to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .alter_table(
+            Table::alter()
+                .table(SaleReturns::Table)
+                .add_column(ColumnDef::new(SaleReturns::ApprovedBy).integer().null().to_owned())
                 .to_owned(),
         )
         .await?;
@@ -2641,6 +2680,7 @@ enum SaleReturns {
     Reason,
     RefundedTotal,
     ReturnedBy,
+    ApprovedBy,
     Note,
     CreatedAt,
 }
@@ -2863,6 +2903,7 @@ enum Sales {
     CustomerId,
     OrderType,
     Rounding,
+    ApprovedBy,
     Note,
     CreatedAt,
     UpdatedAt,
