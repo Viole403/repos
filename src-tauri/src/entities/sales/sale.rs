@@ -32,6 +32,8 @@ pub struct Model {
     pub payment_method: String,
     /// No foreign key yet — the customers table arrives with the customer stage.
     pub customer_id: Option<i32>,
+    /// Closed vocabulary (`ORDER_TYPES` in commands): counter, pickup, delivery, online.
+    pub order_type: String,
     pub note: Option<String>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
