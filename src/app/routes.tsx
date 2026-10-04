@@ -10,6 +10,7 @@ import { ItemCategories } from "./screens/ItemCategories";
 import { ItemSubCategories } from "./screens/ItemSubCategories";
 import { Login, SessionLoading } from "./screens/Login";
 import { Setup } from "./screens/Setup";
+import { DatabaseSetup } from "./screens/DatabaseSetup";
 import { Accounts } from "./screens/Accounts";
 import { Roles } from "./screens/Roles";
 import { Sales } from "./screens/Sales";
@@ -112,16 +113,25 @@ const RequireAuth = () => {
     const { status } = useAuth();
 
     if (status === "restoring") return <SessionLoading />;
+    // No database means no session and no data, so every screen would be broken. The
+    // wizard's first step is the only thing worth showing.
+    if (status === "unconfigured") return <Navigate to={LOGIN_PATH} replace />;
     if (status === "anonymous") return <Navigate to={LOGIN_PATH} replace />;
     return <Outlet />;
 };
 
-/** The login route itself: a signed-in operator has no reason to see it. */
+/**
+ * The login route itself: a signed-in operator has no reason to see it.
+ *
+ * This is also where the wizard starts. The database step comes first and only ever
+ * yields to one: the account step cannot run without a database to hold the account.
+ */
 const OnlyAnonymous = () => {
-    const { status, needsSetup } = useAuth();
+    const { status, needsSetup, reload } = useAuth();
 
     if (status === "restoring") return <SessionLoading />;
     if (status === "authenticated") return <Navigate to={HOME_PATH} replace />;
+    if (status === "unconfigured") return <DatabaseSetup onConfigured={reload} />;
     return needsSetup ? <Setup /> : <Login />;
 };
 

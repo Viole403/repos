@@ -394,6 +394,45 @@ const call = async <T>(command: string, args?: Record<string, unknown>): Promise
 
 export const healthCheck = () => call<number>("health_check");
 
+// ------------------------------------------------------- database selection
+
+/**
+ * Which database this install runs on. `unconfigured` is a first run, `error` means
+ * a choice was saved but could not be opened — both mean the wizard's database step
+ * is what the operator has to see.
+ */
+export type DatabaseState = "unconfigured" | "ready" | "error";
+
+export interface DatabaseStatus {
+    state: DatabaseState;
+    /** "sqlite" | "postgres" | "mysql", absent until one is chosen. */
+    backend?: "sqlite" | "postgres" | "mysql";
+    /** The URL with the password replaced, so it is safe to render. */
+    location?: string;
+    message?: string;
+}
+
+export interface DatabaseOption {
+    backend: "sqlite" | "postgres" | "mysql";
+    label: string;
+    detail: string;
+    /** SQLite keeps its file in the app folder, so it asks for no URL. */
+    needsUrl: boolean;
+}
+
+/** A database as typed into the wizard. `url` is omitted for SQLite. */
+export interface DatabaseCandidate {
+    backend: "sqlite" | "postgres" | "mysql";
+    url?: string;
+}
+
+export const databaseStatus = () => call<DatabaseStatus>("database_status");
+export const databaseOptions = () => call<DatabaseOption[]>("database_options");
+export const testDatabaseConnection = (candidate: DatabaseCandidate) =>
+    call<void>("test_database_connection", { candidate });
+export const configureDatabase = (candidate: DatabaseCandidate) =>
+    call<DatabaseStatus>("configure_database", { candidate });
+
 // ---------------------------------------------------------------- auth
 //
 // Permission checks belong on the Rust side — a client-side guard is UI, not a
