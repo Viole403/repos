@@ -39,6 +39,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::Bookings),
             Box::new(Migrations::Promotions),
             Box::new(Migrations::Combos),
+            Box::new(Migrations::SaleOrderType),
         ]
     }
 }
@@ -59,6 +60,7 @@ pub enum Migrations {
     Bookings,
     Promotions,
     Combos,
+    SaleOrderType,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -109,6 +111,7 @@ impl MigrationName for Migrations {
         Migrations::Bookings => "bookings",
         Migrations::Promotions => "promotions",
         Migrations::Combos => "combos",
+        Migrations::SaleOrderType => "sale_order_type",
         }
     }
 }
@@ -131,6 +134,7 @@ impl MigrationTrait for Migrations {
             Migrations::Bookings => bookings(manager).await?,
             Migrations::Promotions => promotions(manager).await?,
             Migrations::Combos => combos(manager).await?,
+            Migrations::SaleOrderType => sale_order_type(manager).await?,
         }
         Ok(())
     }
@@ -138,6 +142,16 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::SaleOrderType => {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(Sales::Table)
+                            .drop_column(Sales::OrderType)
+                            .to_owned(),
+                    )
+                    .await?;
+            }
             Migrations::Combos => {
                 for t in [
                     ComboSales::Table.into_iden(),
@@ -976,6 +990,27 @@ async fn bookings(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// How the sale leaves the shop: counter, pickup, delivery or online. A column on
+/// the sale rather than a master table, like booking status and return reason —
+/// the vocabulary is closed and the commands enforce it.
+async fn sale_order_type(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Sales::Table)
+                .add_column(
+                    ColumnDef::new(Sales::OrderType)
+                        .string()
+                        .not_null()
+                        .default("InStore")
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
+}
+
 /// A catalog bundle and its per-sale explosion record. The bundle sells as one
 /// line at the bundle's price; the components move the stock. `combo_sales` is
 /// the audit of that explosion, so a receipt can name what the bundle contained
@@ -1793,6 +1828,7 @@ enum Sales {
     PaidTotal,
     PaymentMethod,
     CustomerId,
+    OrderType,
     Note,
     CreatedAt,
     UpdatedAt,
