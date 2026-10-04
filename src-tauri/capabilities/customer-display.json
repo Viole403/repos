@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "customer-display",
+  "description": "Capability for the customer-facing mirror window",
+  "windows": ["customer-display"],
+  "permissions": ["core:default", "opener:default"]
+}
