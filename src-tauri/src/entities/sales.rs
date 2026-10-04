@@ -3,6 +3,8 @@
 //! Same one-entity-per-module constraint as `catalog` — see that module's doc
 //! comment.
 
+pub mod quotation;
+pub mod quotation_detail;
 pub mod register;
 pub mod sale;
 pub mod sale_detail;
