@@ -30,6 +30,9 @@ pub struct Model {
     /// back. Both legal, negative is not.
     pub paid_total: Decimal,
     pub payment_method: String,
+    /// `rounded_total - grand_total` for cash sales, so `SUM(rounding)` is what
+    /// round-off gained or cost the till. Zero otherwise.
+    pub rounding: Decimal,
     /// No foreign key yet — the customers table arrives with the customer stage.
     pub customer_id: Option<i32>,
     /// Closed vocabulary (`ORDER_TYPES` in commands): counter, pickup, delivery, online.
