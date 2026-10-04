@@ -162,7 +162,7 @@ mod tests {
     use crate::entities::auth::permissions;
     use crate::entities::auth::users;
     use crate::entities::auth::{role_permissions, roles, user_roles};
-    use crate::entities::catalog::{item, unit};
+    use crate::entities::catalog::{fixed_asset_item, fixed_asset_movement, item, item_batch, item_category, unit};
     use crate::migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use crate::entities::sales::stock_movement::MovementType;
@@ -1423,6 +1423,82 @@ mod tests {
         // nowhere else.
         assert_eq!(customer::Entity::find().count(&db).await.unwrap(), 0);
         assert_eq!(supplier::Entity::find().count(&db).await.unwrap(), 0);
+    }
+
+    /// The MySQL leg of the portability claim. Same shape as the Postgres one and
+    /// for the same reason: `cargo check` cannot see a DDL statement the server
+    /// rejects, and `db.rs` selects the driver from the URL, so MySQL is config
+    /// rather than code — but only a real run proves the migrations execute.
+    ///
+    /// This one earned its place immediately. MySQL and Postgres disagree about
+    /// foreign keys on a column added after the table exists (`ALTER TABLE ... ADD
+    /// FOREIGN KEY` rebuilds the table, and MySQL will not accept a `SET NULL`
+    /// action against the column types sea-query emits), so the `create_foreign_key`
+    /// branch that excludes SQLite has to be checked here rather than assumed.
+    ///
+    /// Skipped (not failed) when the variable is unset, so the default suite still
+    /// needs no database server.
+    #[tokio::test]
+    async fn migrations_apply_to_mysql() {
+        let Ok(url) = std::env::var("REPOS_TEST_MYSQL_URL") else {
+            eprintln!("skipping: REPOS_TEST_MYSQL_URL not set");
+            return;
+        };
+
+        let db = db::connect_to(&url)
+            .await
+            .expect("connect to the test MySQL");
+
+        // Every table the migrations create, read back. A table that failed to
+        // create is the failure this leg exists to catch, so the assertion is on
+        // the schema rather than on business logic.
+        assert_eq!(unit::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(item_category::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(item::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(item_batch::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(fixed_asset_item::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(fixed_asset_movement::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(customer::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(supplier::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(sale::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(sale_detail::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(stock_movement::Entity::find().count(&db).await.unwrap(), 0);
+
+        // DDL applying is not the same as the schema working: `decimal:3` and
+        // `timestamp` both round-trip differently per backend, and a column that
+        // creates fine can still refuse a value. One insert and read of each kind
+        // catches that, which a bare `count(*)` cannot.
+        let now = migration::now();
+        unit::ActiveModel {
+            unit_name: Set("Piece".into()),
+            description: Set(None),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert a unit");
+
+        let item_id = seed_item(&db, "MySQL Widget").await;
+        assert_eq!(item::Entity::find_by_id(item_id).one(&db).await.unwrap().is_some(), true);
+        // `Decimal` must come back at its declared scale, not as a float artifact.
+        assert_eq!(
+            item::Entity::find_by_id(item_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .purchase_price
+                .round_dp(3),
+            Decimal::ZERO
+        );
+
+        // The whole ledger path on a third backend: opening balance then a derived
+        // sum, which is the arithmetic the stock screens depend on.
+        seed_stock(&db, item_id, dec(7)).await;
+        assert_eq!(commands::stock_on_hand_in(&db, item_id).await.unwrap(), dec(7));
     }
 
     #[tokio::test]
