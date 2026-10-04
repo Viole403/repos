@@ -17,6 +17,7 @@ pub struct Model {
     pub generic_name: Option<String>,
     pub description: Option<String>,
     pub category_id: Option<i32>,
+    pub sub_category_id: Option<i32>,
     pub brand_id: Option<i32>,
     pub purchase_unit_id: Option<i32>,
     pub sale_unit_id: Option<i32>,
@@ -47,6 +48,8 @@ pub struct ItemView {
     pub description: Option<String>,
     pub category_id: Option<i32>,
     pub category_name: Option<String>,
+    pub sub_category_id: Option<i32>,
+    pub sub_category_name: Option<String>,
     pub brand_id: Option<i32>,
     pub brand_name: Option<String>,
     pub purchase_unit_id: Option<i32>,
@@ -77,6 +80,12 @@ pub enum Relation {
     )]
     Category,
     #[sea_orm(
+        belongs_to = "super::item_sub_category::Entity",
+        from = "Column::SubCategoryId",
+        to = "super::item_sub_category::Column::Id"
+    )]
+    SubCategory,
+    #[sea_orm(
         belongs_to = "super::unit::Entity",
         from = "Column::PurchaseUnitId",
         to = "super::unit::Column::Id"
@@ -90,9 +99,6 @@ pub enum Relation {
     SaleUnit,
 }
 
-
-
-
 // Inverse relations for the `has_many` declared on brand/category/unit.
 impl Related<super::brand::Entity> for Entity {
     fn to() -> RelationDef {
@@ -103,6 +109,12 @@ impl Related<super::brand::Entity> for Entity {
 impl Related<super::item_category::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Category.def()
+    }
+}
+
+impl Related<super::item_sub_category::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SubCategory.def()
     }
 }
 
