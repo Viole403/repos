@@ -42,6 +42,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::SaleOrderType),
             Box::new(Migrations::Installments),
             Box::new(Migrations::InstallmentStockLink),
+            Box::new(Migrations::InstallmentDownMethod),
         ]
     }
 }
@@ -65,6 +66,7 @@ pub enum Migrations {
     SaleOrderType,
     Installments,
     InstallmentStockLink,
+    InstallmentDownMethod,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -118,6 +120,7 @@ impl MigrationName for Migrations {
         Migrations::SaleOrderType => "sale_order_type",
         Migrations::Installments => "installments",
         Migrations::InstallmentStockLink => "installment_stock_link",
+        Migrations::InstallmentDownMethod => "installment_down_method",
         }
     }
 }
@@ -143,6 +146,7 @@ impl MigrationTrait for Migrations {
             Migrations::SaleOrderType => sale_order_type(manager).await?,
             Migrations::Installments => installments(manager).await?,
             Migrations::InstallmentStockLink => installment_stock_link(manager).await?,
+            Migrations::InstallmentDownMethod => installment_down_method(manager).await?,
         }
         Ok(())
     }
@@ -150,6 +154,16 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::InstallmentDownMethod => {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(InstallmentSales::Table)
+                            .drop_column(InstallmentSales::DownPaymentMethod)
+                            .to_owned(),
+                    )
+                    .await?;
+            }
             Migrations::InstallmentStockLink => {
                 manager
                     .alter_table(
@@ -1084,6 +1098,26 @@ async fn installment_stock_link(manager: &SchemaManager<'_>) -> Result<(), DbErr
     Ok(())
 }
 
+/// The down payment's tender method, so a cash down payment can later count
+/// toward the register's expected cash. Stored beside the amount rather than as
+/// a schedule row, mirroring the reference — which keeps it on the header too.
+async fn installment_down_method(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .alter_table(
+            Table::alter()
+                .table(InstallmentSales::Table)
+                .add_column(
+                    ColumnDef::new(InstallmentSales::DownPaymentMethod)
+                        .string()
+                        .null()
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
+}
+
 /// A credit sale paid off over time: one item handed over now, the balance split
 /// into dated schedule rows. Two tables, not three — the reference's
 /// `InstallmentSalePayment` is never written (only a commented-out read), so the
@@ -1736,6 +1770,7 @@ enum InstallmentSales {
     OtherCharges,
     Total,
     DownPayment,
+    DownPaymentMethod,
     NumberOfInstallments,
     IntervalDays,
     CreatedBy,
