@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::NaiveDateTime;
 use sea_orm::prelude::Decimal;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DbErr,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DbBackend, DbErr,
     EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionSession,
     TransactionTrait,
 };
@@ -6884,6 +6885,23 @@ pub const LOYALTY_KINDS: &[&str] = &["Earn", "Redeem", "Void"];
 /// lands and can hold the rate. A point spends as Rp1 for the same reason.
 pub const LOYALTY_PER_THOUSAND: i64 = 1;
 
+/// `SUM()` over an integer column does not come back as an integer everywhere, and
+/// no single Rust decode type fits all three backends.
+///
+/// Postgres types `SUM(bigint)` as `NUMERIC` to leave room for overflow, and sqlx
+/// refuses to decode `NUMERIC` into `i64`. SQLite returns `INTEGER`, which in turn
+/// refuses to decode into `Decimal`. So the shape is normalized in SQL — but the
+/// cast *target* is not portable either: MySQL's `CAST` accepts `SIGNED`, not
+/// `bigint`, and rejects the Postgres spelling with a syntax error. Hence the
+/// backend argument rather than a fixed name.
+fn points_sum(backend: DbBackend) -> Expr {
+    let target = match backend {
+        DbBackend::MySql => "signed",
+        _ => "bigint",
+    };
+    sea_orm::sea_query::ExprTrait::cast_as(Expr::expr(loyalty_entry::Column::Points.sum()), target)
+}
+
 /// The balance is `SUM(points)` — never the `loyalty_points` column, which stopped
 /// being written when this table arrived. May go negative: a shortfall is signed
 /// debt, not a silent refusal, so the next earn visibly pays it down.
@@ -6893,7 +6911,7 @@ async fn loyalty_points_in<C: ConnectionTrait>(
 ) -> Result<i64, DbErr> {
     let sum = loyalty_entry::Entity::find()
         .select_only()
-        .column_as(loyalty_entry::Column::Points.sum(), "total")
+        .column_as(points_sum(conn.get_database_backend()), "total")
         .filter(loyalty_entry::Column::CustomerId.eq(customer_id))
         .into_tuple::<Option<i64>>()
         .one(conn)
@@ -6962,7 +6980,7 @@ async fn void_loyalty<C: ConnectionTrait>(
 ) -> CmdResult<()> {
     let earned = loyalty_entry::Entity::find()
         .select_only()
-        .column_as(loyalty_entry::Column::Points.sum(), "total")
+        .column_as(points_sum(conn.get_database_backend()), "total")
         .filter(loyalty_entry::Column::CustomerId.eq(customer_id))
         .filter(loyalty_entry::Column::SaleId.eq(Some(sale_id)))
         .filter(loyalty_entry::Column::Kind.eq("Earn"))
