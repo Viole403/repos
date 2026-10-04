@@ -404,6 +404,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: None,
+                order_type: None,
                 payments,
             },
         )
@@ -423,6 +424,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -467,6 +469,7 @@ mod tests {
                 note: None,
                 promote: Some(false),
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -514,6 +517,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -601,6 +605,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -648,6 +653,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -694,6 +700,7 @@ mod tests {
                     note: None,
                     promote: None,
                     customer_id: None,
+                    order_type: None,
                     payments: None,
                 },
             )
@@ -717,6 +724,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                order_type: None,
                 payments: None,
             }
         )
@@ -743,6 +751,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -779,6 +788,7 @@ mod tests {
                 note: None,
                 promote: Some(false),
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -819,6 +829,7 @@ mod tests {
                 note: None,
                 promote: Some(false),
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -848,6 +859,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -912,6 +924,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -1064,6 +1077,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -1107,6 +1121,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -1280,6 +1295,7 @@ mod tests {
                 note: None,
                 promote: None,
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -1533,6 +1549,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: Some(customer),
+                order_type: None,
                 payments: None,
             },
         )
@@ -1568,6 +1585,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: Some(4242),
+                order_type: None,
                 payments: None,
             },
         )
@@ -1604,6 +1622,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -1691,6 +1710,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkout_defaults_to_a_counter_sale() {
+        let db = db::init_for_tests().await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(10)).await;
+
+        let view =
+            sell_one_item(&db, mug, dec(15000), None, None).await.expect("checkout succeeds");
+
+        assert_eq!(view.sale.order_type, "InStore");
+    }
+
+    #[tokio::test]
+    async fn checkout_rejects_an_unknown_order_type() {
+        let db = db::init_for_tests().await;
+        let nail = seed_item(&db, "nail").await;
+        seed_stock(&db, nail, dec(100)).await;
+
+        let err = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![line(nail, dec(1), dec(500))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+                customer_id: None,
+                order_type: Some("DineIn".into()),
+                payments: None,
+            },
+        )
+        .await
+        .expect_err("DineIn is not an order type");
+        assert!(
+            format!("{err}").contains("DineIn is not an order type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sales_list_filters_by_order_type() {
+        let db = db::init_for_tests().await;
+        let rice = seed_item(&db, "rice").await;
+        seed_stock(&db, rice, dec(100)).await;
+        commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![line(rice, dec(1), dec(20000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: None,
+                customer_id: None,
+                order_type: Some("Delivery".into()),
+                payments: None,
+            },
+        )
+        .await
+        .expect("delivery sale");
+        seed_sale(&db, migration::now(), Decimal::new(5_000, 3), None, "Completed").await;
+
+        let page = commands::list_sales_in(
+            &db,
+            &commands::SaleFilter { order_type: Some("Delivery".into()), ..Default::default() },
+            &page_one(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].order_type, "Delivery");
+
+        let all = commands::list_sales_in(&db, &no_filter(), &page_one()).await.unwrap();
+        assert_eq!(all.total, 2, "the filter narrows, it does not hide");
+    }
+
+    #[tokio::test]
+    async fn a_promoted_draft_keeps_its_order_type() {
+        let db = db::init_for_tests().await;
+        let oil = seed_item(&db, "oil").await;
+        seed_stock(&db, oil, dec(10)).await;
+
+        let parked = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![line(oil, dec(1), dec(30000))],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: None,
+                note: None,
+                promote: Some(false),
+                customer_id: None,
+                order_type: Some("Online".into()),
+                payments: None,
+            },
+        )
+        .await
+        .expect("parking succeeds");
+
+        let view = commands::promote_draft_in(&db, parked.sale.id, None, None)
+            .await
+            .expect("promotion succeeds");
+        assert_eq!(view.sale.order_type, "Online", "promoting must not reset the channel");
+    }
+
+    #[tokio::test]
     async fn the_sales_list_is_newest_first() {
         let db = db::init_for_tests().await;
         let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
@@ -1740,6 +1868,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -2022,6 +2151,7 @@ mod tests {
                 note: None,
                 promote: Some(false),
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -2812,6 +2942,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -2928,6 +3059,7 @@ mod tests {
                 note: None,
                 promote: Some(true),
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -2960,6 +3092,7 @@ mod tests {
                 note: None,
                 promote: Some(false),
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )
@@ -3117,6 +3250,7 @@ mod tests {
                 note: None,
                 promote: Some(false),
                 customer_id: None,
+                order_type: None,
                 payments: None,
             },
         )

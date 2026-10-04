@@ -723,6 +723,20 @@ pub async fn list_supplier_payments(supplier_id: i32) -> CmdResult<Vec<supplier_
         .map_err(Into::into)
 }
 
+/// How a sale leaves the shop. Closed vocabulary like booking status: a free-text
+/// field here would split one channel across spellings in every report.
+pub const ORDER_TYPES: &[&str] = &["InStore", "Pickup", "Delivery", "Online"];
+
+/// Omitted or blank means a counter sale — the common case, and the backfill for
+/// every sale written before the column existed.
+fn resolve_order_type(raw: Option<&str>) -> CmdResult<String> {
+    match raw.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok("InStore".to_owned()),
+        Some(order_type) if ORDER_TYPES.contains(&order_type) => Ok(order_type.to_owned()),
+        Some(order_type) => Err(CmdError::Validation(format!("{order_type} is not an order type"))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sales
 // ---------------------------------------------------------------------------
@@ -734,6 +748,10 @@ pub struct SaleFilter {
     pub status: Option<String>,
     #[serde(default)]
     pub customer_id: Option<i32>,
+    /// One of the closed order types. An unknown value matches nothing rather than
+    /// everything — a typo in the URL should not quietly show the full day's sales.
+    #[serde(default)]
+    pub order_type: Option<String>,
     /// Inclusive start of the day, as `YYYY-MM-DD`.
     #[serde(default)]
     pub from: Option<String>,
@@ -790,6 +808,7 @@ pub struct SaleSummary {
     pub payment_method: String,
     pub customer_id: Option<i32>,
     pub customer_name: Option<String>,
+    pub order_type: String,
     pub note: Option<String>,
     pub created_at: NaiveDateTime,
 }
@@ -815,6 +834,12 @@ pub async fn list_sales_in<C: ConnectionTrait>(
     }
     if let Some(customer_id) = filter.customer_id {
         q = q.filter(sale::Column::CustomerId.eq(customer_id));
+    }
+    // Closed vocabulary means no `contains` ambiguity: either it names a channel
+    // or it matches nothing.
+    if let Some(order_type) = filter.order_type.as_deref().map(str::trim).filter(|t| !t.is_empty())
+    {
+        q = q.filter(sale::Column::OrderType.eq(order_type));
     }
     // A bad date is ignored rather than refused: a filter box with a typo should show
     // the unfiltered list, not an error the cashier has to dismiss before seeing sales.
@@ -848,6 +873,7 @@ pub async fn list_sales_in<C: ConnectionTrait>(
             paid_total: row.paid_total,
             payment_method: row.payment_method,
             customer_id: row.customer_id,
+            order_type: row.order_type,
             note: row.note,
             created_at: row.created_at,
         });
@@ -1854,6 +1880,9 @@ pub struct CheckoutInput {
     /// counter and must not be forced through a customer row.
     #[serde(default)]
     pub customer_id: Option<i32>,
+    /// How the sale leaves the shop. Omitted means counter sale.
+    #[serde(default)]
+    pub order_type: Option<String>,
     /// One entry per tender, for a split payment. When present these *replace*
     /// `paid_total` and `payment_method` rather than sitting beside them, so the
     /// figure can only come from one place.
@@ -1977,6 +2006,7 @@ fn validate_checkout(input: &CheckoutInput) -> CmdResult<()> {
     if input.discount_total.is_some_and(|d| d < Decimal::ZERO) {
         return Err(CmdError::Validation("discount total cannot be negative".into()));
     }
+    resolve_order_type(input.order_type.as_deref())?;
     if input.tax_total.is_some_and(|t| t < Decimal::ZERO) {
         return Err(CmdError::Validation("tax total cannot be negative".into()));
     }
@@ -2145,6 +2175,7 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
         Some(raw) if raw.trim().is_empty() => SALE_PAYMENT_DEFAULT.to_owned(),
         Some(raw) => required(raw, "payment method")?,
     };
+    let order_type = resolve_order_type(input.order_type.as_deref())?;
 
     // Resolved inside the transaction so a customer deleted between the check and the
     // insert cannot end up named on a sale. `None` stays `None` — a walk-in sale is the
@@ -2179,6 +2210,7 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
         paid_total: Set(Decimal::ZERO),
         payment_method: Set(payment_method),
         customer_id: Set(customer_id),
+        order_type: Set(order_type),
         note: Set(input.note),
         created_at: Set(now),
         updated_at: Set(now),
@@ -2508,6 +2540,7 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
         note: header.note.clone(),
         promote: None,
         customer_id: None,
+        order_type: None,
         payments: None,
     })?;
     guard_discount_within_subtotal(discount_total, subtotal)?;
