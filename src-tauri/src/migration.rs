@@ -47,6 +47,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::GiftCards),
             Box::new(Migrations::Loyalty),
             Box::new(Migrations::ServiceRatings),
+            Box::new(Migrations::SaleRounding),
         ]
     }
 }
@@ -75,6 +76,7 @@ pub enum Migrations {
     GiftCards,
     Loyalty,
     ServiceRatings,
+    SaleRounding,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -133,6 +135,7 @@ impl MigrationName for Migrations {
         Migrations::GiftCards => "gift_cards",
         Migrations::Loyalty => "loyalty",
         Migrations::ServiceRatings => "service_ratings",
+        Migrations::SaleRounding => "sale_rounding",
         }
     }
 }
@@ -163,6 +166,7 @@ impl MigrationTrait for Migrations {
             Migrations::GiftCards => gift_cards(manager).await?,
             Migrations::Loyalty => loyalty(manager).await?,
             Migrations::ServiceRatings => service_ratings(manager).await?,
+            Migrations::SaleRounding => sale_rounding(manager).await?,
         }
         Ok(())
     }
@@ -170,6 +174,16 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::SaleRounding => {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(Sales::Table)
+                            .drop_column(Sales::Rounding)
+                            .to_owned(),
+                    )
+                    .await?;
+            }
             Migrations::ServiceRatings => {
                 manager
                     .drop_table(Table::drop().table(ServiceRatings::Table).if_exists().to_owned())
@@ -1154,6 +1168,28 @@ async fn installment_stock_link(manager: &SchemaManager<'_>) -> Result<(), DbErr
                 .name("idx_stock_movements_installment_sale_id")
                 .table(StockMovements::Table)
                 .col(StockMovements::InstallmentSaleId)
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Cash round-off, posted on the sale — not into thin air. The reference carries
+/// a `rounding` column but writes 0 unconditionally; here it holds
+/// `rounded_total - grand_total` for cash sales, so `SUM(rounding)` over a period
+/// is exactly what rounding gained or cost the till.
+async fn sale_rounding(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Sales::Table)
+                .add_column(
+                    ColumnDef::new(Sales::Rounding)
+                        .decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE)
+                        .not_null()
+                        .default(0)
+                        .to_owned(),
+                )
                 .to_owned(),
         )
         .await?;
@@ -2638,6 +2674,7 @@ enum Sales {
     PaymentMethod,
     CustomerId,
     OrderType,
+    Rounding,
     Note,
     CreatedAt,
     UpdatedAt,
