@@ -390,6 +390,60 @@ export const listSales = (filter: SaleFilter = {}, query: PageQuery = {}) =>
 export const getSale = (id: number) => call<SaleView>("get_sale", { id });
 export const listSalePayments = (saleId: number) => call<SalePayment[]>("list_sale_payments", { saleId });
 
+export interface ReturnLine {
+    /** Which line of the original sale this reverses. */
+    saleDetailId: number;
+    quantity: Decimal;
+}
+
+export interface ReturnInput {
+    saleId: number;
+    /** Must be one of the closed `RETURN_REASONS` list. */
+    reason: string;
+    note?: string | null;
+    lines: ReturnLine[];
+}
+
+export interface SaleReturnLine {
+    id: number;
+    saleReturnId: number;
+    saleDetailId: number;
+    itemId: number;
+    /** Snapshotted from the sale line, so a rename since does not rewrite it. */
+    itemName: string;
+    quantity: Decimal;
+    unitPrice: Decimal;
+    amount: Decimal;
+}
+
+export interface SaleReturn {
+    id: number;
+    saleId: number;
+    returnNo: string;
+    reason: string;
+    refundedTotal: Decimal;
+    /** The account that authorised it. */
+    returnedBy: number | null;
+    note: string | null;
+    createdAt: Timestamp;
+    lines: SaleReturnLine[];
+    /** Returned by the write path so the till can refresh without a round trip. */
+    stockOnHand: ItemOnHand[];
+}
+
+/** Closed vocabulary, mirrored from the server. The server refuses anything else. */
+export const RETURN_REASONS = [
+    "Damaged",
+    "Wrong item",
+    "Customer changed mind",
+    "Not as described",
+    "Expired",
+    "Other",
+] as const;
+
+export const createReturn = (input: ReturnInput) => call<SaleReturn>("create_return", { input });
+export const listReturns = (saleId?: number | null) => call<SaleReturn[]>("list_returns", { saleId: saleId ?? null });
+
 // ---------------------------------------------------------------- trade
 export interface CustomerView {
     id: number;
