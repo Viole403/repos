@@ -38,6 +38,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::Quotations),
             Box::new(Migrations::Bookings),
             Box::new(Migrations::Promotions),
+            Box::new(Migrations::Combos),
         ]
     }
 }
@@ -57,6 +58,7 @@ pub enum Migrations {
     Quotations,
     Bookings,
     Promotions,
+    Combos,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -106,6 +108,7 @@ impl MigrationName for Migrations {
         Migrations::Quotations => "quotations",
         Migrations::Bookings => "bookings",
         Migrations::Promotions => "promotions",
+        Migrations::Combos => "combos",
         }
     }
 }
@@ -127,6 +130,7 @@ impl MigrationTrait for Migrations {
             Migrations::Quotations => quotations(manager).await?,
             Migrations::Bookings => bookings(manager).await?,
             Migrations::Promotions => promotions(manager).await?,
+            Migrations::Combos => combos(manager).await?,
         }
         Ok(())
     }
@@ -134,6 +138,14 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::Combos => {
+                for t in [
+                    ComboSales::Table.into_iden(),
+                    ComboItems::Table.into_iden(),
+                ] {
+                    manager.drop_table(Table::drop().table(t).if_exists().to_owned()).await?;
+                }
+            }
             Migrations::Promotions => {
                 manager.drop_table(Table::drop().table(Promotions::Table).if_exists().to_owned()).await?;
                 let conn = manager.get_connection();
@@ -964,6 +976,98 @@ async fn bookings(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// A catalog bundle and its per-sale explosion record. The bundle sells as one
+/// line at the bundle's price; the components move the stock. `combo_sales` is
+/// the audit of that explosion, so a receipt can name what the bundle contained
+/// and a return can put the right stock back.
+async fn combos(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(ComboItems::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(ComboItems::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(ComboItems::ComboItemId).integer().not_null())
+                .col(ColumnDef::new(ComboItems::ItemId).integer().not_null())
+                .col(ColumnDef::new(ComboItems::Quantity).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_combo_items_combo")
+                        .from(ComboItems::Table, ComboItems::ComboItemId)
+                        .to(Items::Table, Items::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_combo_items_item")
+                        .from(ComboItems::Table, ComboItems::ItemId)
+                        .to(Items::Table, Items::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .unique()
+                .name("uq_combo_items_pair")
+                .table(ComboItems::Table)
+                .col(ComboItems::ComboItemId)
+                .col(ComboItems::ItemId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(ComboSales::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(ComboSales::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(ComboSales::SaleId).integer().not_null())
+                .col(ColumnDef::new(ComboSales::SaleDetailId).integer().not_null())
+                .col(ColumnDef::new(ComboSales::ComboItemId).integer().not_null())
+                .col(ColumnDef::new(ComboSales::ItemId).integer().not_null())
+                .col(ColumnDef::new(ComboSales::Quantity).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_combo_sales_sale")
+                        .from(ComboSales::Table, ComboSales::SaleId)
+                        .to(Sales::Table, Sales::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_combo_sales_detail")
+                        .from(ComboSales::Table, ComboSales::SaleDetailId)
+                        .to(SaleDetails::Table, SaleDetails::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_combo_sales_detail_id")
+                .table(ComboSales::Table)
+                .col(ComboSales::SaleDetailId)
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
+}
+
 /// Discount rules the till applies by itself. Four kinds, one table: the columns a
 /// kind does not use stay null, and the commands refuse a row whose kind and
 /// columns disagree — a second table would only move that check, not remove it.
@@ -1324,6 +1428,26 @@ async fn permission_catalog(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     }
 
     Ok(())
+}
+
+#[derive(Iden)]
+enum ComboItems {
+    Table,
+    Id,
+    ComboItemId,
+    ItemId,
+    Quantity,
+}
+
+#[derive(Iden)]
+enum ComboSales {
+    Table,
+    Id,
+    SaleId,
+    SaleDetailId,
+    ComboItemId,
+    ItemId,
+    Quantity,
 }
 
 #[derive(Iden)]
