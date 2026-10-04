@@ -8,12 +8,14 @@ import { Input } from "@/components/base/input/input";
 import { Select } from "@/components/base/select/select";
 import type { SelectItemType } from "@/components/base/select/select-shared";
 import { Table, TableCard } from "@/components/application/table/table";
+import { Dialog, Modal, ModalOverlay } from "@/components/application/modals/modal";
 import { CartProvider, cartLineFromItem, cartLineTotal, useCart } from "@/app/cart";
 import type { CartLine } from "@/app/cart";
 import { decAdd, decCompare, decIsPositive, decStep, decSub } from "@/app/decimal";
 import { formatMoney, formatQuantity, toDecimal } from "@/app/format";
 import type { CheckoutInput, Decimal, PaymentLine, SaleView } from "@/app/ipc";
-import { checkout, listCustomers, listItems, openCustomerDisplay, stockOnHand } from "@/app/ipc";
+import { checkout, listCustomers, listItems, openCustomerDisplay, stockOnHand, verifyApprovalPin } from "@/app/ipc";
+import { useAuth } from "@/app/auth";
 import {
     emitDisplay,
     loadTouch,
@@ -116,6 +118,13 @@ const RegisterScreen = () => {
     // the settings table lands — a non-touch pole display must never show dead
     // buttons, and not every lane has a touchscreen.
     const [touch, setTouch] = useState(loadTouch);
+    const { permissions } = useAuth();
+    // A verified manager id for this sale's discount, if the operator could not
+    // approve their own. Cleared with the cart so it never leaks onto the next sale.
+    const [approval, setApproval] = useState<number | null>(null);
+    const [pinOpen, setPinOpen] = useState(false);
+    const [pin, setPin] = useState("");
+    const [pinError, setPinError] = useState<string | null>(null);
 
     // Searched rather than listed: the till needs a handful of regulars, not every
     // customer in the database, and the list is fetched on focus.
@@ -335,6 +344,17 @@ const RegisterScreen = () => {
     const submitSale = useCallback(async () => {
         if (!canCheckout || paidInvalid || splitOver || sale.kind === "saving") return;
 
+        // The backend gates this too — this is the early, friendly prompt rather
+        // than the boundary. Discounts come from promos or line edits; either way
+        // the server checks `approvedBy` before the sale commits.
+        const discounted = lines.some((line) => line.discount !== "0" && line.discount !== "0.000");
+        if (discounted && approval === null && !permissions.includes("sale-approve")) {
+            setPin("");
+            setPinError(null);
+            setPinOpen(true);
+            return;
+        }
+
         const input: CheckoutInput = {
             lines: lines.map((line) => ({
                 itemId: line.itemId,
@@ -355,6 +375,7 @@ const RegisterScreen = () => {
             promote: true,
             customerId: customerKey === "" ? null : Number(customerKey),
             orderType,
+            approvedBy: approval,
         };
 
         setSale({ kind: "saving" });
@@ -365,6 +386,7 @@ const RegisterScreen = () => {
             setNote("");
             setOrderType("InStore");
             setTenders(DEFAULT_TENDERS);
+            setApproval(null);
             // The backend returns the balances it committed, so take those over
             // what was cached, then forget them so the next scan refetches.
             for (const entry of view.stockOnHand) requested.current.delete(entry.itemId);
@@ -380,7 +402,21 @@ const RegisterScreen = () => {
             setSale({ kind: "failed", message: messageOf(error) });
             focusCode();
         }
-    }, [canCheckout, paidInvalid, paidDigits, sale.kind, lines, taxTotal, paymentMethod, orderType, customerKey, split, tenderSum, grandTotal, note, clearCart, focusCode]);
+    }, [canCheckout, paidInvalid, paidDigits, sale.kind, lines, taxTotal, paymentMethod, orderType, customerKey, split, tenderSum, grandTotal, note, clearCart, focusCode, approval, permissions]);
+
+    const submitPin = useCallback(async () => {
+        setPinError(null);
+        try {
+            const approver = await verifyApprovalPin(pin);
+            setApproval(approver.id);
+            setPinOpen(false);
+            setPin("");
+            // Retry with the approval attached — the gate above now passes.
+            await submitSale();
+        } catch (error) {
+            setPinError(messageOf(error));
+        }
+    }, [pin, submitSale]);
 
     /**
      * Parks the cart as a draft: same lines, customer and note, but `promote: false`
@@ -909,6 +945,47 @@ const RegisterScreen = () => {
                     </div>
                 </div>
             </div>
+
+            {pinOpen && (
+                <ModalOverlay isOpen onOpenChange={(open) => !open && setPinOpen(false)}>
+                    <Modal className="max-w-sm">
+                        <Dialog className="p-6">
+                            <div className="flex flex-col gap-4">
+                                <h2 className="text-display-xs font-semibold text-primary">
+                                    Manager approval
+                                </h2>
+                                <p className="text-sm text-tertiary">
+                                    This sale has a discount. Ask a manager to enter their PIN.
+                                </p>
+
+                                {pinError !== null && (
+                                    <p className="rounded-lg bg-error-secondary px-3 py-2 text-sm text-error-primary">
+                                        {pinError}
+                                    </p>
+                                )}
+
+                                <Input
+                                    label="Manager PIN"
+                                    type="password"
+                                    inputMode="numeric"
+                                    value={pin}
+                                    onChange={setPin}
+                                    autoFocus
+                                />
+
+                                <div className="flex justify-end gap-2">
+                                    <Button color="secondary" onPress={() => setPinOpen(false)}>
+                                        Cancel
+                                    </Button>
+                                    <Button color="primary" onPress={() => void submitPin()}>
+                                        Approve
+                                    </Button>
+                                </div>
+                            </div>
+                        </Dialog>
+                    </Modal>
+                </ModalOverlay>
+            )}
         </div>
     );
 };

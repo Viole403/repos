@@ -171,6 +171,8 @@ export interface Sale {
     customerId: number | null;
     orderType: string;
     note: string | null;
+    /** `sale-approve` holder id, when a discount needed one. */
+    approvedBy: number | null;
     createdAt: Timestamp;
     updatedAt: Timestamp;
 }
@@ -234,6 +236,9 @@ export interface CheckoutInput {
     orderType?: string | null;
     /** One entry per tender. When present these replace `paidTotal` and `paymentMethod`. */
     payments?: PaymentLine[] | null;
+    /** `sale-approve` holder id, from `verifyApprovalPin`. Required on a discounted
+     *  sale unless the operator may approve their own. */
+    approvedBy?: number | null;
 }
 
 export interface PaymentLine {
@@ -356,6 +361,8 @@ export const listUsers = () => call<UserView[]>("list_users");
 export const createUser = (input: UserInput) => call<UserView>("create_user", { input });
 export const deleteUser = (id: number) => call<void>("delete_user", { id });
 export const myPermissions = () => call<string[]>("my_permissions");
+export const setUserPin = (userId: number, pin: string) => call<void>("set_user_pin", { userId, pin });
+export const verifyApprovalPin = (pin: string) => call<UserView>("verify_approval_pin", { pin });
 export const listRoles = () => call<RoleView[]>("list_roles");
 export const setUserRole = (userId: number, roleId: number) =>
     call<void>("set_user_role", { userId, roleId });
@@ -567,6 +574,8 @@ export interface ReturnInput {
     reason: string;
     note?: string | null;
     lines: ReturnLine[];
+    /** `sale-approve` holder id, from `verifyApprovalPin`. Always required. */
+    approvedBy?: number | null;
 }
 
 export interface SaleReturnLine {
@@ -589,6 +598,8 @@ export interface SaleReturn {
     refundedTotal: Decimal;
     /** The account that authorised it. */
     returnedBy: number | null;
+    /** `sale-approve` holder id. Always set — returns have no unapproved path. */
+    approvedBy: number | null;
     note: string | null;
     createdAt: Timestamp;
     lines: SaleReturnLine[];

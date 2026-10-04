@@ -9,8 +9,9 @@ import type { SelectItemType } from "@/components/base/select/select-shared";
 import { Dialog, Modal, ModalOverlay } from "@/components/application/modals/modal";
 import { decAdd, decSub } from "@/app/decimal";
 import { formatMoney, formatQuantity, formatTimestamp, toDecimal } from "@/app/format";
-import { createReturn, getSale, listReturns, RETURN_REASONS } from "@/app/ipc";
+import { createReturn, getSale, listReturns, RETURN_REASONS, verifyApprovalPin } from "@/app/ipc";
 import type { Decimal, SaleView, SaleReturn } from "@/app/ipc";
+import { useAuth } from "@/app/auth";
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -30,6 +31,12 @@ export const Returns = () => {
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
     const [reload, setReload] = useState(0);
+    const { permissions } = useAuth();
+    // Verified manager id for this return. Resolved in the same modal step so
+    // the cashier never submits an unapproved return and waits on the error.
+    const [approval, setApproval] = useState<number | null>(null);
+    const [pin, setPin] = useState("");
+    const [pinError, setPinError] = useState<string | null>(null);
 
     const refresh = useCallback(async () => {
         if (!Number.isFinite(saleId)) {
@@ -76,6 +83,17 @@ export const Returns = () => {
         setBusy(true);
         setError(null);
         try {
+            // Returns have no unapproved path — resolve the approver here rather
+            // than submitting and waiting on the server's rejection.
+            let approver = approval;
+            if (approver === null && !permissions.includes("sale-approve")) {
+                const holder = await verifyApprovalPin(pin).catch((cause) => {
+                    setPinError(messageOf(cause));
+                    throw cause;
+                });
+                approver = holder.id;
+                setApproval(holder.id);
+            }
             await createReturn({
                 saleId,
                 reason,
@@ -86,9 +104,13 @@ export const Returns = () => {
                         saleDetailId: Number(detailId),
                         quantity: toDecimal(qty),
                     })),
+                approvedBy: approver,
             });
             setReturning(false);
             setPicked({});
+            setApproval(null);
+            setPin("");
+            setPinError(null);
             setReload((n) => n + 1);
         } catch (cause) {
             setError(messageOf(cause));
@@ -222,6 +244,24 @@ export const Returns = () => {
                                         }
                                     />
                                 ))}
+
+                                {!permissions.includes("sale-approve") && (
+                                    <>
+                                        <Input
+                                            label="Manager PIN"
+                                            type="password"
+                                            inputMode="numeric"
+                                            hint="A return always needs a second pair of eyes."
+                                            value={pin}
+                                            onChange={setPin}
+                                        />
+                                        {pinError !== null && (
+                                            <p className="rounded-lg bg-error-secondary px-3 py-2 text-sm text-error-primary">
+                                                {pinError}
+                                            </p>
+                                        )}
+                                    </>
+                                )}
 
                                 <div className="flex justify-end gap-2">
                                     <Button color="secondary" onPress={() => setReturning(false)}>
