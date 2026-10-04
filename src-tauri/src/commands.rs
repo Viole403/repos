@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::db;
 use crate::entities::auth::users;
-use crate::entities::catalog::{brand, item, item_category, item_sub_category, unit};
+use crate::entities::catalog::{brand, item, item_batch, item_category, item_sub_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
 use crate::entities::sales::{booking, combo_item, combo_sale, credit_note, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, loyalty_entry, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, service_rating, servicing, stock_movement, warranty};
@@ -2365,6 +2365,10 @@ pub struct StockMoveInput {
     pub item_id: i32,
     pub quantity: Decimal,
     pub reference: Option<String>,
+    /// Which lot this quantity belongs to, when the item is tracked by batch.
+    /// Null is the ordinary case and means untracked stock.
+    #[serde(default)]
+    pub batch_id: Option<i32>,
 }
 
 /// The item must be live: dead catalog rows take no stock.
@@ -2386,12 +2390,28 @@ async fn append_stock_row<C: ConnectionTrait>(
     quantity: Decimal,
     reference: Option<String>,
 ) -> CmdResult<stock_movement::Model> {
+    append_batch_stock_row(conn, item_id, None, movement, quantity, reference).await
+}
+
+async fn append_batch_stock_row<C: ConnectionTrait>(
+    conn: &C,
+    item_id: i32,
+    batch_id: Option<i32>,
+    movement: MovementType,
+    quantity: Decimal,
+    reference: Option<String>,
+) -> CmdResult<stock_movement::Model> {
     guard_stock_item(conn, item_id).await?;
+    // Item-level `balance_after` stays the item's running total even when the
+    // quantity belongs to one lot: the shelf total is what the counter reads, and
+    // the per-lot figure is derived separately when a lot is what is being asked
+    // about.
     let balance_after = on_hand_in(conn, item_id).await? + quantity;
     let now = crate::migration::now();
     Ok(stock_movement::ActiveModel {
         item_id: Set(item_id),
         sale_id: Set(None),
+        batch_id: Set(batch_id),
         movement_type: Set(movement.as_str().to_owned()),
         quantity: Set(quantity),
         reference: Set(reference),
@@ -2401,6 +2421,158 @@ async fn append_stock_row<C: ConnectionTrait>(
     }
     .insert(conn)
     .await?)
+}
+
+/// On-hand for one lot: `SUM(quantity)` over the rows naming it, exactly as
+/// item-level on-hand is derived. Zero for a lot that has never moved.
+pub(crate) async fn batch_on_hand_in<C: ConnectionTrait>(
+    conn: &C,
+    batch_id: i32,
+) -> Result<Decimal, DbErr> {
+    let sum = stock_movement::Entity::find()
+        .select_only()
+        .column_as(stock_movement::Column::Quantity.sum(), "total")
+        .filter(stock_movement::Column::BatchId.eq(batch_id))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten();
+
+    Ok(sum.unwrap_or(Decimal::ZERO).round_dp(MONEY_SCALE))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchInput {
+    pub item_id: i32,
+    pub batch_no: String,
+    /// `YYYY-MM-DD`. Null for a lot with no expiry — a non-perishable that is
+    /// still tracked in lots (a serial-numbered unit, say).
+    pub expiry_date: Option<chrono::NaiveDate>,
+}
+
+#[tauri::command]
+pub async fn create_item_batch(input: BatchInput) -> CmdResult<item_batch::Model> {
+    crate::commands_auth::require_permission(db(), "stock-stock").await?;
+    create_item_batch_in(db(), input).await
+}
+
+pub(crate) async fn create_item_batch_in<C: ConnectionTrait>(
+    conn: &C,
+    input: BatchInput,
+) -> CmdResult<item_batch::Model> {
+    guard_stock_item(conn, input.item_id).await?;
+    let batch_no = required(&input.batch_no, "batch number")?;
+    let existing = item_batch::Entity::find()
+        .filter(item_batch::Column::ItemId.eq(input.item_id))
+        .filter(item_batch::Column::BatchNo.eq(&batch_no))
+        .filter(item_batch::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?;
+    if existing.is_some() {
+        return Err(CmdError::Conflict(format!(
+            "batch '{batch_no}' already exists for this item"
+        )));
+    }
+    let now = crate::migration::now();
+    Ok(item_batch::ActiveModel {
+        item_id: Set(input.item_id),
+        batch_no: Set(batch_no),
+        expiry_date: Set(input.expiry_date),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?)
+}
+
+/// A lot as the shelf reads it: identity, date, derived on-hand, and whether the
+/// date has passed. `is_expired` is computed rather than stored, because a stored
+/// flag would need rewriting every midnight to stay true.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRow {
+    pub batch_id: i32,
+    pub item_id: i32,
+    pub batch_no: String,
+    pub expiry_date: Option<chrono::NaiveDate>,
+    pub on_hand: Decimal,
+    pub is_expired: bool,
+}
+
+#[tauri::command]
+pub async fn list_item_batches(item_id: i32) -> CmdResult<Page<BatchRow>> {
+    crate::commands_auth::require_permission(db(), "stock-stock").await?;
+    list_item_batches_in(db(), item_id).await
+}
+
+pub(crate) async fn list_item_batches_in<C: ConnectionTrait>(
+    conn: &C,
+    item_id: i32,
+) -> CmdResult<Page<BatchRow>> {
+    let rows = item_batch::Entity::find()
+        .filter(item_batch::Column::ItemId.eq(item_id))
+        .filter(item_batch::Column::DelStatus.eq(LIVE))
+        .order_by_asc(item_batch::Column::ExpiryDate)
+        .all(conn)
+        .await?;
+
+    let today = crate::migration::now().date();
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        views.push(BatchRow {
+            batch_id: row.id,
+            item_id: row.item_id,
+            batch_no: row.batch_no,
+            expiry_date: row.expiry_date,
+            on_hand: batch_on_hand_in(conn, row.id).await?,
+            // Strictly before today: a lot expiring today is still sellable today.
+            is_expired: row.expiry_date.is_some_and(|d| d < today),
+        });
+    }
+
+    let total = views.len() as u64;
+    Ok(Page::new(views, total, &PageQuery::default()))
+}
+
+/// Which lots a sale should draw from, earliest expiry first (FEFO).
+///
+/// Expired lots are skipped rather than refused outright: a shop holding both
+/// fresh and expired stock should still be able to sell the fresh units, and
+/// only fails when the *request* cannot be met from what is unexpired. Returns
+/// `None` when the item is not tracked by batch at all, so the caller keeps the
+/// single-movement path it has always used.
+pub(crate) async fn allocate_fefo<C: ConnectionTrait>(
+    conn: &C,
+    item_id: i32,
+    quantity: Decimal,
+) -> CmdResult<Option<Vec<(i32, Decimal)>>> {
+    let page = list_item_batches_in(conn, item_id).await?;
+    if page.rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut remaining = quantity;
+    let mut plan = Vec::new();
+    for row in page.rows.iter().filter(|r| !r.is_expired && r.on_hand > Decimal::ZERO) {
+        if remaining <= Decimal::ZERO {
+            break;
+        }
+        // FEFO order comes from the migration's expiry ordering, so no further sort
+        // is needed here: the earliest-expiring unexpired lot is taken first.
+        let take = row.on_hand.min(remaining);
+        plan.push((row.batch_id, take));
+        remaining -= take;
+    }
+
+    if remaining > Decimal::ZERO {
+        return Err(CmdError::Validation(format!(
+            "item {item_id} has no unexpired stock for {quantity} — {remaining} short"
+        )));
+    }
+    Ok(Some(plan))
 }
 
 #[tauri::command]
@@ -2416,7 +2588,15 @@ pub(crate) async fn record_goods_receipt_in<C: ConnectionTrait>(
     if input.quantity <= Decimal::ZERO {
         return Err(CmdError::Validation("receipt quantity must be greater than zero".into()));
     }
-    append_stock_row(conn, input.item_id, MovementType::GoodsReceipt, input.quantity, input.reference).await
+    append_batch_stock_row(
+        conn,
+        input.item_id,
+        input.batch_id,
+        MovementType::GoodsReceipt,
+        input.quantity,
+        input.reference,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2441,7 +2621,15 @@ pub(crate) async fn record_opening_stock_in<C: ConnectionTrait>(
     if moved > 0 {
         return Err(CmdError::Conflict("opening stock is already recorded for this item".into()));
     }
-    append_stock_row(conn, input.item_id, MovementType::OpeningBalance, input.quantity, input.reference).await
+    append_batch_stock_row(
+        conn,
+        input.item_id,
+        input.batch_id,
+        MovementType::OpeningBalance,
+        input.quantity,
+        input.reference,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2799,6 +2987,57 @@ async fn record_sale_movement<C: ConnectionTrait>(
     Ok(())
 }
 
+/// The sale-side counterpart of `allocate_fefo`: writes one ledger row per lot
+/// drawn on, falling back to a single untracked row when the item has no batches.
+///
+/// One sale line can legitimately span two lots — the early-expiring one does not
+/// have enough on its own — so the row count follows the allocation rather than the
+/// line. `balance_after` stays the item's running total, decremented cumulatively,
+/// so the shelf figure a counter reads is unchanged by lot splitting.
+async fn record_sale_movement_fefo<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    item_id: i32,
+    sale_id: i32,
+    invoice_no: &str,
+    quantity: Decimal,
+    starting_balance: Decimal,
+    now: NaiveDateTime,
+) -> CmdResult<()> {
+    let Some(plan) = allocate_fefo(conn, item_id, quantity).await? else {
+        record_sale_movement(
+            conn,
+            item_id,
+            sale_id,
+            invoice_no,
+            quantity,
+            starting_balance - quantity,
+            now,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let mut remaining = starting_balance;
+    for (batch_id, take) in plan {
+        remaining -= take;
+        stock_movement::ActiveModel {
+            item_id: Set(item_id),
+            sale_id: Set(Some(sale_id)),
+            batch_id: Set(Some(batch_id)),
+            movement_type: Set(MOVEMENT_SALE.as_str().to_owned()),
+            quantity: Set(-take),
+            reference: Set(Some(invoice_no.to_owned())),
+            balance_after: Set(remaining),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// Fold a line's resulting balance into the view's per-item list, so a sale that
 /// lists the same item twice reports one row holding the final balance rather than
 /// two stale ones.
@@ -3014,13 +3253,13 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
                 // same cart sees the earlier line's decrement and cannot oversell between
                 // itself.
                 let balance_after = available - line.quantity;
-                record_sale_movement(
+                record_sale_movement_fefo(
                     &txn,
                     line.item_id,
                     sale_id,
                     &invoice_no,
                     line.quantity,
-                    balance_after,
+                    available,
                     now,
                 )
                 .await?;
@@ -3368,13 +3607,13 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
         }
 
         let balance_after = available - line.quantity;
-        record_sale_movement(
+        record_sale_movement_fefo(
             &txn,
             line.item_id,
             sale_id,
             &header.invoice_no,
             line.quantity,
-            balance_after,
+            available,
             now,
         )
         .await?;

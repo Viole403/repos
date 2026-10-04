@@ -54,6 +54,8 @@ pub fn run() {
             commands::record_opening_stock,
             commands::record_stock_count,
             commands::record_damage,
+            commands::create_item_batch,
+            commands::list_item_batches,
             commands::checkout,
             commands::list_draft_sales,
             commands::promote_draft,
@@ -4534,7 +4536,115 @@ mod tests {
     }
 
     fn stock_move(item_id: i32, quantity: Decimal) -> commands::StockMoveInput {
-        commands::StockMoveInput { item_id, quantity, reference: None }
+        commands::StockMoveInput { item_id, quantity, reference: None, batch_id: None }
+    }
+
+    async fn seed_batch(
+        db: &DatabaseConnection,
+        item_id: i32,
+        batch_no: &str,
+        expiry: Option<chrono::NaiveDate>,
+    ) -> i32 {
+        commands::create_item_batch_in(
+            db,
+            commands::BatchInput { item_id, batch_no: batch_no.to_owned(), expiry_date: expiry },
+        )
+        .await
+        .expect("seed batch")
+        .id
+    }
+
+    #[tokio::test]
+    async fn batch_quantity_is_derived_from_the_ledger_and_never_stored() {
+        let db = db::init_for_tests().await;
+        let syrup = seed_item(&db, "Syrup").await;
+        let lot = seed_batch(&db, syrup, "LOT-1", Some(days_ago(-30).date())).await;
+
+        // The lot starts empty because nothing has moved, not because a column
+        // said zero.
+        assert_eq!(commands::batch_on_hand_in(&db, lot).await.unwrap(), dec(0));
+
+        commands::record_goods_receipt_in(
+            &db,
+            commands::StockMoveInput {
+                item_id: syrup,
+                quantity: dec(20),
+                reference: None,
+                batch_id: Some(lot),
+            },
+        )
+        .await
+        .expect("receipt into the lot");
+        assert_eq!(commands::batch_on_hand_in(&db, lot).await.unwrap(), dec(20));
+        // The item total and the lot total agree — same ledger, two questions.
+        assert_eq!(commands::stock_on_hand_in(&db, syrup).await.unwrap(), dec(20));
+
+        // The same lot number on another product is not a clash.
+        let other = seed_item(&db, "Other Syrup").await;
+        assert!(commands::create_item_batch_in(
+            &db,
+            commands::BatchInput {
+                item_id: other,
+                batch_no: "LOT-1".into(),
+                expiry_date: None,
+            },
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_sale_draws_the_earliest_expiry_first_and_spares_expired_stock() {
+        let db = db::init_for_tests().await;
+        let syrup = seed_item(&db, "Syrup").await;
+        let soon = days_ago(-10).date();
+        let later = days_ago(-90).date();
+        let expired = days_ago(1).date();
+
+        let soon_id = seed_batch(&db, syrup, "SOON", Some(soon)).await;
+        let later_id = seed_batch(&db, syrup, "LATER", Some(later)).await;
+        let dead_id = seed_batch(&db, syrup, "DEAD", Some(expired)).await;
+
+        for (batch_id, qty) in [(soon_id, dec(3)), (later_id, dec(10)), (dead_id, dec(99))] {
+            commands::record_goods_receipt_in(
+                &db,
+                commands::StockMoveInput {
+                    item_id: syrup,
+                    quantity: qty,
+                    reference: None,
+                    batch_id: Some(batch_id),
+                },
+            )
+            .await
+            .expect("receipt");
+        }
+
+        let page = commands::list_item_batches_in(&db, syrup).await.expect("batches");
+        assert!(page.rows.iter().any(|r| r.batch_id == dead_id && r.is_expired));
+        assert!(page.rows.iter().any(|r| r.batch_id == soon_id && !r.is_expired));
+
+        // Two units come out of the lot that expires first; the expired lot is
+        // never touched even though it holds 99 of them.
+        sell_one(&db, syrup, dec(2), dec(100)).await;
+        assert_eq!(commands::batch_on_hand_in(&db, soon_id).await.unwrap(), dec(1));
+        assert_eq!(commands::batch_on_hand_in(&db, later_id).await.unwrap(), dec(10));
+        assert_eq!(commands::batch_on_hand_in(&db, dead_id).await.unwrap(), dec(99));
+
+        // A sale larger than the earliest lot spans into the next one: SOON's last unit
+// goes first, so 4 of these 5 come out of LATER.
+        sell_one(&db, syrup, dec(5), dec(100)).await;
+        assert_eq!(commands::batch_on_hand_in(&db, soon_id).await.unwrap(), dec(0));
+        assert_eq!(commands::batch_on_hand_in(&db, later_id).await.unwrap(), dec(6));
+
+        // Once the unexpired lots are empty, the sale is refused rather than
+        // fulfilled from a dead one.
+        sell_one(&db, syrup, dec(6), dec(100)).await;
+        assert_eq!(commands::batch_on_hand_in(&db, later_id).await.unwrap(), dec(0));
+        assert!(
+            sell_one_item(&db, syrup, dec(100), None, None).await.is_err(),
+            "an expired lot must not sell"
+        );
+        assert_eq!(commands::batch_on_hand_in(&db, dead_id).await.unwrap(), dec(99));
     }
 
     #[tokio::test]
