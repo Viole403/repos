@@ -75,6 +75,7 @@ export interface Item {
     genericName: string | null;
     description: string | null;
     categoryId: number | null;
+    subCategoryId: number | null;
     brandId: number | null;
     purchaseUnitId: number | null;
     saleUnitId: number | null;
@@ -86,6 +87,9 @@ export interface Item {
     alertQuantity: Decimal | null;
     loyaltyPoint: Decimal;
     photo: string | null;
+    parentId: number | null;
+    symbology: string | null;
+    weighed: boolean;
     delStatus: DelStatus;
     createdAt: Timestamp;
     updatedAt: Timestamp;
@@ -101,6 +105,8 @@ export interface ItemView {
     description: string | null;
     categoryId: number | null;
     categoryName: string | null;
+    subCategoryId: number | null;
+    subCategoryName: string | null;
     brandId: number | null;
     brandName: string | null;
     purchaseUnitId: number | null;
@@ -114,6 +120,9 @@ export interface ItemView {
     alertQuantity: Decimal | null;
     loyaltyPoint: Decimal;
     photo: string | null;
+    parentId: number | null;
+    symbology: string | null;
+    weighed: boolean;
 }
 
 export interface UnitInput {
@@ -139,6 +148,7 @@ export interface ItemInput {
     genericName?: string | null;
     description?: string | null;
     categoryId?: number | null;
+    subCategoryId?: number | null;
     brandId?: number | null;
     purchaseUnitId?: number | null;
     saleUnitId?: number | null;
@@ -148,6 +158,63 @@ export interface ItemInput {
     wholeSalePrice?: Decimal | null;
     alertQuantity?: Decimal | null;
     loyaltyPoint?: Decimal;
+    /** Capped data-URI image. A filesystem path would dangle on another machine. */
+    photo?: string | null;
+    /** Variation template. Null means standalone. */
+    parentId?: number | null;
+    /** Barcode symbology. Null means an internal code. */
+    symbology?: string | null;
+    /** Price-per-kg goods: quantity comes from a scale. */
+    weighed?: boolean;
+}
+
+/** Sub-category of a category; owns items through `subCategoryId`. */
+export interface ItemSubCategory {
+    id: number;
+    categoryId: number;
+    name: string;
+    description: string | null;
+    sortId: number;
+    delStatus: DelStatus;
+    createdAt: Timestamp;
+    updatedAt: Timestamp;
+}
+
+export interface ItemSubCategoryInput {
+    categoryId: number;
+    name: string;
+    description?: string | null;
+    sortId?: number;
+}
+
+/** A lot of a perishable. Carries dates only — never a quantity. */
+export interface ItemBatch {
+    id: number;
+    itemId: number;
+    batchNo: string;
+    /** `YYYY-MM-DD`; null for a lot with no expiry. */
+    expiryDate: string | null;
+    delStatus: DelStatus;
+    createdAt: Timestamp;
+    updatedAt: Timestamp;
+}
+
+export interface ItemBatchInput {
+    itemId: number;
+    batchNo: string;
+    expiryDate?: string | null;
+}
+
+/** A batch plus its derived holding, as the shelf reads it. */
+export interface BatchRow {
+    batchId: number;
+    itemId: number;
+    batchNo: string;
+    expiryDate: string | null;
+    /** `SUM(quantity)` over the ledger rows naming this batch. */
+    onHand: Decimal;
+    /** Strictly before today, so a lot expiring today still sells. */
+    isExpired: boolean;
 }
 
 /**
@@ -1109,6 +1176,160 @@ export interface StockRow {
 
 export const listStock = (lowOnly: boolean | null = null, query: PageQuery = {}) =>
     call<Page<StockRow>>("list_stock", { filter: { lowOnly }, query });
+
+export interface StockMoveInput {
+    itemId: number;
+    quantity: Decimal;
+    reference?: string | null;
+    /** Which lot this quantity belongs to; null means untracked stock. */
+    batchId?: number | null;
+}
+
+export const recordGoodsReceipt = (input: StockMoveInput) =>
+    call<StockMovement>("record_goods_receipt", { input });
+
+/** First word only — refused once the item has any history. */
+export const recordOpeningStock = (input: StockMoveInput) =>
+    call<StockMovement>("record_opening_stock", { input });
+
+export interface StockCountInput {
+    itemId: number;
+    /** What the counter saw. The expected figure is never sent. */
+    counted: Decimal;
+    reason: string;
+    note?: string | null;
+}
+
+/** Closed `COUNT_REASONS` vocabulary; a matching count posts nothing. */
+export const recordStockCount = (input: StockCountInput) =>
+    call<StockMovement>("record_stock_count", { input });
+
+export interface DamageInput {
+    itemId: number;
+    quantity: Decimal;
+    note?: string | null;
+}
+
+export const recordDamage = (input: DamageInput) => call<StockMovement>("record_damage", { input });
+
+/** Closed reason vocabulary for stock-count variance. */
+export const COUNT_REASONS = [
+    "Cycle count",
+    "Annual count",
+    "Damaged found",
+    "Theft suspected",
+    "Data correction",
+    "Other",
+] as const;
+
+/** Closed symbology vocabulary. Null means an internal code. */
+export const SYMBOLOGIES = [
+    "EAN-13",
+    "EAN-8",
+    "UPC-A",
+    "CODE-39",
+    "CODE-93",
+    "CODE-128",
+    "CODABAR",
+    "QR",
+] as const;
+
+export const listItemSubCategories = (categoryId: number | null = null, query: PageQuery = {}) =>
+    call<Page<ItemSubCategory>>("list_item_sub_categories", { categoryId, query });
+
+export const createItemSubCategory = (input: ItemSubCategoryInput) =>
+    call<ItemSubCategory>("create_item_sub_category", { input });
+
+export const deleteItemSubCategory = (id: number) => call<void>("delete_item_sub_category", { id });
+
+/**
+ * Resolve a scanned code to exactly one item, or null.
+ *
+ * Whole-string equality, case-insensitively — `listItems` is a substring search,
+ * so a scan of `12345` also returns `123456`. Never pass a search result straight
+ * to the cart from this.
+ */
+export const resolveScan = (code: string) => call<ItemView | null>("resolve_scan", { code });
+
+export const listItemVariations = (parentId: number) =>
+    call<Page<ItemView>>("list_item_variations", { parentId });
+
+export const createItemBatch = (input: ItemBatchInput) => call<ItemBatch>("create_item_batch", { input });
+
+export const listItemBatches = (itemId: number) => call<Page<BatchRow>>("list_item_batches", { itemId });
+
+export interface FixedAsset {
+    id: number;
+    name: string;
+    code: string;
+    description: string | null;
+    purchasePrice: Decimal;
+    salePrice: Decimal;
+    delStatus: DelStatus;
+    createdAt: Timestamp;
+    updatedAt: Timestamp;
+}
+
+export interface FixedAssetInput {
+    name: string;
+    code: string;
+    description?: string | null;
+    purchasePrice?: Decimal;
+    salePrice?: Decimal;
+}
+
+/** An asset plus its derived holdings. Neither figure is stored. */
+export interface FixedAssetRow {
+    assetId: number;
+    name: string;
+    code: string;
+    description: string | null;
+    purchasePrice: Decimal;
+    salePrice: Decimal;
+    /** `SUM(quantity)` over the movement ledger. */
+    onHand: Decimal;
+    /** `SUM(amount)` over arrivals. A disposal does not reduce it. */
+    costBasis: Decimal;
+}
+
+export interface AssetMovement {
+    id: number;
+    assetItemId: number;
+    /** `In` (bought, donated, found) or `Out` (sold, scrapped, written off). */
+    movementKind: string;
+    /** Signed: positive on arrival, negative on departure. */
+    quantity: Decimal;
+    unitPrice: Decimal;
+    /** `quantity * unitPrice`, frozen at write time. */
+    amount: Decimal;
+    referenceNo: string | null;
+    note: string | null;
+    createdAt: Timestamp;
+}
+
+export interface AssetMoveInput {
+    assetId: number;
+    /** Whole units only — a shop does not own two-thirds of a forklift. */
+    quantity: Decimal;
+    unitPrice: Decimal;
+    kind: "In" | "Out";
+    referenceNo?: string | null;
+    note?: string | null;
+}
+
+export const createFixedAsset = (input: FixedAssetInput) =>
+    call<FixedAsset>("create_fixed_asset", { input });
+
+export const listFixedAssets = (query: PageQuery = {}) =>
+    call<Page<FixedAssetRow>>("list_fixed_assets", { query });
+
+export const recordAssetMovement = (input: AssetMoveInput) =>
+    call<AssetMovement>("record_asset_movement", { input });
+
+export const listAssetMovements = (assetId: number, query: PageQuery = {}) =>
+    call<Page<AssetMovement>>("list_asset_movements", { assetId, query });
+
+export const deleteFixedAsset = (id: number) => call<void>("delete_fixed_asset", { id });
 
 /**
  * Writes the sale, its lines and the stock movements as one transaction. The

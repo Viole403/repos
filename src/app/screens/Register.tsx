@@ -14,7 +14,7 @@ import type { CartLine } from "@/app/cart";
 import { decAdd, decCompare, decIsPositive, decStep, decSub } from "@/app/decimal";
 import { formatMoney, formatQuantity, toDecimal } from "@/app/format";
 import type { CheckoutInput, Decimal, PaymentLine, SaleView } from "@/app/ipc";
-import { checkout, listCustomers, listItems, openCustomerDisplay, stockOnHand, verifyApprovalPin } from "@/app/ipc";
+import { checkout, listCustomers, openCustomerDisplay, resolveScan, stockOnHand, verifyApprovalPin } from "@/app/ipc";
 import { useAuth } from "@/app/auth";
 import {
     emitDisplay,
@@ -50,13 +50,6 @@ const ORDER_TYPES: SelectItemType[] = [
     { id: "Delivery", label: "Delivery" },
     { id: "Online", label: "Online" },
 ];
-
-/**
- * A code search can match on name, alternative name or generic name too, so the
- * result set can be long and the exact code can be pushed out of the first page.
- * Ask for the widest page the backend allows and filter locally.
- */
-const LOOKUP_PAGE = 500;
 
 const SHORTCUTS: readonly (readonly [string, string])[] = [
     ["Enter", "Look up the code and add it"],
@@ -168,14 +161,12 @@ const RegisterScreen = () => {
             setLookup({ kind: "searching", code: term });
 
             try {
-                const result = await listItems({ search: term, perPage: LOOKUP_PAGE });
+                // The backend resolves this to exactly one item or nothing. A
+                // substring search would also match `123456` and `Widget 12345`,
+                // and taking the first of those sells the wrong product.
+                const match = await resolveScan(term);
                 if (seq !== lookupSeq.current) return;
 
-                // `search` is a substring match, so a fuzzy hit would put the wrong
-                // product on the shelf. Only the whole code may sell. Compared
-                // case-insensitively because alphanumeric symbologies (Code 39/128)
-                // encode shift state into the barcode itself.
-                const match = result.rows.find((row) => row.code.trim().toLowerCase() === term.toLowerCase());
                 if (!match) {
                     setLookup({ kind: "unknown", code: term });
                     focusCode();
