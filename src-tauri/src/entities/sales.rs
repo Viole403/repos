@@ -20,6 +20,7 @@ pub mod sale_detail;
 pub mod sale_payment;
 pub mod sale_return;
 pub mod sale_return_detail;
+pub mod service_rating;
 pub mod servicing;
 pub mod stock_movement;
 pub mod warranty;

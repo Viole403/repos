@@ -25,7 +25,7 @@ use crate::entities::auth::users;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{booking, combo_item, combo_sale, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, loyalty_entry, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, servicing, stock_movement, warranty};
+use crate::entities::sales::{booking, combo_item, combo_sale, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, loyalty_entry, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, service_rating, servicing, stock_movement, warranty};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -5804,6 +5804,71 @@ pub async fn list_loyalty_in<C: ConnectionTrait>(
         .order_by_asc(loyalty_entry::Column::Id)
         .all(conn)
         .await?)
+}
+
+// ---------------------------------------------------------------------------
+// Service ratings
+// ---------------------------------------------------------------------------
+
+/// The only two answers the mirror offers. One tap, no survey: in-person
+/// point-of-experience collection outperforms email surveys twentyfold, and
+/// anything longer kills the response rate.
+pub const RATING_VALUES: &[&str] = &["Like", "Dislike"];
+
+#[tauri::command]
+pub async fn submit_rating(sale_id: Option<i32>, rating: String) -> CmdResult<service_rating::Model> {
+    crate::commands_auth::require_permission(db(), "rating-submit").await?;
+    submit_rating_in(db(), sale_id, &rating).await
+}
+
+pub(crate) async fn submit_rating_in<C: ConnectionTrait>(
+    conn: &C,
+    sale_id: Option<i32>,
+    rating: &str,
+) -> CmdResult<service_rating::Model> {
+    let rating = rating.trim();
+    if !RATING_VALUES.contains(&rating) {
+        return Err(CmdError::Validation(format!("{rating} is not a rating")));
+    }
+    if let Some(sale_id) = sale_id {
+        sale::Entity::find_by_id(sale_id)
+            .one(conn)
+            .await?
+            .ok_or_else(|| CmdError::NotFound("sale".into()))?;
+        // One-shot per sale: a double tap counts once, and a customer cannot
+        // stuff the ballot for their own visit.
+        if service_rating::Entity::find()
+            .filter(service_rating::Column::SaleId.eq(Some(sale_id)))
+            .one(conn)
+            .await?
+            .is_some()
+        {
+            return Err(CmdError::Conflict("that sale is already rated".into()));
+        }
+    }
+    Ok(service_rating::ActiveModel {
+        sale_id: Set(sale_id),
+        rating: Set(rating.to_owned()),
+        created_at: Set(crate::migration::now()),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?)
+}
+
+#[tauri::command]
+pub async fn list_ratings(query: PageQuery) -> CmdResult<Page<service_rating::Model>> {
+    crate::commands_auth::require_permission(db(), "rating-list").await?;
+    let db = db();
+    let base = service_rating::Entity::find();
+    let total = base.clone().count(db).await?;
+    let rows = base
+        .order_by_desc(service_rating::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(db)
+        .await?;
+    Ok(Page::new(rows, total, &query))
 }
 
 // ---------------------------------------------------------------------------

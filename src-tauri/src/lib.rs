@@ -101,6 +101,8 @@ pub fn run() {
             commands::list_servicings,
             commands::get_servicing,
             commands::list_loyalty,
+            commands::submit_rating,
+            commands::list_ratings,
             commands::sell_gift_card,
             commands::reload_gift_card,
             commands::list_gift_cards,
@@ -2444,6 +2446,32 @@ mod tests {
         .await
         .expect_err("fractional points");
         assert!(format!("{err}").contains("whole points"));
+    }
+
+    #[tokio::test]
+    async fn a_sale_takes_one_rating() {
+        let db = db::init_for_tests().await;
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+        let view = sell_one_item(&db, mug, dec(15000), None, None).await.expect("checkout");
+
+        let row =
+            commands::submit_rating_in(&db, Some(view.sale.id), "Like").await.expect("rated");
+        assert_eq!(row.rating, "Like");
+
+        let err = commands::submit_rating_in(&db, Some(view.sale.id), "Dislike")
+            .await
+            .expect_err("one-shot per sale");
+        assert!(format!("{err}").contains("already rated"));
+    }
+
+    #[tokio::test]
+    async fn a_rating_is_like_or_dislike() {
+        let db = db::init_for_tests().await;
+        let err = commands::submit_rating_in(&db, None, "FiveStars")
+            .await
+            .expect_err("free text is not a rating");
+        assert!(format!("{err}").contains("is not a rating"));
     }
 
     #[tokio::test]
