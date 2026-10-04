@@ -63,6 +63,8 @@ pub fn run() {
             commands::list_sales,
             commands::list_sale_payments,
             commands::get_sale,
+            commands::create_return,
+            commands::list_returns,
             commands::list_customers,
             commands::create_customer,
             commands::update_customer,
@@ -357,6 +359,36 @@ mod tests {
             },
         )
         .await
+    }
+
+    /// A completed sale of one item, returning its sale id and its single line id.
+    async fn sell_one(db: &DatabaseConnection, item_id: i32, quantity: Decimal, price: Decimal) -> (i32, i32) {
+        let view = commands::checkout_in(
+            db,
+            commands::CheckoutInput {
+                lines: vec![commands::CheckoutLine { item_id, quantity, unit_price: price, discount: None }],
+                discount_total: Some(Decimal::ZERO),
+                tax_total: Some(Decimal::ZERO),
+                paid_total: None,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: Some(true),
+                customer_id: None,
+                payments: None,
+            },
+        )
+        .await
+        .expect("checkout");
+        (view.sale.id, view.lines[0].id)
+    }
+
+    fn return_line(sale_detail_id: i32, quantity: Decimal) -> commands::ReturnInput {
+        commands::ReturnInput {
+            sale_id: 0,
+            reason: "Damaged".into(),
+            note: None,
+            lines: vec![commands::ReturnLine { sale_detail_id, quantity }],
+        }
     }
 
     fn line(item_id: i32, quantity: Decimal, unit_price: Decimal) -> CheckoutLine {
@@ -1823,5 +1855,174 @@ mod tests {
 
         assert_eq!(view.sale.paid_total, Decimal::new(40_000, 3));
         assert!(view.sale.paid_total < view.sale.grand_total);
+    }
+
+    #[tokio::test]
+    async fn a_return_puts_the_stock_back() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let (sale_id, line_id) = sell_one(&db, item, Decimal::new(2_000, 3), Decimal::new(25_000, 3)).await;
+        assert_eq!(commands::stock_on_hand_in(&db, item).await.unwrap(), Decimal::new(8_000, 3));
+
+        let mut input = return_line(line_id, Decimal::new(1_000, 3));
+        input.sale_id = sale_id;
+        let view = commands::create_return_in(&db, input, Some(7)).await.expect("return one");
+
+        assert_eq!(
+            view.refunded_total,
+            Decimal::new(25_000, 3),
+            "the refund is the line price times the returned quantity"
+        );
+        assert_eq!(
+            commands::stock_on_hand_in(&db, item).await.unwrap(),
+            Decimal::new(9_000, 3),
+            "the shelf did not grow by what came back"
+        );
+        assert_eq!(view.returned_by, Some(7), "the return records who authorised it");
+        assert!(view.return_no.starts_with("RET-"), "got {}", view.return_no);
+    }
+
+    #[tokio::test]
+    async fn returning_more_than_was_sold_is_refused() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let (sale_id, line_id) = sell_one(&db, item, Decimal::new(2_000, 3), Decimal::new(25_000, 3)).await;
+
+        let mut input = return_line(line_id, Decimal::new(3_000, 3));
+        input.sale_id = sale_id;
+        let err = commands::create_return_in(&db, input, None).await.expect_err("more than was sold");
+
+        assert!(matches!(err, commands::CmdError::Validation(_)), "unexpected error: {err}");
+        assert_eq!(
+            commands::stock_on_hand_in(&db, item).await.unwrap(),
+            Decimal::new(8_000, 3),
+            "a refused return still added stock back"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_partial_returns_cannot_exceed_the_sold_quantity() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let (sale_id, line_id) = sell_one(&db, item, Decimal::new(2_000, 3), Decimal::new(25_000, 3)).await;
+
+        for quantity in [Decimal::new(1_500, 3), Decimal::new(500, 3)] {
+            let mut input = return_line(line_id, quantity);
+            input.sale_id = sale_id;
+            commands::create_return_in(&db, input, None).await.expect("partial return");
+        }
+        // Both halves are back, so nothing is left.
+        assert_eq!(
+            commands::returned_quantity(&db, line_id).await.unwrap(),
+            Decimal::new(2_000, 3)
+        );
+
+        let mut input = return_line(line_id, Decimal::new(1, 3));
+        input.sale_id = sale_id;
+        assert!(
+            commands::create_return_in(&db, input, None).await.is_err(),
+            "a third return hands back stock that was never sold"
+        );
+        assert_eq!(
+            commands::stock_on_hand_in(&db, item).await.unwrap(),
+            Decimal::new(10_000, 3),
+            "the shelf is back to where it started"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_from_another_sale_cannot_be_returned() {
+        let db = db::init_for_tests().await;
+        let first = seed_item(&db, "Widget").await;
+        let second = seed_item(&db, "Gadget").await;
+        seed_stock(&db, first, Decimal::new(10_000, 3)).await;
+        seed_stock(&db, second, Decimal::new(10_000, 3)).await;
+        let (sale_id, _) = sell_one(&db, first, Decimal::new(1_000, 3), Decimal::new(5_000, 3)).await;
+        let (_, other_line) = sell_one(&db, second, Decimal::new(1_000, 3), Decimal::new(5_000, 3)).await;
+
+        let mut input = return_line(other_line, Decimal::new(1_000, 3));
+        input.sale_id = sale_id;
+        assert!(
+            commands::create_return_in(&db, input, None).await.is_err(),
+            "a line from a different sale is returnable against this one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_draft_sale_cannot_be_returned_against() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+
+        let draft = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![commands::CheckoutLine {
+                    item_id: item,
+                    quantity: Decimal::new(1_000, 3),
+                    unit_price: Decimal::new(5_000, 3),
+                    discount: None,
+                }],
+                discount_total: Some(Decimal::ZERO),
+                tax_total: Some(Decimal::ZERO),
+                paid_total: None,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: Some(false),
+                customer_id: None,
+                payments: None,
+            },
+        )
+        .await
+        .expect("a draft");
+
+        let mut input = return_line(draft.lines[0].id, Decimal::new(1_000, 3));
+        input.sale_id = draft.sale.id;
+        assert!(
+            commands::create_return_in(&db, input, None).await.is_err(),
+            "a draft that was never paid is returnable"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_return_reason_is_refused() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let (sale_id, line_id) = sell_one(&db, item, Decimal::new(1_000, 3), Decimal::new(5_000, 3)).await;
+
+        let mut input = return_line(line_id, Decimal::new(1_000, 3));
+        input.sale_id = sale_id;
+        input.reason = "customer was annoyed".into();
+
+        assert!(
+            matches!(
+                commands::create_return_in(&db, input, None).await,
+                Err(commands::CmdError::Validation(ref m)) if m.contains("closed")
+            ),
+            "free text was accepted, so returns cannot be grouped in a report"
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_against_one_sale_accumulate() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let (sale_id, line_id) = sell_one(&db, item, Decimal::new(3_000, 3), Decimal::new(10_000, 3)).await;
+
+        for quantity in [Decimal::new(1_000, 3), Decimal::new(500, 3)] {
+            let mut input = return_line(line_id, quantity);
+            input.sale_id = sale_id;
+            commands::create_return_in(&db, input, None).await.expect("partial return");
+        }
+
+        let listed = commands::list_returns_in(&db, Some(sale_id)).await.unwrap();
+        assert_eq!(listed.len(), 2, "both returns are listed against the sale");
+        let refunded: Decimal = listed.iter().map(|r| r.refunded_total).sum();
+        assert_eq!(refunded, Decimal::new(15_000, 3));
     }
 }

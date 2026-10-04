@@ -24,7 +24,7 @@ use crate::db::db;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{sale, sale_detail, sale_payment, stock_movement};
+use crate::entities::sales::{sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -879,6 +879,289 @@ async fn customer_names<C: ConnectionTrait>(
         .all(conn)
         .await?;
     Ok(found.into_iter().map(|c| (c.id, c.name)).collect())
+}
+
+/// One line being handed back.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReturnLine {
+    /// Which line of the original sale this reverses.
+    pub sale_detail_id: i32,
+    /// May be less than what was sold, for a partial return.
+    pub quantity: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReturnInput {
+    pub sale_id: i32,
+    /// A closed vocabulary rather than free text, so returns group in a report.
+    pub reason: String,
+    pub note: Option<String>,
+    pub lines: Vec<ReturnLine>,
+}
+
+/// The `return` reasons a shop needs. A closed set so a report can group them; free
+/// text would need string matching to answer "how much came back because it was broken".
+pub const RETURN_REASONS: &[&str] = &[
+    "Damaged",
+    "Wrong item",
+    "Customer changed mind",
+    "Not as described",
+    "Expired",
+    "Other",
+];
+
+/// A return with its lines and the stock it put back.
+///
+/// The header fields are repeated rather than nested under a `return` key, so the
+/// wire shape matches the table and a screen reads `view.refundedTotal`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReturnView {
+    pub id: i32,
+    pub sale_id: i32,
+    pub return_no: String,
+    pub reason: String,
+    pub refunded_total: Decimal,
+    pub returned_by: Option<i32>,
+    pub note: Option<String>,
+    pub created_at: NaiveDateTime,
+    pub lines: Vec<sale_return_detail::Model>,
+    pub stock_on_hand: Vec<ItemOnHand>,
+}
+
+impl From<sale_return::Model> for ReturnView {
+    fn from(row: sale_return::Model) -> Self {
+        Self {
+            id: row.id,
+            sale_id: row.sale_id,
+            return_no: row.return_no,
+            reason: row.reason,
+            refunded_total: row.refunded_total,
+            returned_by: row.returned_by,
+            note: row.note,
+            created_at: row.created_at,
+            lines: Vec::new(),
+            stock_on_hand: Vec::new(),
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn create_return(input: ReturnInput) -> CmdResult<ReturnView> {
+    crate::commands_auth::require_permission(db(), "sale-create").await?;
+    create_return_in(db(), input, crate::auth::current_user_id()).await
+}
+
+pub async fn create_return_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    input: ReturnInput,
+    returned_by: Option<i32>,
+) -> CmdResult<ReturnView> {
+    let reason = required(&input.reason, "return reason")?;
+    if !RETURN_REASONS.contains(&reason.as_str()) {
+        return Err(CmdError::Validation(format!(
+            "'{reason}' is not a return reason — the list is closed so reports can group them"
+        )));
+    }
+    if input.lines.is_empty() {
+        return Err(CmdError::Validation("a return needs at least one line".into()));
+    }
+
+    let txn = conn.begin().await?;
+
+    let original = sale::Entity::find_by_id(input.sale_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("sale".into()))?;
+    if original.status != SALE_STATUS_COMPLETED {
+        return Err(CmdError::Validation(
+            "only a completed sale can be returned against".into(),
+        ));
+    }
+
+    // Provisional first, for the same reason `sales` does it: the return number is
+    // derived from the primary key this insert produces.
+    let now = crate::migration::now();
+    let header = sale_return::ActiveModel {
+        sale_id: Set(original.id),
+        return_no: Set(provisional_return_no()),
+        reason: Set(reason),
+        refunded_total: Set(Decimal::ZERO),
+        returned_by: Set(returned_by),
+        note: Set(text(input.note.clone())),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
+    let return_id = header.id;
+
+    let mut lines = Vec::with_capacity(input.lines.len());
+    let mut refunded = Decimal::ZERO;
+    let mut touched: Vec<i32> = Vec::new();
+
+    for line in &input.lines {
+        if line.quantity <= Decimal::ZERO {
+            return Err(CmdError::Validation(format!(
+                "return quantity must be greater than zero"
+            )));
+        }
+        let sold = sale_detail::Entity::find_by_id(line.sale_detail_id)
+            .filter(sale_detail::Column::SaleId.eq(original.id))
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                CmdError::Validation(format!(
+                    "line {} does not belong to this sale",
+                    line.sale_detail_id
+                ))
+            })?;
+
+        let already = returned_quantity(&txn, sold.id).await?;
+        let remaining = sold.quantity - already;
+        if line.quantity > remaining {
+            return Err(CmdError::Validation(format!(
+                "{} was sold {} and {} has already come back; only {remaining} left",
+                sold.item_name, sold.quantity, already
+            )));
+        }
+
+        let amount = sold.unit_price * line.quantity;
+        lines.push(
+            sale_return_detail::ActiveModel {
+                sale_return_id: Set(return_id),
+                sale_detail_id: Set(sold.id),
+                item_id: Set(sold.item_id),
+                // Snapshotted from the sale line, so a rename since does not rewrite
+                // what the customer was told they were returning.
+                item_name: Set(sold.item_name.clone()),
+                quantity: Set(line.quantity),
+                unit_price: Set(sold.unit_price),
+                amount: Set(amount),
+                ..Default::default()
+            }
+            .insert(&txn)
+            .await?,
+        );
+        refunded += amount;
+
+        if !touched.contains(&sold.item_id) {
+            touched.push(sold.item_id);
+        }
+    }
+
+    let return_no = return_no_for(return_id);
+    let mut am: sale_return::ActiveModel = header.into();
+    am.return_no = Set(return_no.clone());
+    am.refunded_total = Set(refunded.round_dp(MONEY_SCALE));
+    let return_row = am.update(&txn).await?;
+
+    // Stock comes back: positive quantity, so the shelf grows by exactly what went out.
+    let mut stock_on_hand = Vec::with_capacity(touched.len());
+    for item_id in touched {
+        let quantity: Decimal = lines
+            .iter()
+            .filter(|l| l.item_id == item_id)
+            .map(|l| l.quantity)
+            .sum();
+        let balance_after = on_hand_in(&txn, item_id).await? + quantity;
+        record_return_movement(&txn, item_id, return_id, &return_no, quantity, balance_after, now).await?;
+        stock_on_hand.push(ItemOnHand { item_id, quantity: balance_after });
+    }
+
+    let view = ReturnView { lines, stock_on_hand, ..return_row.into() };
+    // Committed last. Without this the transaction rolls back on `Drop` and the
+    // return, the stock it put back and the ledger row all vanish together.
+    txn.commit().await?;
+
+    Ok(view)
+}
+
+/// How much of a sale line has already come back. Summed, not stored: a stored
+/// counter is a read-modify-write two partial returns can interleave.
+pub async fn returned_quantity<C: ConnectionTrait>(conn: &C, sale_detail_id: i32) -> CmdResult<Decimal> {
+    let sum = sale_return_detail::Entity::find()
+        .select_only()
+        .column_as(sale_return_detail::Column::Quantity.sum(), "total")
+        .filter(sale_return_detail::Column::SaleDetailId.eq(sale_detail_id))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten();
+    Ok(sum.unwrap_or(Decimal::ZERO))
+}
+
+/// The ledger row for goods coming back. Shares nothing with `record_sale_movement` on
+/// purpose: the quantity is positive here, and folding both into one function is how a
+/// sign error gets in.
+async fn record_return_movement<C: ConnectionTrait>(
+    conn: &C,
+    item_id: i32,
+    return_id: i32,
+    return_no: &str,
+    quantity: Decimal,
+    balance_after: Decimal,
+    now: NaiveDateTime,
+) -> CmdResult<()> {
+    stock_movement::ActiveModel {
+        item_id: Set(item_id),
+        sale_id: Set(None),
+        movement_type: Set(MovementType::SaleReturn.as_str().to_owned()),
+        quantity: Set(quantity),
+        reference: Set(Some(return_no.to_owned())),
+        balance_after: Set(balance_after),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+
+    Ok(())
+}
+
+/// Unique within the process only — the column's own uniqueness comes from the real
+/// number, which is derived from the primary key.
+fn provisional_return_no() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "RET-PENDING-{}-{}",
+        crate::migration::now().timestamp_micros(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn return_no_for(id: i32) -> String {
+    format!("RET-{id:06}")
+}
+
+#[tauri::command]
+pub async fn list_returns(sale_id: Option<i32>) -> CmdResult<Vec<ReturnView>> {
+    crate::commands_auth::require_permission(db(), "sale-list").await?;
+    list_returns_in(db(), sale_id).await
+}
+
+pub async fn list_returns_in<C: ConnectionTrait>(
+    conn: &C,
+    sale_id: Option<i32>,
+) -> CmdResult<Vec<ReturnView>> {
+    let mut q = sale_return::Entity::find();
+    if let Some(id) = sale_id {
+        q = q.filter(sale_return::Column::SaleId.eq(id));
+    }
+    let rows = q.order_by_desc(sale_return::Column::Id).all(conn).await?;
+
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let lines = sale_return_detail::Entity::find()
+            .filter(sale_return_detail::Column::SaleReturnId.eq(row.id))
+            .order_by_asc(sale_return_detail::Column::Id)
+            .all(conn)
+            .await?;
+        views.push(ReturnView { lines, stock_on_hand: Vec::new(), ..row.into() });
+    }
+    Ok(views)
 }
 
 // ---------------------------------------------------------------------------
