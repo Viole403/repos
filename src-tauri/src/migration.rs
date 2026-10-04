@@ -48,6 +48,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::Loyalty),
             Box::new(Migrations::ServiceRatings),
             Box::new(Migrations::SaleRounding),
+            Box::new(Migrations::CreditNotes),
         ]
     }
 }
@@ -77,6 +78,7 @@ pub enum Migrations {
     Loyalty,
     ServiceRatings,
     SaleRounding,
+    CreditNotes,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -136,6 +138,7 @@ impl MigrationName for Migrations {
         Migrations::Loyalty => "loyalty",
         Migrations::ServiceRatings => "service_ratings",
         Migrations::SaleRounding => "sale_rounding",
+        Migrations::CreditNotes => "credit_notes",
         }
     }
 }
@@ -167,6 +170,7 @@ impl MigrationTrait for Migrations {
             Migrations::Loyalty => loyalty(manager).await?,
             Migrations::ServiceRatings => service_ratings(manager).await?,
             Migrations::SaleRounding => sale_rounding(manager).await?,
+            Migrations::CreditNotes => credit_notes(manager).await?,
         }
         Ok(())
     }
@@ -174,6 +178,18 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::CreditNotes => {
+                manager
+                    .drop_table(Table::drop().table(CreditNotes::Table).if_exists().to_owned())
+                    .await?;
+                let conn = manager.get_connection();
+                for name in CREDIT_NOTE_PERMISSIONS {
+                    permissions::Entity::delete_many()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .exec(conn)
+                        .await?;
+                }
+            }
             Migrations::SaleRounding => {
                 manager
                     .alter_table(
@@ -1171,6 +1187,87 @@ async fn installment_stock_link(manager: &SchemaManager<'_>) -> Result<(), DbErr
                 .to_owned(),
         )
         .await?;
+    Ok(())
+}
+
+/// Store credit against a customer, issued from a return. A return reverses one
+/// sale; a credit note settles credit across several: the customer owes less on
+/// *future* sales rather than getting cash back now.
+///
+/// The balance math already counts `customer_receives`, so a note that can be
+/// spent must debit the same figure — it is recorded as a *negative receipt* in
+/// the same table, with the note number as its reference. No new money table,
+/// no second source for what was paid.
+async fn credit_notes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(CreditNotes::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(CreditNotes::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(CreditNotes::CreditNo).string().not_null().unique_key().to_owned())
+                .col(ColumnDef::new(CreditNotes::CustomerId).integer().not_null())
+                .col(ColumnDef::new(CreditNotes::SaleReturnId).integer().null())
+                .col(ColumnDef::new(CreditNotes::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(CreditNotes::AppliedTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(CreditNotes::CreatedBy).integer().null())
+                .col(ColumnDef::new(CreditNotes::Note).string().null())
+                .col(ColumnDef::new(CreditNotes::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(CreditNotes::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_credit_notes_customer")
+                        .from(CreditNotes::Table, CreditNotes::CustomerId)
+                        .to(Customers::Table, Customers::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_credit_notes_return")
+                        .from(CreditNotes::Table, CreditNotes::SaleReturnId)
+                        .to(SaleReturns::Table, SaleReturns::Id)
+                        .on_delete(ForeignKeyAction::SetNull)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_credit_notes_customer_id")
+                .table(CreditNotes::Table)
+                .col(CreditNotes::CustomerId)
+                .to_owned(),
+        )
+        .await?;
+
+    let conn = manager.get_connection();
+    let now = now();
+    for name in CREDIT_NOTE_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        let group = name.split_once('-').map(|(g, _)| g).unwrap_or("creditnote");
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set(group.to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
     Ok(())
 }
 
@@ -2261,6 +2358,28 @@ enum ServiceRatings {
 
 /// Permissions this migration owns, for the down arm above.
 const RATING_PERMISSIONS: &[&str] = &["rating-submit", "rating-list"];
+
+#[derive(Iden)]
+enum CreditNotes {
+    Table,
+    Id,
+    CreditNo,
+    CustomerId,
+    SaleReturnId,
+    Amount,
+    AppliedTotal,
+    CreatedBy,
+    Note,
+    DelStatus,
+    CreatedAt,
+}
+
+/// Permissions this migration owns, for the down arm above.
+const CREDIT_NOTE_PERMISSIONS: &[&str] = &[
+    "creditnote-list",
+    "creditnote-issue",
+    "creditnote-show",
+];
 
 #[derive(Iden)]
 enum LoyaltyEntries {
