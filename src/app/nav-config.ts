@@ -46,7 +46,7 @@ const allowed = (permissions: string[], permission?: string): boolean =>
     !permission || permissions.length === 0 || permissions.includes(permission);
 
 /** Screens that exist. Anything else in the tree is inert until built. */
-export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/sales/registers", "/sales/quotations", "/sales/bookings", "/sales/promotions", "/sales/installments", "/sales/warranties", "/sales/servicings", "/sales/gift-cards", "/sales/credit-notes", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/catalog/combos", "/settings/accounts", "/settings/roles", "/customers", "/purchase/suppliers", "/sales"]);
+export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/sales/registers", "/sales/quotations", "/sales/bookings", "/sales/promotions", "/sales/installments", "/sales/warranties", "/sales/servicings", "/sales/gift-cards", "/sales/credit-notes", "/stock", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/catalog/combos", "/settings/accounts", "/settings/roles", "/customers", "/purchase/suppliers", "/sales"]);
 
 export const navItems: NavEntry[] = [
     { label: "Dashboard", href: "#/", icon: Home01 },
@@ -85,7 +85,7 @@ export const navItems: NavEntry[] = [
         label: "Stock",
         icon: Truck01,
         items: [
-            { label: "Stock on Hand", href: "#/stock", disabled: true },
+            { label: "Stock on Hand", href: "#/stock" },
             { label: "Stock Counts", href: "#/stock/counts", disabled: true },
             { label: "Transfers", href: "#/stock/transfers", disabled: true },
             { label: "Barcode Settings", href: "#/stock/barcodes", disabled: true },

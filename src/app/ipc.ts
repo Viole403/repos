@@ -1096,6 +1096,20 @@ export const closeRegister = (input: { closingBalance: Decimal; note?: string | 
 export const listStockMovements = (itemId: number, query: PageQuery = {}) => call<Page<StockMovement>>("list_stock_movements", { itemId, query });
 export const stockOnHand = (itemId: number) => call<Decimal>("stock_on_hand", { itemId });
 
+/** One catalog row with derived on-hand. The screen displays, never computes. */
+export interface StockRow {
+    itemId: number;
+    itemName: string;
+    itemCode: string;
+    alertQuantity: Decimal | null;
+    onHand: Decimal;
+    /** At or under the alert quantity. False when there is no threshold. */
+    isLow: boolean;
+}
+
+export const listStock = (lowOnly: boolean | null = null, query: PageQuery = {}) =>
+    call<Page<StockRow>>("list_stock", { filter: { lowOnly }, query });
+
 /**
  * Writes the sale, its lines and the stock movements as one transaction. The
  * server recomputes every total and rejects an oversell or a non-positive

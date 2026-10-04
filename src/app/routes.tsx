@@ -27,6 +27,7 @@ import { Warranties } from "./screens/Warranties";
 import { Servicings } from "./screens/Servicings";
 import { GiftCards } from "./screens/GiftCards";
 import { CreditNotes } from "./screens/CreditNotes";
+import { Stock } from "./screens/Stock";
 import { Display } from "./screens/Display";
 import { Combos } from "./screens/Combos";
 import { Units } from "./screens/Units";
@@ -49,6 +50,7 @@ const screens: Record<string, ReactNode> = {
     "/sales/servicings": <Servicings />,
     "/sales/gift-cards": <GiftCards />,
     "/sales/credit-notes": <CreditNotes />,
+    "/stock": <Stock />,
     "/catalog/combos": <Combos />,
     "/catalog/items": <ItemsList />,
     "/catalog/units": <Units />,
