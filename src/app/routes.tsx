@@ -18,6 +18,7 @@ import { Customers } from "./screens/Customers";
 import { Suppliers } from "./screens/Suppliers";
 import { Register } from "./screens/Register";
 import { Drafts } from "./screens/Drafts";
+import { Registers } from "./screens/Registers";
 import { Units } from "./screens/Units";
 import { enabledRoutes, navItems } from "./nav-config";
 
@@ -29,6 +30,7 @@ const screens: Record<string, ReactNode> = {
     "/": <Dashboard />,
     "/pos": <Register />,
     "/sales/holds": <Drafts />,
+    "/sales/registers": <Registers />,
     "/catalog/items": <ItemsList />,
     "/catalog/units": <Units />,
     "/catalog/brands": <Brands />,
