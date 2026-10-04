@@ -53,6 +53,11 @@ pub fn run() {
             commands::list_registers,
             commands::register_summary,
             commands::close_register,
+            commands::create_promotion,
+            commands::list_promotions,
+            commands::get_promotion,
+            commands::update_promotion,
+            commands::delete_promotion,
             commands::create_booking,
             commands::list_bookings,
             commands::get_booking,
@@ -2613,6 +2618,135 @@ mod tests {
         .expect("filtered");
         assert_eq!(filtered.total, 1);
         assert_eq!(filtered.rows[0].status, "Booked");
+    }
+
+    // -----------------------------------------------------------------------
+    // Promotions
+    // -----------------------------------------------------------------------
+
+    fn promo_input(title: &str) -> commands::PromotionInput {
+        commands::PromotionInput {
+            title: title.into(),
+            kind: "ItemPercent".into(),
+            target_item_id: None,
+            reward_item_id: None,
+            percent: Some(Decimal::new(10, 0)),
+            amount: None,
+            min_total: None,
+            buy_qty: None,
+            get_qty: None,
+            start_at: "2026-01-01".into(),
+            end_at: "2026-12-31".into(),
+        }
+    }
+
+    fn promo_item(item_id: i32) -> commands::PromotionInput {
+        let mut input = promo_input("Ten off");
+        input.target_item_id = Some(item_id);
+        input
+    }
+
+    #[tokio::test]
+    async fn create_promotion_stores_a_valid_rule() {
+        let db = db::init_for_tests().await;
+        let widget = seed_item(&db, "Widget").await;
+        let row = commands::create_promotion_in(&db, promo_item(widget))
+            .await
+            .expect("create");
+        assert_eq!(row.kind, "ItemPercent");
+        assert_eq!(row.target_item_id, Some(widget));
+    }
+
+    #[tokio::test]
+    async fn promotion_kind_and_columns_must_agree() {
+        let db = db::init_for_tests().await;
+        let widget = seed_item(&db, "Widget").await;
+
+        // Percent kind carrying a fixed amount: refused, not silently ignored.
+        let mut input = promo_item(widget);
+        input.amount = Some(Decimal::new(5_000, 3));
+        assert!(
+            matches!(
+                commands::create_promotion_in(&db, input).await,
+                Err(commands::CmdError::Validation(_))
+            )
+        );
+
+        // Item kind without an item: refused.
+        let input = promo_input("Nowhere");
+        assert!(
+            matches!(
+                commands::create_promotion_in(&db, input).await,
+                Err(commands::CmdError::Validation(_))
+            )
+        );
+
+        // Unknown kind: refused.
+        let mut input = promo_item(widget);
+        input.kind = "Mystery".into();
+        assert!(
+            matches!(
+                commands::create_promotion_in(&db, input).await,
+                Err(commands::CmdError::Validation(_))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_promotions_on_one_item_are_refused() {
+        let db = db::init_for_tests().await;
+        let widget = seed_item(&db, "Widget").await;
+        commands::create_promotion_in(&db, promo_item(widget))
+            .await
+            .expect("first");
+
+        let mut input = promo_item(widget);
+        input.title = "Overlapping".into();
+        assert!(
+            matches!(
+                commands::create_promotion_in(&db, input).await,
+                Err(commands::CmdError::Conflict(_))
+            )
+        );
+
+        // A disjoint year is fine: the guard is about overlapping dates, not the item.
+        let gadget = seed_item(&db, "Gadget").await;
+        let mut input = promo_item(gadget);
+        input.start_at = "2027-01-01".into();
+        input.end_at = "2027-12-31".into();
+        commands::create_promotion_in(&db, input).await.expect("disjoint");
+    }
+
+    #[tokio::test]
+    async fn update_promotion_excludes_itself_from_the_overlap_check() {
+        let db = db::init_for_tests().await;
+        let widget = seed_item(&db, "Widget").await;
+        let row = commands::create_promotion_in(&db, promo_item(widget))
+            .await
+            .expect("create");
+
+        // Saving unchanged must not trip on itself.
+        let mut input = promo_item(widget);
+        input.title = "Ten off renamed".into();
+        let updated = commands::update_promotion_in(&db, row.id, input).await.expect("update");
+        assert_eq!(updated.title, "Ten off renamed");
+    }
+
+    #[tokio::test]
+    async fn delete_promotion_removes_the_rule() {
+        let db = db::init_for_tests().await;
+        let widget = seed_item(&db, "Widget").await;
+        let row = commands::create_promotion_in(&db, promo_item(widget))
+            .await
+            .expect("create");
+
+        commands::delete_promotion_in(&db, row.id).await.expect("delete");
+        assert!(
+            matches!(
+                commands::delete_promotion_in(&db, row.id).await,
+                Err(commands::CmdError::NotFound(_))
+            )
+        );
     }
 
     #[tokio::test]

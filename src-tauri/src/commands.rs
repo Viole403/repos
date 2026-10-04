@@ -25,7 +25,7 @@ use crate::entities::auth::users;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{booking, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
+use crate::entities::sales::{booking, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -3635,6 +3635,357 @@ pub async fn delete_booking_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResu
     am.del_status = Set(DELETED.to_owned());
     am.updated_at = Set(crate::migration::now());
     am.update(conn).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Promotions
+// ---------------------------------------------------------------------------
+
+pub const PROMOTION_KINDS: &[&str] = &["ItemPercent", "ItemFixed", "OrderPercent", "OrderFixed", "BuyGet"];
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromotionInput {
+    pub title: String,
+    pub kind: String,
+    pub target_item_id: Option<i32>,
+    pub reward_item_id: Option<i32>,
+    pub percent: Option<Decimal>,
+    pub amount: Option<Decimal>,
+    pub min_total: Option<Decimal>,
+    pub buy_qty: Option<Decimal>,
+    pub get_qty: Option<Decimal>,
+    /// `YYYY-MM-DD`, inclusive on both ends.
+    pub start_at: String,
+    pub end_at: String,
+}
+
+fn parse_promo_day(raw: &str) -> CmdResult<NaiveDateTime> {
+    chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .ok_or_else(|| CmdError::Validation(format!("{raw} is not a YYYY-MM-DD date")))
+}
+
+/// A positive decimal or nothing. Zero is not a discount, a threshold, or a
+/// quantity — accepting it would make a rule that never fires and reads as live.
+fn positive(raw: Option<Decimal>, field: &str) -> CmdResult<Option<Decimal>> {
+    match raw {
+        None => Ok(None),
+        Some(v) if v > Decimal::ZERO => Ok(Some(v)),
+        _ => Err(CmdError::Validation(format!("{field} must be greater than zero"))),
+    }
+}
+
+fn non_negative(raw: Option<Decimal>, field: &str) -> CmdResult<Decimal> {
+    match raw {
+        None => Ok(Decimal::ZERO),
+        Some(v) if v >= Decimal::ZERO => Ok(v),
+        _ => Err(CmdError::Validation(format!("{field} cannot be negative"))),
+    }
+}
+
+async fn resolve_promo_item<C: ConnectionTrait>(conn: &C, item_id: i32, field: &str) -> CmdResult<()> {
+    item::Entity::find_by_id(item_id)
+        .filter(item::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound(format!("{field} item {item_id}")))
+        .map(|_| ())
+}
+
+/// The validated shape of one promotion row. Kind and columns must agree — a second
+/// table per kind would only move that check, not remove it.
+struct ResolvedPromotion {
+    kind: &'static str,
+    target_item_id: Option<i32>,
+    reward_item_id: Option<i32>,
+    percent: Option<Decimal>,
+    amount: Option<Decimal>,
+    min_total: Decimal,
+    buy_qty: Option<Decimal>,
+    get_qty: Option<Decimal>,
+    start_at: NaiveDateTime,
+    end_at: NaiveDateTime,
+}
+
+async fn resolve_promotion<C: ConnectionTrait>(conn: &C, input: &PromotionInput) -> CmdResult<ResolvedPromotion> {
+    let title = required(&input.title, "title")?;
+    let _ = title;
+    let kind = match input.kind.trim() {
+        "ItemPercent" => "ItemPercent",
+        "ItemFixed" => "ItemFixed",
+        "OrderPercent" => "OrderPercent",
+        "OrderFixed" => "OrderFixed",
+        "BuyGet" => "BuyGet",
+        other => return Err(CmdError::Validation(format!("{other} is not a promotion kind"))),
+    };
+    // Day bounds are half-open: the end date is fully included, the day after is not.
+    let start_at = parse_promo_day(&input.start_at)?;
+    let end_day = parse_promo_day(&input.end_at)?;
+    let end_at = end_day
+        .checked_add_days(chrono::Days::new(1))
+        .ok_or_else(|| CmdError::Validation("end date is out of range".to_owned()))?;
+    if end_at <= start_at {
+        return Err(CmdError::Validation("the promotion cannot end before it starts".into()));
+    }
+
+    // Columns a kind does not use must stay empty, so a row always means what its
+    // kind says and a report never has to guess which column won.
+    let only = |want: &[&str], name: &str, present: bool| -> CmdResult<()> {
+        if present && !want.contains(&name) {
+            return Err(CmdError::Validation(format!("{name} does not apply to a {kind} promotion")));
+        }
+        Ok(())
+    };
+    let has_target = input.target_item_id.is_some();
+    let has_reward = input.reward_item_id.is_some();
+    let has_percent = input.percent.is_some();
+    let has_amount = input.amount.is_some();
+    let has_min = input.min_total.is_some();
+    let has_buy = input.buy_qty.is_some();
+    let has_get = input.get_qty.is_some();
+
+    let resolved = match kind {
+        "ItemPercent" => {
+            only(&["target", "percent"], "reward_item", has_reward)?;
+            only(&["target", "percent"], "amount", has_amount)?;
+            only(&["target", "percent"], "min_total", has_min)?;
+            only(&["target", "percent"], "buy_qty", has_buy)?;
+            only(&["target", "percent"], "get_qty", has_get)?;
+            let target = input.target_item_id.ok_or_else(|| CmdError::Validation("an item promotion needs an item".into()))?;
+            let percent = positive(input.percent, "percent")?
+                .ok_or_else(|| CmdError::Validation("an item promotion needs a percent".into()))?;
+            if percent > Decimal::new(100, 0) {
+                return Err(CmdError::Validation("percent cannot exceed 100".into()));
+            }
+            resolve_promo_item(conn, target, "target").await?;
+            ResolvedPromotion { kind, target_item_id: Some(target), reward_item_id: None,
+                percent: Some(percent), amount: None, min_total: Decimal::ZERO,
+                buy_qty: None, get_qty: None, start_at, end_at }
+        }
+        "ItemFixed" => {
+            only(&["target", "amount"], "reward_item", has_reward)?;
+            only(&["target", "amount"], "percent", has_percent)?;
+            only(&["target", "amount"], "min_total", has_min)?;
+            only(&["target", "amount"], "buy_qty", has_buy)?;
+            only(&["target", "amount"], "get_qty", has_get)?;
+            let target = input.target_item_id.ok_or_else(|| CmdError::Validation("an item promotion needs an item".into()))?;
+            let amount = positive(input.amount, "amount")?
+                .ok_or_else(|| CmdError::Validation("an item promotion needs an amount".into()))?;
+            resolve_promo_item(conn, target, "target").await?;
+            ResolvedPromotion { kind, target_item_id: Some(target), reward_item_id: None,
+                percent: None, amount: Some(amount), min_total: Decimal::ZERO,
+                buy_qty: None, get_qty: None, start_at, end_at }
+        }
+        "OrderPercent" => {
+            only(&["percent", "min_total"], "target_item", has_target)?;
+            only(&["percent", "min_total"], "reward_item", has_reward)?;
+            only(&["percent", "min_total"], "amount", has_amount)?;
+            only(&["percent", "min_total"], "buy_qty", has_buy)?;
+            only(&["percent", "min_total"], "get_qty", has_get)?;
+            let percent = positive(input.percent, "percent")?
+                .ok_or_else(|| CmdError::Validation("an order promotion needs a percent".into()))?;
+            if percent > Decimal::new(100, 0) {
+                return Err(CmdError::Validation("percent cannot exceed 100".into()));
+            }
+            ResolvedPromotion { kind, target_item_id: None, reward_item_id: None,
+                percent: Some(percent), amount: None, min_total: non_negative(input.min_total, "min_total")?,
+                buy_qty: None, get_qty: None, start_at, end_at }
+        }
+        "OrderFixed" => {
+            only(&["amount", "min_total"], "target_item", has_target)?;
+            only(&["amount", "min_total"], "reward_item", has_reward)?;
+            only(&["amount", "min_total"], "percent", has_percent)?;
+            only(&["amount", "min_total"], "buy_qty", has_buy)?;
+            only(&["amount", "min_total"], "get_qty", has_get)?;
+            let amount = positive(input.amount, "amount")?
+                .ok_or_else(|| CmdError::Validation("an order promotion needs an amount".into()))?;
+            ResolvedPromotion { kind, target_item_id: None, reward_item_id: None,
+                percent: None, amount: Some(amount), min_total: non_negative(input.min_total, "min_total")?,
+                buy_qty: None, get_qty: None, start_at, end_at }
+        }
+        _ => {
+            only(&["target_item", "reward_item", "buy_qty", "get_qty"], "percent", has_percent)?;
+            only(&["target_item", "reward_item", "buy_qty", "get_qty"], "amount", has_amount)?;
+            only(&["target_item", "reward_item", "buy_qty", "get_qty"], "min_total", has_min)?;
+            let target = input.target_item_id.ok_or_else(|| CmdError::Validation("a buy-get promotion needs a buy item".into()))?;
+            let reward = input.reward_item_id.ok_or_else(|| CmdError::Validation("a buy-get promotion needs a free item".into()))?;
+            let buy_qty = positive(input.buy_qty, "buy_qty")?
+                .ok_or_else(|| CmdError::Validation("a buy-get promotion needs a buy quantity".into()))?;
+            let get_qty = positive(input.get_qty, "get_qty")?
+                .ok_or_else(|| CmdError::Validation("a buy-get promotion needs a free quantity".into()))?;
+            resolve_promo_item(conn, target, "buy").await?;
+            resolve_promo_item(conn, reward, "free").await?;
+            ResolvedPromotion { kind, target_item_id: Some(target), reward_item_id: Some(reward),
+                percent: None, amount: None, min_total: Decimal::ZERO,
+                buy_qty: Some(buy_qty), get_qty: Some(get_qty), start_at, end_at }
+        }
+    };
+    Ok(resolved)
+}
+
+/// A live promotion overlapping this one's dates on the same scope. Two discounts
+/// on one item stop being explainable at the till, so the second one is refused
+/// instead of stacked — same reason a manual discount beats a promo at checkout.
+async fn overlapping_promotion<C: ConnectionTrait>(
+    conn: &C,
+    kind: &str,
+    target_item_id: Option<i32>,
+    start_at: NaiveDateTime,
+    end_at: NaiveDateTime,
+    exclude_id: Option<i32>,
+) -> CmdResult<Option<promotion::Model>> {
+    let mut q = promotion::Entity::find()
+        .filter(promotion::Column::DelStatus.eq(LIVE))
+        .filter(promotion::Column::Kind.eq(kind))
+        .filter(promotion::Column::StartAt.lt(end_at))
+        .filter(promotion::Column::EndAt.gt(start_at));
+    // Item promos collide per item; order promos collide with each other outright.
+    // A BuyGet collides on its buy item: two freebies on one trigger is the same
+    // unexplainable stack.
+    if kind == "BuyGet" || kind == "ItemPercent" || kind == "ItemFixed" {
+        let target = target_item_id.ok_or_else(|| CmdError::Validation("promotion has no target item".into()))?;
+        q = q.filter(promotion::Column::TargetItemId.eq(target));
+    }
+    if let Some(id) = exclude_id {
+        q = q.filter(promotion::Column::Id.ne(id));
+    }
+    Ok(q.one(conn).await?)
+}
+
+#[tauri::command]
+pub async fn create_promotion(input: PromotionInput) -> CmdResult<promotion::Model> {
+    crate::commands_auth::require_permission(db(), "promotion-create").await?;
+    create_promotion_in(db(), input).await
+}
+
+pub async fn create_promotion_in<C: ConnectionTrait>(
+    conn: &C,
+    input: PromotionInput,
+) -> CmdResult<promotion::Model> {
+    let title = required(&input.title, "title")?;
+    let r = resolve_promotion(conn, &input).await?;
+    if overlapping_promotion(conn, r.kind, r.target_item_id, r.start_at, r.end_at, None)
+        .await?
+        .is_some()
+    {
+        return Err(CmdError::Conflict("a promotion already covers this item and these dates".into()));
+    }
+    let now = crate::migration::now();
+    Ok(promotion::ActiveModel {
+        title: Set(title),
+        kind: Set(r.kind.to_owned()),
+        target_item_id: Set(r.target_item_id),
+        reward_item_id: Set(r.reward_item_id),
+        percent: Set(r.percent),
+        amount: Set(r.amount),
+        min_total: Set(Some(r.min_total)),
+        buy_qty: Set(r.buy_qty),
+        get_qty: Set(r.get_qty),
+        start_at: Set(r.start_at),
+        end_at: Set(r.end_at),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?)
+}
+
+#[tauri::command]
+pub async fn list_promotions(query: PageQuery) -> CmdResult<Page<promotion::Model>> {
+    crate::commands_auth::require_permission(db(), "promotion-list").await?;
+    list_promotions_in(db(), &query).await
+}
+
+pub async fn list_promotions_in<C: ConnectionTrait>(
+    conn: &C,
+    query: &PageQuery,
+) -> CmdResult<Page<promotion::Model>> {
+    let mut q = promotion::Entity::find().filter(promotion::Column::DelStatus.eq(LIVE));
+    if let Some(term) = query.term() {
+        q = q.filter(promotion::Column::Title.contains(like_term(&term)));
+    }
+    let total = q.clone().count(conn).await?;
+    let rows = q
+        .order_by_desc(promotion::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+    Ok(Page::new(rows, total, query))
+}
+
+#[tauri::command]
+pub async fn get_promotion(id: i32) -> CmdResult<promotion::Model> {
+    crate::commands_auth::require_permission(db(), "promotion-show").await?;
+    promotion::Entity::find_by_id(id)
+        .filter(promotion::Column::DelStatus.eq(LIVE))
+        .one(db())
+        .await?
+        .ok_or_else(|| CmdError::NotFound("promotion".into()))
+}
+
+#[tauri::command]
+pub async fn update_promotion(id: i32, input: PromotionInput) -> CmdResult<promotion::Model> {
+    crate::commands_auth::require_permission(db(), "promotion-edit").await?;
+    update_promotion_in(db(), id, input).await
+}
+
+pub async fn update_promotion_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+    input: PromotionInput,
+) -> CmdResult<promotion::Model> {
+    let found = promotion::Entity::find_by_id(id)
+        .filter(promotion::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("promotion".into()))?;
+    let title = required(&input.title, "title")?;
+    let r = resolve_promotion(conn, &input).await?;
+    if overlapping_promotion(conn, r.kind, r.target_item_id, r.start_at, r.end_at, Some(id))
+        .await?
+        .is_some()
+    {
+        return Err(CmdError::Conflict("a promotion already covers this item and these dates".into()));
+    }
+    let mut am: promotion::ActiveModel = found.into();
+    am.title = Set(title);
+    am.kind = Set(r.kind.to_owned());
+    am.target_item_id = Set(r.target_item_id);
+    am.reward_item_id = Set(r.reward_item_id);
+    am.percent = Set(r.percent);
+    am.amount = Set(r.amount);
+    am.min_total = Set(Some(r.min_total));
+    am.buy_qty = Set(r.buy_qty);
+    am.get_qty = Set(r.get_qty);
+    am.start_at = Set(r.start_at);
+    am.end_at = Set(r.end_at);
+    am.updated_at = Set(crate::migration::now());
+    Ok(am.update(conn).await?)
+}
+
+#[tauri::command]
+pub async fn delete_promotion(id: i32) -> CmdResult<()> {
+    crate::commands_auth::require_permission(db(), "promotion-destroy").await?;
+    delete_promotion_in(db(), id).await
+}
+
+pub async fn delete_promotion_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResult<()> {
+    // Hard delete: a rule carries no money, and past sales record the discount
+    // amount on their lines without pointing back at the rule.
+    let deleted = promotion::Entity::delete_many()
+        .filter(promotion::Column::Id.eq(id))
+        .filter(promotion::Column::DelStatus.eq(LIVE))
+        .exec(conn)
+        .await?;
+    if deleted.rows_affected == 0 {
+        return Err(CmdError::NotFound("promotion".into()));
+    }
     Ok(())
 }
 
