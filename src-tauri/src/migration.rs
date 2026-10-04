@@ -44,6 +44,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::InstallmentStockLink),
             Box::new(Migrations::InstallmentDownMethod),
             Box::new(Migrations::WarrantyAndServicing),
+            Box::new(Migrations::GiftCards),
         ]
     }
 }
@@ -69,6 +70,7 @@ pub enum Migrations {
     InstallmentStockLink,
     InstallmentDownMethod,
     WarrantyAndServicing,
+    GiftCards,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -124,6 +126,7 @@ impl MigrationName for Migrations {
         Migrations::InstallmentStockLink => "installment_stock_link",
         Migrations::InstallmentDownMethod => "installment_down_method",
         Migrations::WarrantyAndServicing => "warranty_and_servicing",
+        Migrations::GiftCards => "gift_cards",
         }
     }
 }
@@ -151,6 +154,7 @@ impl MigrationTrait for Migrations {
             Migrations::InstallmentStockLink => installment_stock_link(manager).await?,
             Migrations::InstallmentDownMethod => installment_down_method(manager).await?,
             Migrations::WarrantyAndServicing => warranty_and_servicing(manager).await?,
+            Migrations::GiftCards => gift_cards(manager).await?,
         }
         Ok(())
     }
@@ -158,6 +162,18 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::GiftCards => {
+                for t in [GiftCardTransactions::Table.into_iden(), GiftCards::Table.into_iden()] {
+                    manager.drop_table(Table::drop().table(t).if_exists().to_owned()).await?;
+                }
+                let conn = manager.get_connection();
+                for name in GIFT_CARD_PERMISSIONS {
+                    permissions::Entity::delete_many()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .exec(conn)
+                        .await?;
+                }
+            }
             Migrations::WarrantyAndServicing => {
                 for t in [Servicings::Table.into_iden(), Warranties::Table.into_iden()] {
                     manager.drop_table(Table::drop().table(t).if_exists().to_owned()).await?;
@@ -1119,6 +1135,104 @@ async fn installment_stock_link(manager: &SchemaManager<'_>) -> Result<(), DbErr
     Ok(())
 }
 
+/// Stored value: a card number with a transaction ledger behind it. The balance is
+/// `SUM(amount)` — never a mutated column — and every row carries `balance_after`
+/// like the stock ledger, so a discrepancy points at one row.
+///
+/// The card number is operator-supplied (printed on the physical card), which is
+/// why it is unique but not derived. Selling or reloading records the tender
+/// method on the row, so the register close can count cash taken for stored
+/// value later. Nothing leaves the shelf, so no stock moves: value is stored,
+/// not goods handed over.
+///
+/// Refund-to-card is still open: it needs a card target on the return flow.
+async fn gift_cards(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(GiftCards::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(GiftCards::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(GiftCards::CardNo).string().not_null().unique_key().to_owned())
+                .col(ColumnDef::new(GiftCards::Pin).string().null())
+                .col(ColumnDef::new(GiftCards::CreatedBy).integer().null())
+                .col(ColumnDef::new(GiftCards::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(GiftCards::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(GiftCardTransactions::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(GiftCardTransactions::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(GiftCardTransactions::GiftCardId).integer().not_null())
+                .col(ColumnDef::new(GiftCardTransactions::SaleId).integer().null())
+                // `Sell`, `Reload` or `Redeem`. Signed `amount`: in is positive.
+                .col(ColumnDef::new(GiftCardTransactions::Kind).string().not_null())
+                .col(ColumnDef::new(GiftCardTransactions::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(GiftCardTransactions::BalanceAfter).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(GiftCardTransactions::PaymentMethod).string().null())
+                .col(ColumnDef::new(GiftCardTransactions::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_gift_card_transactions_card")
+                        .from(GiftCardTransactions::Table, GiftCardTransactions::GiftCardId)
+                        .to(GiftCards::Table, GiftCards::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_gift_card_transactions_sale")
+                        .from(GiftCardTransactions::Table, GiftCardTransactions::SaleId)
+                        .to(Sales::Table, Sales::Id)
+                        .on_delete(ForeignKeyAction::SetNull)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_gift_card_transactions_card_id")
+                .table(GiftCardTransactions::Table)
+                .col(GiftCardTransactions::GiftCardId)
+                .to_owned(),
+        )
+        .await?;
+
+    let conn = manager.get_connection();
+    let now = now();
+    for name in GIFT_CARD_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        let group = name.split_once('-').map(|(g, _)| g).unwrap_or("gift_card");
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set(group.to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Repair tickets and paid repair jobs. A warranty is a product sent back through
 /// the pipeline (customer → vendor → customer); a servicing is a repair the shop
 /// bills for. Both name the product as free text like the reference — the unit on
@@ -1957,6 +2071,38 @@ const INSTALLMENT_PERMISSIONS: &[&str] = &[
     "installment-create",
     "installment-show",
     "installment-collect",
+];
+
+#[derive(Iden)]
+enum GiftCards {
+    Table,
+    Id,
+    CardNo,
+    Pin,
+    CreatedBy,
+    DelStatus,
+    CreatedAt,
+}
+
+#[derive(Iden)]
+enum GiftCardTransactions {
+    Table,
+    Id,
+    GiftCardId,
+    SaleId,
+    Kind,
+    Amount,
+    BalanceAfter,
+    PaymentMethod,
+    CreatedAt,
+}
+
+/// Permissions this migration owns, for the down arm above.
+const GIFT_CARD_PERMISSIONS: &[&str] = &[
+    "giftcard-list",
+    "giftcard-sell",
+    "giftcard-reload",
+    "giftcard-show",
 ];
 
 #[derive(Iden)]
