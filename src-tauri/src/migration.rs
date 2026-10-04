@@ -49,6 +49,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::ServiceRatings),
             Box::new(Migrations::SaleRounding),
             Box::new(Migrations::CreditNotes),
+            Box::new(Migrations::ManagerApprovals),
         ]
     }
 }
@@ -79,6 +80,7 @@ pub enum Migrations {
     ServiceRatings,
     SaleRounding,
     CreditNotes,
+    ManagerApprovals,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -139,6 +141,7 @@ impl MigrationName for Migrations {
         Migrations::ServiceRatings => "service_ratings",
         Migrations::SaleRounding => "sale_rounding",
         Migrations::CreditNotes => "credit_notes",
+        Migrations::ManagerApprovals => "manager_approvals",
         }
     }
 }
@@ -171,6 +174,7 @@ impl MigrationTrait for Migrations {
             Migrations::ServiceRatings => service_ratings(manager).await?,
             Migrations::SaleRounding => sale_rounding(manager).await?,
             Migrations::CreditNotes => credit_notes(manager).await?,
+            Migrations::ManagerApprovals => manager_approvals(manager).await?,
         }
         Ok(())
     }
@@ -178,6 +182,23 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::ManagerApprovals => {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(Users::Table)
+                            .drop_column(Users::PinHash)
+                            .to_owned(),
+                    )
+                    .await?;
+                let conn = manager.get_connection();
+                for name in APPROVAL_PERMISSIONS {
+                    permissions::Entity::delete_many()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .exec(conn)
+                        .await?;
+                }
+            }
             Migrations::CreditNotes => {
                 manager
                     .drop_table(Table::drop().table(CreditNotes::Table).if_exists().to_owned())
@@ -1409,6 +1430,50 @@ async fn loyalty(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// Second pair of eyes for risky till actions. The reference carries a
+/// `discount_permission_code` per user but never checks it at the till; here the
+/// manager's PIN is verified server-side before a discount, return, or price
+/// override commits, and the approver's id is stored on the row.
+///
+/// `pin_hash` mirrors `password_hash` (Argon2 PHC string, never on the wire),
+/// because a 4-digit secret stored in cleartext is a gift to anyone who reads
+/// the database file.
+async fn manager_approvals(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Users::Table)
+                .add_column(ColumnDef::new(Users::PinHash).string().null().to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    let conn = manager.get_connection();
+    let now = now();
+    for name in APPROVAL_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        let group = name.split_once('-').map(|(g, _)| g).unwrap_or("approval");
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set(group.to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Stored value: a card number with a transaction ledger behind it. The balance is
 /// `SUM(amount)` — never a mutated column — and every row carries `balance_after`
 /// like the stock ledger, so a discrepancy points at one row.
@@ -2392,6 +2457,9 @@ enum LoyaltyEntries {
     CreatedAt,
 }
 
+/// Permissions this migration owns, for the down arm above.
+const APPROVAL_PERMISSIONS: &[&str] = &["sale-approve"];
+
 #[derive(Iden)]
 enum GiftCards {
     Table,
@@ -2676,6 +2744,7 @@ enum Users {
     Phone,
     Role,
     Photo,
+    PinHash,
     DelStatus,
     TwoFactorEnabled,
     CreatedAt,
