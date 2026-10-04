@@ -97,7 +97,7 @@ pub fn now() -> NaiveDateTime {
 /// an explicit precision makes sea-query emit `real(18,3)`, which every backend accepts.
 /// The reference casts money to `decimal:3`, so scale 3 is deliberate.
 const DECIMAL_PRECISION: u32 = 18;
-const DECIMAL_SCALE: u32 = 3;
+pub(crate) const DECIMAL_SCALE: u32 = 3;
 
 #[async_trait::async_trait]
 impl MigrationName for Migrations {
@@ -1074,16 +1074,21 @@ async fn installment_stock_link(manager: &SchemaManager<'_>) -> Result<(), DbErr
         .await?;
 
     // SET NULL, not CASCADE: a ledger row outlives the credit sale that caused it.
-    manager
-        .create_foreign_key(
-            ForeignKey::create()
-                .name("fk_stock_movements_installment_sale")
-                .from(StockMovements::Table, StockMovements::InstallmentSaleId)
-                .to(InstallmentSales::Table, InstallmentSales::Id)
-                .on_delete(ForeignKeyAction::SetNull)
-                .to_owned(),
-        )
-        .await?;
+    // SQLite cannot add a foreign key to an existing table at all — sea-query
+    // panics — so only Postgres gets the constraint. The column and the index
+    // apply everywhere; the application always writes a valid id or NULL.
+    if manager.get_database_backend() != sea_orm::DbBackend::Sqlite {
+        manager
+            .create_foreign_key(
+                ForeignKey::create()
+                    .name("fk_stock_movements_installment_sale")
+                    .from(StockMovements::Table, StockMovements::InstallmentSaleId)
+                    .to(InstallmentSales::Table, InstallmentSales::Id)
+                    .on_delete(ForeignKeyAction::SetNull)
+                    .to_owned(),
+            )
+            .await?;
+    }
 
     manager
         .create_index(
