@@ -44,6 +44,7 @@ pub fn run() {
             commands::delete_item,
             commands::list_stock_movements,
             commands::stock_on_hand,
+            commands::list_stock,
             commands::checkout,
             commands::list_draft_sales,
             commands::promote_draft,
@@ -2713,6 +2714,74 @@ mod tests {
             .await
             .expect_err("wrong PIN");
         assert!(format!("{err}").contains("incorrect"));
+    }
+
+    async fn set_alert(db: &DatabaseConnection, item_id: i32, alert: Decimal) {
+        let row = item::Entity::find_by_id(item_id)
+            .one(db)
+            .await
+            .expect("query")
+            .expect("item exists");
+        let mut am: item::ActiveModel = row.into();
+        am.alert_quantity = Set(Some(alert));
+        am.update(db).await.expect("set alert");
+    }
+
+    #[tokio::test]
+    async fn a_stock_list_reports_on_hand_and_low_state() {
+        let db = db::init_for_tests().await;
+        let flour = seed_item(&db, "flour").await;
+        let sugar = seed_item(&db, "sugar").await;
+        seed_stock(&db, flour, dec(3)).await;
+        seed_stock(&db, sugar, dec(50)).await;
+        set_alert(&db, flour, dec(10)).await;
+        set_alert(&db, sugar, dec(10)).await;
+
+        let page = commands::list_stock_in(&db, &commands::StockFilter::default(), &page_one())
+            .await
+            .expect("list stock");
+        assert_eq!(page.total, 2);
+        let flour_row = page.rows.iter().find(|r| r.item_id == flour).expect("flour row");
+        assert_eq!(flour_row.on_hand, dec(3));
+        assert!(flour_row.is_low, "3 at a threshold of 10 is low");
+        let sugar_row = page.rows.iter().find(|r| r.item_id == sugar).expect("sugar row");
+        assert_eq!(sugar_row.on_hand, dec(50));
+        assert!(!sugar_row.is_low);
+    }
+
+    #[tokio::test]
+    async fn a_stock_list_without_a_threshold_has_no_opinion() {
+        let db = db::init_for_tests().await;
+        let bulk = seed_item(&db, "bulk rice").await;
+        seed_stock(&db, bulk, Decimal::ZERO).await;
+
+        let page = commands::list_stock_in(&db, &commands::StockFilter::default(), &page_one())
+            .await
+            .expect("list stock");
+        let row = page.rows.iter().find(|r| r.item_id == bulk).expect("bulk row");
+        assert_eq!(row.on_hand, Decimal::ZERO);
+        assert!(!row.is_low, "zero with no threshold is not low");
+    }
+
+    #[tokio::test]
+    async fn a_low_only_filter_shows_just_the_short_shelf() {
+        let db = db::init_for_tests().await;
+        let low = seed_item(&db, "yeast").await;
+        let fine = seed_item(&db, "salt").await;
+        seed_stock(&db, low, dec(2)).await;
+        seed_stock(&db, fine, dec(100)).await;
+        set_alert(&db, low, dec(5)).await;
+        set_alert(&db, fine, dec(5)).await;
+
+        let page = commands::list_stock_in(
+            &db,
+            &commands::StockFilter { low_only: Some(true) },
+            &page_one(),
+        )
+        .await
+        .expect("low stock");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].item_id, low);
     }
 
     #[tokio::test]

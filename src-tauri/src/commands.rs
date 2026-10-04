@@ -1903,6 +1903,86 @@ pub(crate) async fn stock_on_hand_in<C: ConnectionTrait>(conn: &C, item_id: i32)
     Ok(on_hand_in(conn, item_id).await?)
 }
 
+/// One catalog row with its derived on-hand and low-stock state, so the stock
+/// screen shows numbers without computing any itself.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StockRow {
+    pub item_id: i32,
+    pub item_name: String,
+    pub item_code: String,
+    pub alert_quantity: Option<Decimal>,
+    /// `SUM(quantity)` over the ledger. Never stored, never stale.
+    pub on_hand: Decimal,
+    /// Set only when the item names a threshold and sits at or under it.
+    /// No threshold means no opinion — bulk goods without one are not "low".
+    pub is_low: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StockFilter {
+    /// When true, only rows at or under their alert quantity.
+    #[serde(default)]
+    pub low_only: Option<bool>,
+}
+
+#[tauri::command]
+pub async fn list_stock(filter: StockFilter, query: PageQuery) -> CmdResult<Page<StockRow>> {
+    crate::commands_auth::require_permission(db(), "stock-stock").await?;
+    list_stock_in(db(), &filter, &query).await
+}
+
+pub(crate) async fn list_stock_in<C: ConnectionTrait>(
+    conn: &C,
+    filter: &StockFilter,
+    query: &PageQuery,
+) -> CmdResult<Page<StockRow>> {
+    let items = item::Entity::find()
+        .filter(item::Column::DelStatus.eq(LIVE))
+        .order_by_asc(item::Column::Name)
+        .all(conn)
+        .await?;
+
+    // One aggregate per item. A page of 20 costs 20 sums, like the customer
+    // balance list — N+1 is fine at this scale, a grouped join is not worth
+    // the second query shape.
+    let mut rows = Vec::with_capacity(items.len());
+    for i in items {
+        let on_hand = on_hand_in(conn, i.id).await?;
+        let is_low = i
+            .alert_quantity
+            .is_some_and(|alert| on_hand <= alert);
+        if filter.low_only.unwrap_or(false) && !is_low {
+            continue;
+        }
+        rows.push(StockRow {
+            item_id: i.id,
+            item_name: i.name,
+            item_code: i.code,
+            alert_quantity: i.alert_quantity,
+            on_hand,
+            is_low,
+        });
+    }
+
+    if let Some(term) = query.term() {
+        rows.retain(|r| {
+            r.item_name.to_lowercase().contains(&term)
+                || r.item_code.to_lowercase().contains(&term)
+        });
+    }
+
+    let total = rows.len() as u64;
+    let rows = rows
+        .into_iter()
+        .skip(query.offset() as usize)
+        .take(query.per_page() as usize)
+        .collect();
+
+    Ok(Page::new(rows, total, query))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutLine {
