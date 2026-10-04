@@ -5,4 +5,5 @@
 
 pub mod sale;
 pub mod sale_detail;
+pub mod sale_payment;
 pub mod stock_movement;
