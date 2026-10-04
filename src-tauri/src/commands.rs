@@ -1677,6 +1677,15 @@ pub struct ItemInput {
     pub loyalty_point: Decimal,
     #[serde(default)]
     pub photo: Option<String>,
+    /// Template item for a variation; None means standalone.
+    #[serde(default)]
+    pub parent_id: Option<i32>,
+    /// How `code` scans; None means an internal code.
+    #[serde(default)]
+    pub symbology: Option<String>,
+    /// Price-per-kg goods: quantity comes from a scale.
+    #[serde(default)]
+    pub weighed: bool,
 }
 
 fn one() -> Decimal {
@@ -1718,6 +1727,15 @@ fn validate(input: &ItemInput) -> CmdResult<()> {
             return Err(CmdError::Validation("photo is too large".into()));
         }
     }
+    // An unnamed symbology means an internal code, which is a legal choice — but
+    // a named one has to be a symbology the label printer can actually draw.
+    if let Some(symbology) = input.symbology.as_deref() {
+        if !SYMBOLOGIES.contains(&symbology) {
+            return Err(CmdError::Validation(format!(
+                "'{symbology}' is not a barcode symbology"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1744,6 +1762,41 @@ async fn guard_sub_category_belongs<C: ConnectionTrait>(
             "sub-category does not belong to the chosen category".into(),
         ));
     }
+    Ok(())
+}
+
+/// The symbologies a retail counter actually meets (finding 8). Closed so a
+/// label printer is not asked to render a symbology it cannot draw, and so a
+/// `0`-prefixed EAN-8 is never mistaken for an internal SKU.
+pub const SYMBOLOGIES: &[&str] = &[
+    "EAN-13",
+    "EAN-8",
+    "UPC-A",
+    "CODE-39",
+    "CODE-93",
+    "CODE-128",
+    "CODABAR",
+    "QR",
+];
+
+/// A variation names a template that is itself live, and the template cannot be
+/// its own child — a cycle would make the variation tree unlistable.
+async fn guard_variation_parent<C: ConnectionTrait>(
+    conn: &C,
+    parent_id: Option<i32>,
+    self_id: Option<i32>,
+) -> CmdResult<()> {
+    let Some(parent_id) = parent_id else {
+        return Ok(());
+    };
+    if self_id == Some(parent_id) {
+        return Err(CmdError::Validation("an item cannot be its own variation".into()));
+    }
+    item::Entity::find_by_id(parent_id)
+        .filter(item::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("variation parent item".into()))?;
     Ok(())
 }
 
@@ -1776,45 +1829,9 @@ pub async fn list_items(query: PageQuery) -> CmdResult<Page<ItemView>> {
         .all(db)
         .await?;
 
-    // Lookup tables are small and shared across every item, so each is loaded once
-    // per request and indexed by id — one round trip each instead of a join per row.
-    let categories = item_category::Entity::find().all(db).await?;
-    let sub_categories = item_sub_category::Entity::find().all(db).await?;
-    let brands = brand::Entity::find().all(db).await?;
-    let units = unit::Entity::find().all(db).await?;
-    let categories = by_id(categories.into_iter().map(|r| (r.id, r.name)));
-    let sub_categories = by_id(sub_categories.into_iter().map(|r| (r.id, r.name)));
-    let brands = by_id(brands.into_iter().map(|r| (r.id, r.name)));
-    let units = by_id(units.into_iter().map(|r| (r.id, r.unit_name)));
+    let lookups = load_item_lookups(db).await?;
 
-    let mut views: Vec<ItemView> = rows
-        .into_iter()
-        .map(|i| ItemView {
-            id: i.id,
-            name: i.name,
-            code: i.code,
-            alternative_name: i.alternative_name,
-            generic_name: i.generic_name,
-            description: i.description,
-            category_id: i.category_id,
-            category_name: i.category_id.and_then(|id| categories.get(&id).cloned()),
-            sub_category_id: i.sub_category_id,
-            sub_category_name: i.sub_category_id.and_then(|id| sub_categories.get(&id).cloned()),
-            brand_id: i.brand_id,
-            brand_name: i.brand_id.and_then(|id| brands.get(&id).cloned()),
-            purchase_unit_id: i.purchase_unit_id,
-            purchase_unit_name: i.purchase_unit_id.and_then(|id| units.get(&id).cloned()),
-            sale_unit_id: i.sale_unit_id,
-            sale_unit_name: i.sale_unit_id.and_then(|id| units.get(&id).cloned()),
-            conversion_rate: i.conversion_rate,
-            purchase_price: i.purchase_price,
-            sale_price: i.sale_price,
-            whole_sale_price: i.whole_sale_price,
-            alert_quantity: i.alert_quantity,
-            loyalty_point: i.loyalty_point,
-            photo: i.photo,
-        })
-        .collect();
+    let mut views: Vec<ItemView> = rows.into_iter().map(|i| lookups.view(i)).collect();
 
     if let Some(term) = query.term() {
         views.retain(|v| {
@@ -1844,6 +1861,166 @@ fn by_id<K: std::hash::Hash + Eq, V>(pairs: impl IntoIterator<Item = (K, V)>) ->
     pairs.into_iter().collect()
 }
 
+/// The four small lookup tables an `ItemView` needs its display names from.
+///
+/// Loaded once per request and shared by every row. Three call sites build views
+/// (`list_items`, `resolve_scan`, `list_item_variations`) and doing this inside the
+/// row loop would have cost four queries *per item*.
+struct ItemLookups {
+    categories: HashMap<i32, String>,
+    sub_categories: HashMap<i32, String>,
+    brands: HashMap<i32, String>,
+    units: HashMap<i32, String>,
+}
+
+async fn load_item_lookups<C: ConnectionTrait>(conn: &C) -> CmdResult<ItemLookups> {
+    Ok(ItemLookups {
+        categories: by_id(
+            item_category::Entity::find()
+                .all(conn)
+                .await?
+                .into_iter()
+                .map(|r| (r.id, r.name)),
+        ),
+        sub_categories: by_id(
+            item_sub_category::Entity::find()
+                .all(conn)
+                .await?
+                .into_iter()
+                .map(|r| (r.id, r.name)),
+        ),
+        brands: by_id(
+            brand::Entity::find()
+                .all(conn)
+                .await?
+                .into_iter()
+                .map(|r| (r.id, r.name)),
+        ),
+        units: by_id(
+            unit::Entity::find()
+                .all(conn)
+                .await?
+                .into_iter()
+                .map(|r| (r.id, r.unit_name)),
+        ),
+    })
+}
+
+impl ItemLookups {
+    fn view(&self, i: item::Model) -> ItemView {
+        ItemView {
+            id: i.id,
+            name: i.name,
+            code: i.code,
+            alternative_name: i.alternative_name,
+            generic_name: i.generic_name,
+            description: i.description,
+            category_id: i.category_id,
+            category_name: i.category_id.and_then(|id| self.categories.get(&id).cloned()),
+            sub_category_id: i.sub_category_id,
+            sub_category_name: i
+                .sub_category_id
+                .and_then(|id| self.sub_categories.get(&id).cloned()),
+            brand_id: i.brand_id,
+            brand_name: i.brand_id.and_then(|id| self.brands.get(&id).cloned()),
+            purchase_unit_id: i.purchase_unit_id,
+            purchase_unit_name: i.purchase_unit_id.and_then(|id| self.units.get(&id).cloned()),
+            sale_unit_id: i.sale_unit_id,
+            sale_unit_name: i.sale_unit_id.and_then(|id| self.units.get(&id).cloned()),
+            conversion_rate: i.conversion_rate,
+            purchase_price: i.purchase_price,
+            sale_price: i.sale_price,
+            whole_sale_price: i.whole_sale_price,
+            alert_quantity: i.alert_quantity,
+            loyalty_point: i.loyalty_point,
+            photo: i.photo,
+            parent_id: i.parent_id,
+            symbology: i.symbology,
+            weighed: i.weighed,
+        }
+    }
+}
+
+/// Resolve a scanned or typed code to exactly one item, or nothing.
+///
+/// `list_items` searches with `contains`, so a scan of `12345` also returns
+/// `123456` and `Widget 12345` — taking the first row sells the wrong product.
+/// The register therefore resolved by hand over one page of those results, which
+/// is both a fuzzy match at the edge and blind past the page. This does the
+/// whole-string comparison in SQL instead, and returns `None` rather than a
+/// near miss.
+///
+/// Case is ignored because alphanumeric symbologies (Code 39/128) bake shift
+/// state into the code, so a scanner's case is not dependable. The alternative
+/// and generic names match too, because that is how a shop's own stickers are
+/// written.
+#[tauri::command]
+pub async fn resolve_scan(code: String) -> CmdResult<Option<ItemView>> {
+    crate::commands_auth::require_permission(db(), "item-list").await?;
+    resolve_scan_in(db(), code).await
+}
+
+pub(crate) async fn resolve_scan_in<C: ConnectionTrait>(
+    conn: &C,
+    code: String,
+) -> CmdResult<Option<ItemView>> {
+    let needle = code.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(None);
+    }
+    // SQL cannot do case-insensitive equality portably across SQLite and
+    // Postgres, and this is a single scanned code — not a list — so the catalog
+    // is read once and compared in Rust.
+    let rows = item::Entity::find()
+        .filter(item::Column::DelStatus.eq(LIVE))
+        .all(conn)
+        .await?;
+
+    let hit = rows.into_iter().find(|i| {
+        i.code.trim().to_lowercase() == needle
+            || i.alternative_name
+                .as_deref()
+                .is_some_and(|s| s.trim().to_lowercase() == needle)
+            || i.generic_name
+                .as_deref()
+                .is_some_and(|s| s.trim().to_lowercase() == needle)
+    });
+    let Some(hit) = hit else {
+        return Ok(None);
+    };
+
+    Ok(Some(load_item_lookups(conn).await?.view(hit)))
+}
+
+/// A template's children: the rows that actually carry size, colour, or flavour.
+/// Each holds its own stock and price, so the template itself is never sold.
+#[tauri::command]
+pub async fn list_item_variations(parent_id: i32) -> CmdResult<Page<ItemView>> {
+    crate::commands_auth::require_permission(db(), "item-list").await?;
+    list_item_variations_in(db(), parent_id).await
+}
+
+pub(crate) async fn list_item_variations_in<C: ConnectionTrait>(
+    conn: &C,
+    parent_id: i32,
+) -> CmdResult<Page<ItemView>> {
+    let rows = item::Entity::find()
+        .filter(item::Column::ParentId.eq(parent_id))
+        .filter(item::Column::DelStatus.eq(LIVE))
+        .order_by_asc(item::Column::Name)
+        .all(conn)
+        .await?;
+
+    let lookups = load_item_lookups(conn).await?;
+    // Each child is a full catalog row, so it is rendered through the same view
+    // the list screen uses rather than a variation-shaped struct that would have
+    // to be kept in step with `ItemView`.
+    let views: Vec<ItemView> = rows.into_iter().map(|i| lookups.view(i)).collect();
+
+    let total = views.len() as u64;
+    Ok(Page::new(views, total, &PageQuery::default()))
+}
+
 #[tauri::command]
 pub async fn create_item(input: ItemInput) -> CmdResult<item::Model> {
     // Guarded like the reference's `middleware('permission:…')`: check the
@@ -1859,6 +2036,7 @@ pub(crate) async fn create_item_in<C: ConnectionTrait>(
 ) -> CmdResult<item::Model> {
     validate(&input)?;
     guard_sub_category_belongs(conn, input.category_id, input.sub_category_id).await?;
+    guard_variation_parent(conn, input.parent_id, None).await?;
 
     let code = required(&input.code, "item code")?;
     let existing = item::Entity::find()
@@ -1888,6 +2066,9 @@ pub(crate) async fn create_item_in<C: ConnectionTrait>(
         alert_quantity: Set(input.alert_quantity),
         loyalty_point: Set(input.loyalty_point),
         photo: Set(input.photo),
+        parent_id: Set(input.parent_id),
+        symbology: Set(input.symbology),
+        weighed: Set(input.weighed),
         del_status: Set(LIVE.to_owned()),
         created_at: Set(now),
         updated_at: Set(now),
@@ -1913,6 +2094,7 @@ pub(crate) async fn update_item_in<C: ConnectionTrait>(
 ) -> CmdResult<item::Model> {
     validate(&input)?;
     guard_sub_category_belongs(conn, input.category_id, input.sub_category_id).await?;
+    guard_variation_parent(conn, input.parent_id, Some(id)).await?;
 
     let Some(found) = item::Entity::find_by_id(id).one(conn).await? else {
         return Err(CmdError::NotFound("item".into()));
@@ -1946,6 +2128,9 @@ pub(crate) async fn update_item_in<C: ConnectionTrait>(
     model.alert_quantity = Set(input.alert_quantity);
     model.loyalty_point = Set(input.loyalty_point);
     model.photo = Set(input.photo);
+    model.parent_id = Set(input.parent_id);
+    model.symbology = Set(input.symbology);
+    model.weighed = Set(input.weighed);
     model.updated_at = Set(crate::migration::now());
 
     Ok(model.update(conn).await?)

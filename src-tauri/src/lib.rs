@@ -42,6 +42,8 @@ pub fn run() {
             commands::create_item_sub_category,
             commands::delete_item_sub_category,
             commands::list_items,
+            commands::resolve_scan,
+            commands::list_item_variations,
             commands::create_item,
             commands::update_item,
             commands::delete_item,
@@ -4410,6 +4412,9 @@ mod tests {
             alert_quantity: None,
             loyalty_point: Decimal::ZERO,
             photo: None,
+            parent_id: None,
+            symbology: None,
+            weighed: false,
         }
     }
 
@@ -4453,6 +4458,79 @@ mod tests {
         let mut huge = item_input("huge-1");
         huge.photo = Some(format!("data:image/png;base64,{}", "A".repeat(1_000_000)));
         assert!(commands::create_item_in(&db, huge).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn variations_are_child_rows_under_a_live_template() {
+        let db = db::init_for_tests().await;
+        let shirt = commands::create_item_in(&db, item_input("shirt")).await.expect("template");
+
+        for (code, name) in [("shirt-s", "Shirt / S"), ("shirt-m", "Shirt / M")] {
+            let mut child = item_input(code);
+            child.name = name.into();
+            child.parent_id = Some(shirt.id);
+            commands::create_item_in(&db, child).await.expect("child");
+        }
+
+        let page = commands::list_item_variations_in(&db, shirt.id).await.expect("variations");
+        assert_eq!(page.total, 2);
+        assert!(page.rows.iter().all(|r| r.parent_id == Some(shirt.id)));
+
+        // A template cannot become its own child — only an update can say so,
+        // because a create has no id until it has been inserted.
+        let mut selfish = item_input("shirt-self");
+        selfish.parent_id = Some(shirt.id);
+        selfish.name = "Shirt / L".into();
+        assert!(
+            commands::update_item_in(&db, shirt.id, selfish)
+                .await
+                .is_err(),
+            "an item cannot be its own variation"
+        );
+
+        // A dead or absent parent groups nothing.
+        let mut orphan = item_input("shirt-orphan");
+        orphan.parent_id = Some(9999);
+        assert!(commands::create_item_in(&db, orphan).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_symbology_outside_the_vocabulary_is_refused() {
+        let db = db::init_for_tests().await;
+
+        let mut ok = item_input("ean-1");
+        ok.symbology = Some("EAN-13".into());
+        ok.weighed = true;
+        let row = commands::create_item_in(&db, ok).await.expect("EAN-13 is real");
+        assert_eq!(row.symbology.as_deref(), Some("EAN-13"));
+        assert!(row.weighed);
+
+        let mut bad = item_input("ean-2");
+        bad.symbology = Some("Aztec".into());
+        assert!(commands::create_item_in(&db, bad).await.is_err());
+
+        // No symbology means an internal code, which is a legal choice.
+        assert!(commands::create_item_in(&db, item_input("sku-1")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_scan_matches_the_whole_code_and_nothing_else() {
+        let db = db::init_for_tests().await;
+        commands::create_item_in(&db, item_input("12345")).await.expect("exact");
+        commands::create_item_in(&db, item_input("123456")).await.expect("longer");
+
+        // A substring scan of `12345` also matches `123456`, so only whole-string
+        // equality may put a product on the shelf.
+        assert_eq!(commands::resolve_scan_in(&db, "12345".into()).await.unwrap().unwrap().code, "12345");
+        assert_eq!(commands::resolve_scan_in(&db, "123456".into()).await.unwrap().unwrap().code, "123456");
+        assert!(commands::resolve_scan_in(&db, "1234".into()).await.unwrap().is_none());
+        assert!(commands::resolve_scan_in(&db, "2345".into()).await.unwrap().is_none());
+        assert!(commands::resolve_scan_in(&db, "  ".into()).await.unwrap().is_none());
+
+        // Alphanumeric symbologies bake shift state into the code, so case is not
+        // dependable.
+        commands::create_item_in(&db, item_input("AbC39x")).await.expect("mixed case");
+        assert!(commands::resolve_scan_in(&db, "abc39x".into()).await.unwrap().is_some());
     }
 
     fn stock_move(item_id: i32, quantity: Decimal) -> commands::StockMoveInput {
