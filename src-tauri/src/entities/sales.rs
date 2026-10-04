@@ -4,6 +4,7 @@
 //! comment.
 
 pub mod booking;
+pub mod promotion;
 pub mod quotation;
 pub mod quotation_detail;
 pub mod register;
