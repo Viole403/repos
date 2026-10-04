@@ -53,6 +53,9 @@ pub fn run() {
             commands::list_registers,
             commands::register_summary,
             commands::close_register,
+            commands::create_combo_item,
+            commands::list_combo_items,
+            commands::delete_combo_item,
             commands::create_promotion,
             commands::list_promotions,
             commands::get_promotion,
@@ -119,7 +122,7 @@ mod tests {
     use crate::migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use crate::entities::sales::stock_movement::MovementType;
-    use crate::entities::sales::{booking, quotation, quotation_detail, sale, sale_detail, stock_movement};
+    use crate::entities::sales::{booking, combo_sale, quotation, quotation_detail, sale, sale_detail, stock_movement};
     use crate::entities::trade::{customer, supplier, supplier_payment};
 
     fn days_ago(n: i64) -> chrono::NaiveDateTime {
@@ -2970,6 +2973,182 @@ mod tests {
             .expect("promote");
         assert_eq!(view.lines[0].discount, Decimal::new(10_000, 3));
         assert_eq!(view.sale.grand_total, Decimal::new(90_000, 3));
+    }
+
+    // -----------------------------------------------------------------------
+    // Combos
+    // -----------------------------------------------------------------------
+
+    /// A "Breakfast" bundle of 2 cola + 1 chips. Returns the bundle item id.
+    async fn seed_breakfast(db: &DatabaseConnection) -> (i32, i32, i32) {
+        let bundle = seed_item(db, "Breakfast").await;
+        let cola = seed_item(db, "Cola").await;
+        let chips = seed_item(db, "Chips").await;
+        seed_stock(db, cola, dec(10)).await;
+        seed_stock(db, chips, dec(10)).await;
+        for (item_id, qty) in [(cola, dec(2)), (chips, dec(1))] {
+            commands::create_combo_item_in(
+                db,
+                commands::ComboItemInput { combo_item_id: bundle, item_id, quantity: qty },
+            )
+            .await
+            .expect("combo component");
+        }
+        (bundle, cola, chips)
+    }
+
+    #[tokio::test]
+    async fn combo_sells_as_one_line_but_moves_components() {
+        let db = db::init_for_tests().await;
+        let (bundle, cola, chips) = seed_breakfast(&db).await;
+
+        let view = sell_one_item(&db, bundle, Decimal::new(100_000, 3), None, None)
+            .await
+            .expect("checkout");
+        assert_eq!(view.lines.len(), 1);
+        assert_eq!(view.lines[0].item_id, bundle);
+        assert_eq!(view.sale.grand_total, Decimal::new(100_000, 3));
+
+        assert_eq!(
+            commands::stock_on_hand_in(&db, bundle).await.unwrap(),
+            Decimal::ZERO,
+            "the virtual bundle holds no stock and moves none"
+        );
+        assert_eq!(commands::stock_on_hand_in(&db, cola).await.unwrap(), dec(8));
+        assert_eq!(commands::stock_on_hand_in(&db, chips).await.unwrap(), dec(9));
+
+        let audit: Vec<(i32, Decimal)> = combo_sale::Entity::find()
+            .filter(combo_sale::Column::SaleId.eq(view.sale.id))
+            .all(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.item_id, r.quantity))
+            .collect();
+        assert_eq!(audit.len(), 2, "the explosion was not recorded");
+        assert!(audit.contains(&(cola, dec(2))));
+        assert!(audit.contains(&(chips, dec(1))));
+    }
+
+    #[tokio::test]
+    async fn combo_short_component_refuses_the_sale() {
+        let db = db::init_for_tests().await;
+        let (bundle, _, _) = seed_breakfast(&db).await;
+
+        // Drain the cola: 10 in stock, bundles need 2 each, so the 6th fails.
+        for _ in 0..5 {
+            sell_one_item(&db, bundle, Decimal::new(100_000, 3), None, None)
+                .await
+                .expect("bundle sale");
+        }
+        let err = sell_one_item(&db, bundle, Decimal::new(100_000, 3), None, None).await;
+        assert!(
+            matches!(err, Err(commands::CmdError::Validation(ref m)) if m.contains("Cola")),
+            "expected the component named, got {err:?}"
+        );
+        assert_eq!(sale::Entity::find().count(&db).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn combo_catalog_guards() {
+        let db = db::init_for_tests().await;
+        let (bundle, cola, _) = seed_breakfast(&db).await;
+
+        let itself = commands::ComboItemInput { combo_item_id: bundle, item_id: bundle, quantity: dec(1) };
+        assert!(
+            matches!(
+                commands::create_combo_item_in(&db, itself).await,
+                Err(commands::CmdError::Validation(_))
+            )
+        );
+
+        // Cola is not a bundle, so nesting needs a bundle-as-component: make chips
+        // a bundle first, then refuse it inside breakfast.
+        let chips = seed_item(&db, "Snack").await;
+        commands::create_combo_item_in(
+            &db,
+            commands::ComboItemInput { combo_item_id: chips, item_id: cola, quantity: dec(1) },
+        )
+        .await
+        .expect("chips bundle");
+        let nested = commands::ComboItemInput { combo_item_id: bundle, item_id: chips, quantity: dec(1) };
+        assert!(
+            matches!(
+                commands::create_combo_item_in(&db, nested).await,
+                Err(commands::CmdError::Validation(_))
+            )
+        );
+
+        let dup = commands::ComboItemInput { combo_item_id: bundle, item_id: cola, quantity: dec(1) };
+        assert!(
+            matches!(
+                commands::create_combo_item_in(&db, dup).await,
+                Err(commands::CmdError::Conflict(_))
+            )
+        );
+
+        let ghost = commands::ComboItemInput { combo_item_id: bundle, item_id: 4242, quantity: dec(1) };
+        assert!(
+            matches!(
+                commands::create_combo_item_in(&db, ghost).await,
+                Err(commands::CmdError::NotFound(_))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn combo_promote_explodes_at_promote_time() {
+        let db = db::init_for_tests().await;
+        let (bundle, cola, chips) = seed_breakfast(&db).await;
+
+        let draft = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![commands::CheckoutLine {
+                    item_id: bundle,
+                    quantity: Decimal::new(1_000, 3),
+                    unit_price: Decimal::new(100_000, 3),
+                    discount: None,
+                }],
+                discount_total: Some(Decimal::ZERO),
+                tax_total: Some(Decimal::ZERO),
+                paid_total: None,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: Some(false),
+                customer_id: None,
+                payments: None,
+            },
+        )
+        .await
+        .expect("park");
+        assert_eq!(commands::stock_on_hand_in(&db, cola).await.unwrap(), dec(10));
+
+        commands::promote_draft_in(&db, draft.sale.id, None, None).await.expect("promote");
+        assert_eq!(commands::stock_on_hand_in(&db, cola).await.unwrap(), dec(8));
+        assert_eq!(commands::stock_on_hand_in(&db, chips).await.unwrap(), dec(9));
+        assert_eq!(
+            combo_sale::Entity::find().count(&db).await.unwrap(),
+            2,
+            "promote wrote no explosion audit"
+        );
+    }
+
+    #[tokio::test]
+    async fn combo_return_puts_components_back() {
+        let db = db::init_for_tests().await;
+        let (bundle, cola, chips) = seed_breakfast(&db).await;
+
+        let view = sell_one_item(&db, bundle, Decimal::new(100_000, 3), None, None)
+            .await
+            .expect("checkout");
+        let mut input = return_line(view.lines[0].id, Decimal::new(1_000, 3));
+        input.sale_id = view.sale.id;
+        let returned = commands::create_return_in(&db, input, None).await.expect("return");
+
+        assert_eq!(returned.refunded_total, Decimal::new(100_000, 3));
+        assert_eq!(commands::stock_on_hand_in(&db, cola).await.unwrap(), dec(10));
+        assert_eq!(commands::stock_on_hand_in(&db, chips).await.unwrap(), dec(10));
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ use crate::entities::auth::users;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{booking, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
+use crate::entities::sales::{booking, combo_item, combo_sale, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -1001,7 +1001,10 @@ pub async fn create_return_in<C: ConnectionTrait + TransactionTrait>(
 
     let mut lines = Vec::with_capacity(input.lines.len());
     let mut refunded = Decimal::ZERO;
-    let mut touched: Vec<i32> = Vec::new();
+    // (item, qty) pairs the shelf grows by. A bundle line explodes into its
+    // components here, prorated from the explosion audit — never from the catalog,
+    // whose definition may have changed since the sale.
+    let mut back: Vec<(i32, Decimal)> = Vec::new();
 
     for line in &input.lines {
         if line.quantity <= Decimal::ZERO {
@@ -1048,8 +1051,20 @@ pub async fn create_return_in<C: ConnectionTrait + TransactionTrait>(
         );
         refunded += amount;
 
-        if !touched.contains(&sold.item_id) {
-            touched.push(sold.item_id);
+        let explosion: Vec<combo_sale::Model> = combo_sale::Entity::find()
+            .filter(combo_sale::Column::SaleId.eq(original.id))
+            .filter(combo_sale::Column::SaleDetailId.eq(sold.id))
+            .all(&txn)
+            .await?;
+        if explosion.is_empty() {
+            back.push((sold.item_id, line.quantity));
+        } else {
+            for row in explosion {
+                back.push((
+                    row.item_id,
+                    (row.quantity * line.quantity / sold.quantity).round_dp(MONEY_SCALE),
+                ));
+            }
         }
     }
 
@@ -1060,12 +1075,18 @@ pub async fn create_return_in<C: ConnectionTrait + TransactionTrait>(
     let return_row = am.update(&txn).await?;
 
     // Stock comes back: positive quantity, so the shelf grows by exactly what went out.
+    let mut touched: Vec<i32> = Vec::new();
+    for (item_id, _) in &back {
+        if !touched.contains(item_id) {
+            touched.push(*item_id);
+        }
+    }
     let mut stock_on_hand = Vec::with_capacity(touched.len());
     for item_id in touched {
-        let quantity: Decimal = lines
+        let quantity: Decimal = back
             .iter()
-            .filter(|l| l.item_id == item_id)
-            .map(|l| l.quantity)
+            .filter(|(id, _)| *id == item_id)
+            .map(|(_, qty)| *qty)
             .sum();
         let balance_after = on_hand_in(&txn, item_id).await? + quantity;
         record_return_movement(&txn, item_id, return_id, &return_no, quantity, balance_after, now).await?;
@@ -2196,46 +2217,68 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     let mut seen: HashMap<i32, usize> = HashMap::with_capacity(input.lines.len());
 
     for (index, line) in input.lines.iter().enumerate() {
-        let (item_name, available) = guard_line_sellable(&txn, line).await?;
+        // Looked up before the guard: a bundle skips the shelf check below, because
+        // the virtual item holds no stock and would refuse every bundle sale.
+        let is_bundle = !combo_components(&txn, line.item_id).await?.is_empty();
+        let (item_name, available) = if is_bundle {
+            let item = item::Entity::find_by_id(line.item_id)
+                .filter(item::Column::DelStatus.eq(LIVE))
+                .one(&txn)
+                .await?
+                .ok_or_else(|| CmdError::NotFound(format!("item {}", line.item_id)))?;
+            (item.name, Decimal::ZERO)
+        } else {
+            guard_line_sellable(&txn, line).await?
+        };
         let discount = line.discount.unwrap_or(Decimal::ZERO) + promo.line_promos[index];
         let gross = line.unit_price * line.quantity;
 
-        lines.push(
-            sale_detail::ActiveModel {
-                sale_id: Set(sale_id),
-                item_id: Set(line.item_id),
-                // Snapshot: a later rename must not rewrite the receipt.
-                item_name: Set(item_name),
-                unit_price: Set(line.unit_price),
-                quantity: Set(line.quantity),
-                discount: Set(discount),
-                line_total: Set(gross - discount),
-                tax_amount: Set(Decimal::ZERO),
-                created_at: Set(now),
-                ..Default::default()
-            }
-            .insert(&txn)
-            .await?,
-        );
+        let detail = sale_detail::ActiveModel {
+            sale_id: Set(sale_id),
+            item_id: Set(line.item_id),
+            // Snapshot: a later rename must not rewrite the receipt.
+            item_name: Set(item_name.clone()),
+            unit_price: Set(line.unit_price),
+            quantity: Set(line.quantity),
+            discount: Set(discount),
+            line_total: Set(gross - discount),
+            tax_amount: Set(Decimal::ZERO),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+        lines.push(detail.clone());
         subtotal += gross;
         line_discount_total += discount;
 
         if promoted {
-            // `available` was read inside the transaction, so a repeated item in the
-            // same cart sees the earlier line's decrement and cannot oversell between
-            // itself.
-            let balance_after = available - line.quantity;
-            record_sale_movement(
-                &txn,
-                line.item_id,
-                sale_id,
-                &invoice_no,
-                line.quantity,
-                balance_after,
-                now,
-            )
-            .await?;
-            record_on_hand(&mut stock_on_hand, &mut seen, line.item_id, balance_after);
+            // A bundle sells as one line but moves its components: the bundle item
+            // itself is virtual and holds no stock.
+            if is_bundle {
+                let needs = guard_combo_sellable(&txn, line.item_id, &item_name, line.quantity).await?;
+                record_combo_sale(
+                    &txn, sale_id, detail.id, line.item_id, &needs, &invoice_no, now,
+                    &mut stock_on_hand, &mut seen,
+                )
+                .await?;
+            } else {
+                // `available` was read inside the transaction, so a repeated item in the
+                // same cart sees the earlier line's decrement and cannot oversell between
+                // itself.
+                let balance_after = available - line.quantity;
+                record_sale_movement(
+                    &txn,
+                    line.item_id,
+                    sale_id,
+                    &invoice_no,
+                    line.quantity,
+                    balance_after,
+                    now,
+                )
+                .await?;
+                record_on_hand(&mut stock_on_hand, &mut seen, line.item_id, balance_after);
+            }
         }
     }
 
@@ -2502,10 +2545,22 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
             unit_price: stored_line.unit_price,
             discount: Some(stored_line.discount),
         };
+        let is_bundle = !combo_components(&txn, line.item_id).await?.is_empty();
         // The check that matters: the shelf is re-read now, not trusted from scan time,
         // because another till may have sold this stock while the draft waited. Also
-        // rejects the sale if the item was soft-deleted in the meantime.
-        let (_, available) = guard_line_sellable(&txn, &line).await?;
+        // rejects the sale if the item was soft-deleted in the meantime. Bundles skip
+        // the shelf check here; their components are checked below.
+        let available = if is_bundle {
+            item::Entity::find_by_id(line.item_id)
+                .filter(item::Column::DelStatus.eq(LIVE))
+                .one(&txn)
+                .await?
+                .ok_or_else(|| CmdError::NotFound(format!("item {}", line.item_id)))?;
+            Decimal::ZERO
+        } else {
+            let (_, available) = guard_line_sellable(&txn, &line).await?;
+            available
+        };
         let discount = stored_line.discount + promo.line_promos[index];
         let net = stored_line.unit_price * stored_line.quantity - discount;
 
@@ -2520,6 +2575,17 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
             am.update(&txn).await?
         };
         lines.push(line_row);
+
+        if is_bundle {
+            let needs =
+                guard_combo_sellable(&txn, line.item_id, &stored_line.item_name, line.quantity).await?;
+            record_combo_sale(
+                &txn, sale_id, stored_line.id, line.item_id, &needs, &header.invoice_no, now,
+                &mut stock_on_hand, &mut seen,
+            )
+            .await?;
+            continue;
+        }
 
         let balance_after = available - line.quantity;
         record_sale_movement(
@@ -4126,6 +4192,197 @@ async fn apply_promotions<C: ConnectionTrait>(
     order_promo = order_promo.min((subtotal - line_total).max(Decimal::ZERO)).round_dp(MONEY_SCALE);
 
     Ok(PromoOutcome { line_promos, order_promo })
+}
+
+// ---------------------------------------------------------------------------
+// Combos
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComboItemInput {
+    pub combo_item_id: i32,
+    pub item_id: i32,
+    pub quantity: Decimal,
+}
+
+/// Components of a bundle, each with the total units one sale line moves.
+async fn combo_needs<C: ConnectionTrait>(
+    conn: &C,
+    combo_item_id: i32,
+    bundle_qty: Decimal,
+) -> CmdResult<Vec<(i32, Decimal)>> {
+    let rows: Vec<combo_item::Model> = combo_item::Entity::find()
+        .filter(combo_item::Column::ComboItemId.eq(combo_item_id))
+        .order_by_asc(combo_item::Column::ItemId)
+        .all(conn)
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push((row.item_id, (row.quantity * bundle_qty).round_dp(MONEY_SCALE)));
+    }
+    Ok(out)
+}
+
+/// Guard for a bundle line. The bundle itself needs no stock — it is virtual, and
+/// requiring shelf for it would refuse every bundle sale. Each component must
+/// exist, be Live, and cover its share; the message names the component, because
+/// that is the shelf the cashier has to go and look at.
+async fn guard_combo_sellable<C: ConnectionTrait>(
+    conn: &C,
+    combo_item_id: i32,
+    bundle_name: &str,
+    bundle_qty: Decimal,
+) -> CmdResult<Vec<(i32, Decimal)>> {
+    let needs = combo_needs(conn, combo_item_id, bundle_qty).await?;
+    for (item_id, need) in &needs {
+        let Some(component) = item::Entity::find_by_id(*item_id)
+            .filter(item::Column::DelStatus.eq(LIVE))
+            .one(conn)
+            .await?
+        else {
+            return Err(CmdError::NotFound(format!("item {item_id}")));
+        };
+        if !combo_components(conn, *item_id).await?.is_empty() {
+            return Err(CmdError::Validation(format!(
+                "'{bundle_name}' contains '{}', which is itself a bundle",
+                component.name,
+            )));
+        }
+        let available = on_hand_in(conn, *item_id).await?;
+        if *need > available {
+            return Err(CmdError::Validation(format!(
+                "'{bundle_name}' needs {need} of '{}' but only {available} in stock",
+                component.name,
+            )));
+        }
+    }
+    Ok(needs)
+}
+
+async fn combo_components<C: ConnectionTrait>(
+    conn: &C,
+    combo_item_id: i32,
+) -> CmdResult<Vec<combo_item::Model>> {
+    Ok(combo_item::Entity::find()
+        .filter(combo_item::Column::ComboItemId.eq(combo_item_id))
+        .all(conn)
+        .await?)
+}
+
+/// Writes the explosion audit plus one ledger movement per component. Shared by
+/// checkout and promote so the two spell a bundle sale identically.
+async fn record_combo_sale<C: ConnectionTrait>(
+    conn: &C,
+    sale_id: i32,
+    detail_id: i32,
+    combo_item_id: i32,
+    needs: &[(i32, Decimal)],
+    invoice_no: &str,
+    now: NaiveDateTime,
+    stock_on_hand: &mut Vec<ItemOnHand>,
+    seen: &mut HashMap<i32, usize>,
+) -> CmdResult<()> {
+    for (item_id, need) in needs {
+        combo_sale::ActiveModel {
+            sale_id: Set(sale_id),
+            sale_detail_id: Set(detail_id),
+            combo_item_id: Set(combo_item_id),
+            item_id: Set(*item_id),
+            quantity: Set(*need),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+        let balance_after = on_hand_in(conn, *item_id).await? - *need;
+        record_sale_movement(conn, *item_id, sale_id, invoice_no, *need, balance_after, now).await?;
+        record_on_hand(stock_on_hand, seen, *item_id, balance_after);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn create_combo_item(input: ComboItemInput) -> CmdResult<combo_item::Model> {
+    // Guarded as catalog, not its own group: a bundle definition is what an item
+    // means, and a fourth permission group for three commands buys nothing.
+    crate::commands_auth::require_permission(db(), "item-create").await?;
+    create_combo_item_in(db(), input).await
+}
+
+pub async fn create_combo_item_in<C: ConnectionTrait>(
+    conn: &C,
+    input: ComboItemInput,
+) -> CmdResult<combo_item::Model> {
+    if input.quantity <= Decimal::ZERO {
+        return Err(CmdError::Validation("component quantity must be greater than zero".into()));
+    }
+    if input.combo_item_id == input.item_id {
+        return Err(CmdError::Validation("an item cannot contain itself".into()));
+    }
+    for (id, field) in [(input.combo_item_id, "bundle"), (input.item_id, "component")] {
+        item::Entity::find_by_id(id)
+            .filter(item::Column::DelStatus.eq(LIVE))
+            .one(conn)
+            .await?
+            .ok_or_else(|| CmdError::NotFound(format!("{field} item {id}")))?;
+    }
+    if !combo_components(conn, input.item_id).await?.is_empty() {
+        return Err(CmdError::Validation(
+            "a bundle cannot contain another bundle: the explosion is one level".into(),
+        ));
+    }
+    if combo_item::Entity::find()
+        .filter(combo_item::Column::ComboItemId.eq(input.combo_item_id))
+        .filter(combo_item::Column::ItemId.eq(input.item_id))
+        .one(conn)
+        .await?
+        .is_some()
+    {
+        return Err(CmdError::Conflict("this item is already a component of the bundle".into()));
+    }
+    Ok(combo_item::ActiveModel {
+        combo_item_id: Set(input.combo_item_id),
+        item_id: Set(input.item_id),
+        quantity: Set(input.quantity),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?)
+}
+
+#[tauri::command]
+pub async fn list_combo_items(combo_item_id: Option<i32>, query: PageQuery) -> CmdResult<Page<combo_item::Model>> {
+    crate::commands_auth::require_permission(db(), "item-list").await?;
+    let db = db();
+    let mut q = combo_item::Entity::find();
+    if let Some(bundle) = combo_item_id {
+        q = q.filter(combo_item::Column::ComboItemId.eq(bundle));
+    }
+    let total = q.clone().count(db).await?;
+    let rows = q
+        .order_by_asc(combo_item::Column::ComboItemId)
+        .order_by_asc(combo_item::Column::ItemId)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(db)
+        .await?;
+    Ok(Page::new(rows, total, &query))
+}
+
+#[tauri::command]
+pub async fn delete_combo_item(id: i32) -> CmdResult<()> {
+    crate::commands_auth::require_permission(db(), "item-destroy").await?;
+    delete_combo_item_in(db(), id).await
+}
+
+pub async fn delete_combo_item_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResult<()> {
+    // Hard delete like promotions: past sales keep their own explosion rows, so no
+    // history points here.
+    let deleted = combo_item::Entity::delete_by_id(id).exec(conn).await?;
+    if deleted.rows_affected == 0 {
+        return Err(CmdError::NotFound("combo item".into()));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
