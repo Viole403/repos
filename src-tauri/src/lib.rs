@@ -2,6 +2,10 @@
 mod auth;
 mod commands;
 mod commands_auth;
+mod commands_db;
+
+/// What [`db::bootstrap`] found at startup, for diagnostics and tests.
+static BOOTSTRAP: std::sync::OnceLock<db::Bootstrap> = std::sync::OnceLock::new();
 mod db;
 mod entities;
 mod migration;
@@ -13,22 +17,39 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // Async work can't run on the sync setup hook, so block the thread
-            // until migrations finish. This happens once, before the window opens.
+            // Async work can't run on the sync setup hook, so block the thread.
             let handle = app.handle().clone();
             let data_dir = handle
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|e| panic!("failed to resolve app data dir: {e}"));
 
-            let url_override = std::env::var("REPOS_DATABASE_URL").ok();
-            tauri::async_runtime::block_on(db::init(&data_dir, url_override.as_deref()))
-                .expect("failed to initialize database");
+            // Published so the wizard's commands can resolve the same directory
+            // instead of guessing it.
+            std::env::set_var("REPOS_APP_DATA_DIR", &data_dir);
+
+            // Deliberately does not panic. Choosing the database is the wizard's job,
+            // so an install with none — or one whose saved database will not open —
+            // still has to reach a window, or the question can never be asked.
+            let (state, status) = tauri::async_runtime::block_on(db::bootstrap(&data_dir));
+            if let Some(s) = &status {
+                eprintln!(
+                    "database {}{}",
+                    s.state,
+                    s.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default()
+                );
+            }
+            // Remembered so the wizard can render the failure without asking again.
+            BOOTSTRAP.set(state).ok();
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::health_check,
+            commands_db::database_status,
+            commands_db::database_options,
+            commands_db::test_database_connection,
+            commands_db::configure_database,
             commands::list_units,
             commands::create_unit,
             commands::delete_unit,
