@@ -40,6 +40,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::Promotions),
             Box::new(Migrations::Combos),
             Box::new(Migrations::SaleOrderType),
+            Box::new(Migrations::Installments),
         ]
     }
 }
@@ -61,6 +62,7 @@ pub enum Migrations {
     Promotions,
     Combos,
     SaleOrderType,
+    Installments,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -112,6 +114,7 @@ impl MigrationName for Migrations {
         Migrations::Promotions => "promotions",
         Migrations::Combos => "combos",
         Migrations::SaleOrderType => "sale_order_type",
+        Migrations::Installments => "installments",
         }
     }
 }
@@ -135,6 +138,7 @@ impl MigrationTrait for Migrations {
             Migrations::Promotions => promotions(manager).await?,
             Migrations::Combos => combos(manager).await?,
             Migrations::SaleOrderType => sale_order_type(manager).await?,
+            Migrations::Installments => installments(manager).await?,
         }
         Ok(())
     }
@@ -142,6 +146,21 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::Installments => {
+                for t in [
+                    InstallmentSaleDetails::Table.into_iden(),
+                    InstallmentSales::Table.into_iden(),
+                ] {
+                    manager.drop_table(Table::drop().table(t).if_exists().to_owned()).await?;
+                }
+                let conn = manager.get_connection();
+                for name in INSTALLMENT_PERMISSIONS {
+                    permissions::Entity::delete_many()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .exec(conn)
+                        .await?;
+                }
+            }
             Migrations::SaleOrderType => {
                 manager
                     .alter_table(
@@ -1011,6 +1030,141 @@ async fn sale_order_type(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// A credit sale paid off over time: one item handed over now, the balance split
+/// into dated schedule rows. Two tables, not three — the reference's
+/// `InstallmentSalePayment` is never written (only a commented-out read), so the
+/// schedule rows carry their own `paid_amount` and there is nowhere else a payment
+/// could hide.
+///
+/// Paid, due and status are derived (`down_payment + SUM(paid_amount)`), never
+/// stored: the reference stores them and recomputes them on every payment anyway,
+/// which is two sources for one figure. The schedule is auto-split for now —
+// floor division with the remainder on the first due, like the reference —
+// manual per-due amounts are still open.
+async fn installments(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(InstallmentSales::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(InstallmentSales::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                // Written as a placeholder, then replaced with `INST-{id:06}` — same
+                // derivation as the sale invoice number, so it cannot collide.
+                .col(ColumnDef::new(InstallmentSales::ReferenceNo).string().not_null())
+                .col(ColumnDef::new(InstallmentSales::CustomerId).integer().not_null())
+                .col(ColumnDef::new(InstallmentSales::ItemId).integer().not_null())
+                .col(ColumnDef::new(InstallmentSales::Quantity).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(InstallmentSales::UnitPrice).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(InstallmentSales::DiscountAmount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(InstallmentSales::InterestPercent).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(InstallmentSales::InterestAmount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(InstallmentSales::OtherCharges).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(InstallmentSales::Total).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(InstallmentSales::DownPayment).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(InstallmentSales::NumberOfInstallments).integer().not_null())
+                .col(ColumnDef::new(InstallmentSales::IntervalDays).integer().not_null())
+                .col(ColumnDef::new(InstallmentSales::CreatedBy).integer().null())
+                .col(ColumnDef::new(InstallmentSales::Note).string().null())
+                .col(ColumnDef::new(InstallmentSales::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(InstallmentSales::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(InstallmentSales::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_installment_sales_customer")
+                        .from(InstallmentSales::Table, InstallmentSales::CustomerId)
+                        .to(Customers::Table, Customers::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                // RESTRICT, not CASCADE: deleting an item must not erase the record
+                // that it was once sold on credit.
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_installment_sales_item")
+                        .from(InstallmentSales::Table, InstallmentSales::ItemId)
+                        .to(Items::Table, Items::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(InstallmentSaleDetails::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(InstallmentSaleDetails::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(InstallmentSaleDetails::InstallmentSaleId).integer().not_null())
+                // Midnight on the due day: a due date is a date, and every timestamp
+                // here already means "that day at midnight" when it has to.
+                .col(ColumnDef::new(InstallmentSaleDetails::DueDate).custom(TIMESTAMP).not_null())
+                .col(ColumnDef::new(InstallmentSaleDetails::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(InstallmentSaleDetails::PaidAmount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(InstallmentSaleDetails::PaidDate).custom(TIMESTAMP).null())
+                .col(ColumnDef::new(InstallmentSaleDetails::PaymentMethod).string().null())
+                .col(ColumnDef::new(InstallmentSaleDetails::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(InstallmentSaleDetails::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_installment_sale_details_sale")
+                        .from(InstallmentSaleDetails::Table, InstallmentSaleDetails::InstallmentSaleId)
+                        .to(InstallmentSales::Table, InstallmentSales::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_installment_sales_customer_id")
+                .table(InstallmentSales::Table)
+                .col(InstallmentSales::CustomerId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_installment_sale_details_sale_id")
+                .table(InstallmentSaleDetails::Table)
+                .col(InstallmentSaleDetails::InstallmentSaleId)
+                .to_owned(),
+        )
+        .await?;
+
+    let conn = manager.get_connection();
+    let now = now();
+    for name in INSTALLMENT_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set("installment".to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+    Ok(())
+}
+
 /// A catalog bundle and its per-sale explosion record. The bundle sells as one
 /// line at the bundle's price; the components move the stock. `combo_sales` is
 /// the audit of that explosion, so a receipt can name what the bundle contained
@@ -1511,6 +1665,52 @@ const PROMOTION_PERMISSIONS: &[&str] = &[
     "promotion-edit",
     "promotion-show",
     "promotion-destroy",
+];
+
+#[derive(Iden)]
+enum InstallmentSales {
+    Table,
+    Id,
+    ReferenceNo,
+    CustomerId,
+    ItemId,
+    Quantity,
+    UnitPrice,
+    DiscountAmount,
+    InterestPercent,
+    InterestAmount,
+    OtherCharges,
+    Total,
+    DownPayment,
+    NumberOfInstallments,
+    IntervalDays,
+    CreatedBy,
+    Note,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum InstallmentSaleDetails {
+    Table,
+    Id,
+    InstallmentSaleId,
+    DueDate,
+    Amount,
+    PaidAmount,
+    PaidDate,
+    PaymentMethod,
+    DelStatus,
+    CreatedAt,
+}
+
+/// Permissions this migration owns, for the down arm above.
+const INSTALLMENT_PERMISSIONS: &[&str] = &[
+    "installment-list",
+    "installment-create",
+    "installment-show",
+    "installment-collect",
 ];
 
 #[derive(Iden)]
