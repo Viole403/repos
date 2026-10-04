@@ -94,13 +94,35 @@ pub enum Migrations {
 /// Soft-delete marker used across the reference's tables.
 const DEL_LIVE: &str = "Live";
 
-/// Timestamp column type.
+/// Timestamp column type, per backend.
 ///
-/// `ColumnType::Timestamp` renders as `timestamp_text` and `TimestampWithTimeZone`
-/// as `timestamp_with_timezone_text` on SQLite — neither is valid SQLite DDL and the
-/// migration fails with `near "(": syntax error`. `custom("timestamp")` is portable
-/// across SQLite, Postgres, and MySQL, so all three stay on the same schema.
-const TIMESTAMP: &str = "timestamp";
+/// `ColumnType::Timestamp` renders as `timestamp_text` on SQLite — not valid SQLite
+/// DDL, so the migration fails with `near "(": syntax error` — and the type is
+/// therefore spelled as raw SQL. But there is **no single spelling that works
+/// everywhere**, and picking one that appears to is how a portability claim goes
+/// untested until someone runs it:
+///
+/// - SQLite accepts any type name, so it never distinguishes these.
+/// - Postgres wants `timestamp`; `datetime` does not exist and the migration fails
+///   with `type "datetime" does not exist`.
+/// - MySQL wants `datetime`. sqlx maps `NaiveDateTime` to `DATETIME`, so a column
+///   created as `TIMESTAMP` cannot be decoded at all — `mismatched types` while
+///   reading back the first row. MySQL's `TIMESTAMP` also carries a 2038 range limit
+///   and implicit NOT NULL, neither of which a created-at column wants.
+///
+/// The constant is therefore resolved from the connection's backend rather than
+/// fixed, and call sites read `ts` — a local resolved once per migration from
+/// `manager.get_database_backend()`, not a process global, because the suite
+/// exercises several backends inside one process.
+///
+/// Both halves of this were found by *running* the server-backed legs. `cargo
+/// check` and the SQLite suite are green with the wrong constant either way.
+fn timestamp_type(backend: sea_orm::DbBackend) -> &'static str {
+    match backend {
+        sea_orm::DbBackend::MySql => "datetime",
+        _ => "timestamp",
+    }
+}
 
 /// A UTC timestamp as `NaiveDateTime`, because that is what a `timestamp` column is.
 ///
@@ -560,6 +582,8 @@ impl MigrationTrait for Migrations {
 // ---------------------------------------------------------------------------
 
 async fn auth_and_roles(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -574,8 +598,8 @@ async fn auth_and_roles(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(Users::Photo).string().null())
                 .col(ColumnDef::new(Users::DelStatus).string().not_null().default(DEL_LIVE))
                 .col(ColumnDef::new(Users::TwoFactorEnabled).boolean().not_null().default(false))
-                .col(ColumnDef::new(Users::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Users::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Users::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Users::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .to_owned(),
         )
         .await?;
@@ -591,8 +615,8 @@ async fn auth_and_roles(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 // The reference omits guard_name (single web guard); kept for parity.
                 .col(ColumnDef::new(Permissions::GuardName).string().not_null().default("web"))
                 .col(ColumnDef::new(Permissions::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(Permissions::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Permissions::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Permissions::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Permissions::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 // reference: unique(['name', 'guard_name', 'group_name'])
                 .to_owned(),
         )
@@ -609,8 +633,8 @@ async fn auth_and_roles(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 // reference enum('role_type', ['Master', 'Other'])
                 .col(ColumnDef::new(Roles::RoleType).string().not_null().default("Other"))
                 .col(ColumnDef::new(Roles::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(Roles::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Roles::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Roles::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Roles::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .to_owned(),
         )
         .await?;
@@ -651,6 +675,8 @@ async fn auth_and_roles(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 // ---------------------------------------------------------------------------
 
 async fn master_data(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     let _ = &manager;
     manager
         .create_table(
@@ -661,8 +687,8 @@ async fn master_data(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(Units::UnitName).string().not_null())
                 .col(ColumnDef::new(Units::Description).string().null())
                 .col(ColumnDef::new(Units::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(Units::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Units::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Units::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Units::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .to_owned(),
         )
         .await?;
@@ -676,8 +702,8 @@ async fn master_data(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(Brands::Name).string().not_null())
                 .col(ColumnDef::new(Brands::Description).string().null())
                 .col(ColumnDef::new(Brands::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(Brands::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Brands::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Brands::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Brands::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .to_owned(),
         )
         .await?;
@@ -692,8 +718,8 @@ async fn master_data(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(ItemCategories::Description).string().null())
                 .col(ColumnDef::new(ItemCategories::SortId).integer().not_null().default(0))
                 .col(ColumnDef::new(ItemCategories::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(ItemCategories::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(ItemCategories::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(ItemCategories::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(ItemCategories::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .to_owned(),
         )
         .await?;
@@ -719,6 +745,8 @@ async fn master_data(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 // ---------------------------------------------------------------------------
 
 async fn items(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -742,8 +770,8 @@ async fn items(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(Items::LoyaltyPoint).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
                 .col(ColumnDef::new(Items::Photo).string().null())
                 .col(ColumnDef::new(Items::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(Items::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Items::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Items::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Items::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(&mut ForeignKey::create().name("fk_items_category").from(Items::Table, Items::CategoryId).to(ItemCategories::Table, ItemCategories::Id).on_delete(ForeignKeyAction::SetNull).to_owned())
                 .foreign_key(&mut ForeignKey::create().name("fk_items_brand").from(Items::Table, Items::BrandId).to(Brands::Table, Brands::Id).on_delete(ForeignKeyAction::SetNull).to_owned())
                 .foreign_key(&mut ForeignKey::create().name("fk_items_purchase_unit").from(Items::Table, Items::PurchaseUnitId).to(Units::Table, Units::Id).on_delete(ForeignKeyAction::SetNull).to_owned())
@@ -783,6 +811,8 @@ async fn items(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// That single convention means a receipt and a sale are the same kind of row and
 /// an audit never has to special-case a direction.
 async fn sales_and_stock(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -808,8 +838,8 @@ async fn sales_and_stock(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 // inventing a stub table here would fork the schema.
                 .col(ColumnDef::new(Sales::CustomerId).integer().null())
                 .col(ColumnDef::new(Sales::Note).string().null())
-                .col(ColumnDef::new(Sales::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Sales::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Sales::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Sales::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .to_owned(),
         )
         .await?;
@@ -852,7 +882,7 @@ async fn sales_and_stock(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(SaleDetails::Discount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
                 .col(ColumnDef::new(SaleDetails::LineTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
                 .col(ColumnDef::new(SaleDetails::TaxAmount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
-                .col(ColumnDef::new(SaleDetails::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(SaleDetails::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 // Deleting the sale removes its lines — they have no meaning alone.
                 .foreign_key(&mut ForeignKey::create().name("fk_sale_details_sale").from(SaleDetails::Table, SaleDetails::SaleId).to(Sales::Table, Sales::Id).on_delete(ForeignKeyAction::Cascade).to_owned())
                 // RESTRICT, not CASCADE: deleting an item must not erase the record
@@ -894,7 +924,7 @@ async fn sales_and_stock(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 // On-hand immediately after this row. Makes a discrepancy traceable to
                 // one specific movement instead of to a number that drifted.
                 .col(ColumnDef::new(StockMovements::BalanceAfter).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
-                .col(ColumnDef::new(StockMovements::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(StockMovements::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(&mut ForeignKey::create().name("fk_stock_movements_item").from(StockMovements::Table, StockMovements::ItemId).to(Items::Table, Items::Id).on_delete(ForeignKeyAction::Restrict).to_owned())
                 // SET NULL, not CASCADE: a ledger row outlives the sale that caused it.
                 // A return written after the sale is purged still has to be on record.
@@ -949,6 +979,8 @@ async fn sales_and_stock(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// payments, for the same reason stock is a ledger: a stored balance is a
 /// read-modify-write that two concurrent sales can interleave.
 async fn customers_and_suppliers(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -970,8 +1002,8 @@ async fn customers_and_suppliers(manager: &SchemaManager<'_>) -> Result<(), DbEr
                 .col(ColumnDef::new(Customers::Note).string().null())
                 .col(ColumnDef::new(Customers::Photo).string().null())
                 .col(ColumnDef::new(Customers::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(Customers::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Customers::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Customers::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Customers::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .to_owned(),
         )
         .await?;
@@ -1006,8 +1038,8 @@ async fn customers_and_suppliers(manager: &SchemaManager<'_>) -> Result<(), DbEr
                 .col(ColumnDef::new(Suppliers::Note).string().null())
                 .col(ColumnDef::new(Suppliers::Photo).string().null())
                 .col(ColumnDef::new(Suppliers::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(Suppliers::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Suppliers::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Suppliers::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Suppliers::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .to_owned(),
         )
         .await?;
@@ -1038,6 +1070,8 @@ async fn customers_and_suppliers(manager: &SchemaManager<'_>) -> Result<(), DbEr
 /// No `del_status`: a closed shift is immutable history, and an open one is closed
 /// rather than deleted — the same reason `sales` carries none.
 async fn registers(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -1047,8 +1081,8 @@ async fn registers(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(Registers::UserId).integer().not_null())
                 // 'Open' or 'Closed'. Strings, like every other status here.
                 .col(ColumnDef::new(Registers::Status).string().not_null())
-                .col(ColumnDef::new(Registers::OpenedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Registers::ClosedAt).custom(TIMESTAMP).null())
+                .col(ColumnDef::new(Registers::OpenedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Registers::ClosedAt).custom(ts).null())
                 .col(ColumnDef::new(Registers::OpeningBalance).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
                 // Per-method opening float as JSON, mirroring the reference's
                 // `opening_details`: `[{"method":"Cash","amount":"50000.000"}]`.
@@ -1057,7 +1091,7 @@ async fn registers(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(Registers::ClosingBalance).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
                 .col(ColumnDef::new(Registers::ExpectedBalance).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
                 .col(ColumnDef::new(Registers::Note).string().null())
-                .col(ColumnDef::new(Registers::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Registers::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_registers_user")
@@ -1110,6 +1144,8 @@ async fn registers(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 }
 
 async fn sale_returns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -1124,7 +1160,7 @@ async fn sale_returns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(SaleReturns::RefundedTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
                 .col(ColumnDef::new(SaleReturns::ReturnedBy).integer().null())
                 .col(ColumnDef::new(SaleReturns::Note).string().null())
-                .col(ColumnDef::new(SaleReturns::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(SaleReturns::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_sale_returns_sale")
@@ -1183,6 +1219,8 @@ async fn sale_returns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// A customer appointment: who, with which staff member, when. No outlet column —
 /// outlets arrive in Stage 9 and columns pointing at missing tables fork the schema.
 async fn bookings(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -1193,12 +1231,12 @@ async fn bookings(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(Bookings::ServiceSellerId).integer().null())
                 .col(ColumnDef::new(Bookings::CreatedBy).integer().null())
                 .col(ColumnDef::new(Bookings::Status).string().not_null().default("Booked"))
-                .col(ColumnDef::new(Bookings::StartAt).custom(TIMESTAMP).not_null())
-                .col(ColumnDef::new(Bookings::EndAt).custom(TIMESTAMP).not_null())
+                .col(ColumnDef::new(Bookings::StartAt).custom(ts).not_null())
+                .col(ColumnDef::new(Bookings::EndAt).custom(ts).not_null())
                 .col(ColumnDef::new(Bookings::Note).string().null())
                 .col(ColumnDef::new(Bookings::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(Bookings::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Bookings::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Bookings::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Bookings::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_bookings_customer")
@@ -1331,6 +1369,8 @@ async fn installment_stock_link(manager: &SchemaManager<'_>) -> Result<(), DbErr
 /// the same table, with the note number as its reference. No new money table,
 /// no second source for what was paid.
 async fn credit_notes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -1345,7 +1385,7 @@ async fn credit_notes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(CreditNotes::CreatedBy).integer().null())
                 .col(ColumnDef::new(CreditNotes::Note).string().null())
                 .col(ColumnDef::new(CreditNotes::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(CreditNotes::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(CreditNotes::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_credit_notes_customer")
@@ -1429,6 +1469,8 @@ async fn sale_rounding(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// completed sale, anonymous and uneditable — the same screen is offered for
 /// every rating, so there is no path that filters criticism out.
 async fn service_ratings(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -1437,7 +1479,7 @@ async fn service_ratings(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(ServiceRatings::Id).integer().not_null().auto_increment().primary_key().to_owned())
                 .col(ColumnDef::new(ServiceRatings::SaleId).integer().null())
                 .col(ColumnDef::new(ServiceRatings::Rating).string().not_null())
-                .col(ColumnDef::new(ServiceRatings::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(ServiceRatings::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_service_ratings_sale")
@@ -1496,6 +1538,8 @@ async fn service_ratings(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// the same reason stock and money are ledgers here. The column stays (dropping
 /// it strands old databases); the views derive from this table instead.
 async fn loyalty(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -1507,7 +1551,7 @@ async fn loyalty(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 // `Earn`, `Redeem` or `Void`. Signed `points`: earn is positive.
                 .col(ColumnDef::new(LoyaltyEntries::Kind).string().not_null())
                 .col(ColumnDef::new(LoyaltyEntries::Points).integer().not_null())
-                .col(ColumnDef::new(LoyaltyEntries::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(LoyaltyEntries::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_loyalty_entries_customer")
@@ -1614,6 +1658,8 @@ async fn manager_approvals(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// both links are `SetNull` like every other catalog FK — deleting a grouping
 /// must not delete the items in it.
 async fn item_sub_categories(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -1625,8 +1671,8 @@ async fn item_sub_categories(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(ItemSubCategories::Description).string().null())
                 .col(ColumnDef::new(ItemSubCategories::SortId).integer().not_null().default(0))
                 .col(ColumnDef::new(ItemSubCategories::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(ItemSubCategories::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(ItemSubCategories::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(ItemSubCategories::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(ItemSubCategories::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(&mut ForeignKey::create().name("fk_item_sub_categories_category").from(ItemSubCategories::Table, ItemSubCategories::CategoryId).to(ItemCategories::Table, ItemCategories::Id).on_delete(ForeignKeyAction::Cascade).to_owned())
                 .to_owned(),
         )
@@ -1761,6 +1807,8 @@ async fn item_variation_depth(manager: &SchemaManager<'_>) -> Result<(), DbErr> 
 /// is none on `items` — a second figure that can disagree with the ledger is a
 /// bug waiting to happen.
 async fn item_batches(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -1773,8 +1821,8 @@ async fn item_batches(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 // component only invites timezone arguments at the till.
                 .col(ColumnDef::new(ItemBatches::ExpiryDate).date().null())
                 .col(ColumnDef::new(ItemBatches::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(ItemBatches::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(ItemBatches::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(ItemBatches::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(ItemBatches::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_item_batches_item")
@@ -1866,6 +1914,8 @@ async fn item_batches(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// quantity and the price it went at, and on-hand is `SUM(quantity)` over them — the
 /// same derivation as stock, so the two subsystems agree on what a ledger is.
 async fn fixed_assets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -1878,8 +1928,8 @@ async fn fixed_assets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(FixedAssetItems::PurchasePrice).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
                 .col(ColumnDef::new(FixedAssetItems::SalePrice).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
                 .col(ColumnDef::new(FixedAssetItems::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(FixedAssetItems::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(FixedAssetItems::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(FixedAssetItems::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(FixedAssetItems::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .to_owned(),
         )
         .await?;
@@ -1902,7 +1952,7 @@ async fn fixed_assets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(FixedAssetMovements::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
                 .col(ColumnDef::new(FixedAssetMovements::ReferenceNo).string().null())
                 .col(ColumnDef::new(FixedAssetMovements::Note).string().null())
-                .col(ColumnDef::new(FixedAssetMovements::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(FixedAssetMovements::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 // CASCADE: a movement with no asset is a line with no meaning, and an
                 // asset's history is not a financial record the way a sale is.
                 .foreign_key(
@@ -1967,6 +2017,8 @@ async fn fixed_assets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 ///
 /// Refund-to-card is still open: it needs a card target on the return flow.
 async fn gift_cards(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -1977,7 +2029,7 @@ async fn gift_cards(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(GiftCards::Pin).string().null())
                 .col(ColumnDef::new(GiftCards::CreatedBy).integer().null())
                 .col(ColumnDef::new(GiftCards::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(GiftCards::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(GiftCards::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .to_owned(),
         )
         .await?;
@@ -1995,7 +2047,7 @@ async fn gift_cards(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(GiftCardTransactions::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
                 .col(ColumnDef::new(GiftCardTransactions::BalanceAfter).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
                 .col(ColumnDef::new(GiftCardTransactions::PaymentMethod).string().null())
-                .col(ColumnDef::new(GiftCardTransactions::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(GiftCardTransactions::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_gift_card_transactions_card")
@@ -2058,6 +2110,8 @@ async fn gift_cards(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// bills for. Both name the product as free text like the reference — the unit on
 /// the bench is not necessarily a catalog row anymore.
 async fn warranty_and_servicing(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -2068,8 +2122,8 @@ async fn warranty_and_servicing(manager: &SchemaManager<'_>) -> Result<(), DbErr
                 .col(ColumnDef::new(Warranties::ProductName).string().not_null())
                 .col(ColumnDef::new(Warranties::ProductSerialNo).string().null())
                 .col(ColumnDef::new(Warranties::Description).text().null())
-                .col(ColumnDef::new(Warranties::ReceivingDate).custom(TIMESTAMP).not_null())
-                .col(ColumnDef::new(Warranties::DeliveryDate).custom(TIMESTAMP).null())
+                .col(ColumnDef::new(Warranties::ReceivingDate).custom(ts).not_null())
+                .col(ColumnDef::new(Warranties::DeliveryDate).custom(ts).null())
                 .col(ColumnDef::new(Warranties::CurrentStatus).string().not_null().default("R_F_C"))
                 .col(ColumnDef::new(Warranties::TechnicianId).integer().null())
                 .col(ColumnDef::new(Warranties::PresentLocation).string().null())
@@ -2077,8 +2131,8 @@ async fn warranty_and_servicing(manager: &SchemaManager<'_>) -> Result<(), DbErr
                 .col(ColumnDef::new(Warranties::ReceiverServiceCenter).string().null())
                 .col(ColumnDef::new(Warranties::CreatedBy).integer().null())
                 .col(ColumnDef::new(Warranties::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(Warranties::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Warranties::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Warranties::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Warranties::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_warranties_customer")
@@ -2109,16 +2163,16 @@ async fn warranty_and_servicing(manager: &SchemaManager<'_>) -> Result<(), DbErr
                 .col(ColumnDef::new(Servicings::ProductName).string().not_null())
                 .col(ColumnDef::new(Servicings::ProductModel).string().null())
                 .col(ColumnDef::new(Servicings::ProblemDescription).text().null())
-                .col(ColumnDef::new(Servicings::ReceivingDate).custom(TIMESTAMP).not_null())
-                .col(ColumnDef::new(Servicings::DeliveryDate).custom(TIMESTAMP).null())
+                .col(ColumnDef::new(Servicings::ReceivingDate).custom(ts).not_null())
+                .col(ColumnDef::new(Servicings::DeliveryDate).custom(ts).null())
                 .col(ColumnDef::new(Servicings::ServicingCharge).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
                 .col(ColumnDef::new(Servicings::PaidAmount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
                 .col(ColumnDef::new(Servicings::CurrentStatus).string().not_null().default("Received"))
                 .col(ColumnDef::new(Servicings::TechnicianId).integer().null())
                 .col(ColumnDef::new(Servicings::CreatedBy).integer().null())
                 .col(ColumnDef::new(Servicings::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(Servicings::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Servicings::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Servicings::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Servicings::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_servicings_customer")
@@ -2221,6 +2275,8 @@ async fn installment_down_method(manager: &SchemaManager<'_>) -> Result<(), DbEr
 // floor division with the remainder on the first due, like the reference —
 // manual per-due amounts are still open.
 async fn installments(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -2245,8 +2301,8 @@ async fn installments(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(InstallmentSales::CreatedBy).integer().null())
                 .col(ColumnDef::new(InstallmentSales::Note).string().null())
                 .col(ColumnDef::new(InstallmentSales::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(InstallmentSales::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(InstallmentSales::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(InstallmentSales::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(InstallmentSales::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_installment_sales_customer")
@@ -2278,13 +2334,13 @@ async fn installments(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(InstallmentSaleDetails::InstallmentSaleId).integer().not_null())
                 // Midnight on the due day: a due date is a date, and every timestamp
                 // here already means "that day at midnight" when it has to.
-                .col(ColumnDef::new(InstallmentSaleDetails::DueDate).custom(TIMESTAMP).not_null())
+                .col(ColumnDef::new(InstallmentSaleDetails::DueDate).custom(ts).not_null())
                 .col(ColumnDef::new(InstallmentSaleDetails::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
                 .col(ColumnDef::new(InstallmentSaleDetails::PaidAmount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
-                .col(ColumnDef::new(InstallmentSaleDetails::PaidDate).custom(TIMESTAMP).null())
+                .col(ColumnDef::new(InstallmentSaleDetails::PaidDate).custom(ts).null())
                 .col(ColumnDef::new(InstallmentSaleDetails::PaymentMethod).string().null())
                 .col(ColumnDef::new(InstallmentSaleDetails::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(InstallmentSaleDetails::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(InstallmentSaleDetails::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_installment_sale_details_sale")
@@ -2440,6 +2496,8 @@ async fn combos(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// kind does not use stay null, and the commands refuse a row whose kind and
 /// columns disagree — a second table would only move that check, not remove it.
 async fn promotions(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -2456,11 +2514,11 @@ async fn promotions(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(Promotions::MinTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
                 .col(ColumnDef::new(Promotions::BuyQty).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
                 .col(ColumnDef::new(Promotions::GetQty).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
-                .col(ColumnDef::new(Promotions::StartAt).custom(TIMESTAMP).not_null())
-                .col(ColumnDef::new(Promotions::EndAt).custom(TIMESTAMP).not_null())
+                .col(ColumnDef::new(Promotions::StartAt).custom(ts).not_null())
+                .col(ColumnDef::new(Promotions::EndAt).custom(ts).not_null())
                 .col(ColumnDef::new(Promotions::DelStatus).string().not_null().default(DEL_LIVE))
-                .col(ColumnDef::new(Promotions::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(Promotions::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Promotions::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Promotions::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_promotions_target_item")
@@ -2522,6 +2580,8 @@ async fn promotions(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// what separates it from a draft, which is a sale waiting to happen. Totals are
 /// derived from the lines by the commands, never trusted from the client.
 async fn quotations(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -2532,14 +2592,14 @@ async fn quotations(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(Quotations::QuotationNo).string().not_null().unique_key())
                 // Midnight of the quoted day. A date, not an instant: `TIMESTAMP` is
                 // the portable column and midnight UTC keeps ordering sane.
-                .col(ColumnDef::new(Quotations::QuotedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Quotations::QuotedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .col(ColumnDef::new(Quotations::ReferenceNo).string().null())
                 .col(ColumnDef::new(Quotations::Subtotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
                 .col(ColumnDef::new(Quotations::DiscountTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
                 .col(ColumnDef::new(Quotations::GrandTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
                 .col(ColumnDef::new(Quotations::CreatedBy).integer().null())
                 .col(ColumnDef::new(Quotations::Note).string().null())
-                .col(ColumnDef::new(Quotations::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Quotations::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_quotations_customer")
@@ -2622,6 +2682,8 @@ async fn quotations(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// single figure queries read; this table is the detail behind it, so "which card" and
 /// "which QRIS reference" are answerable after the fact rather than lost in one string.
 async fn sale_payments(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -2633,7 +2695,7 @@ async fn sale_payments(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(SalePayments::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
                 // Gateway reference, receipt number, or whatever the tender produces.
                 .col(ColumnDef::new(SalePayments::Reference).string().null())
-                .col(ColumnDef::new(SalePayments::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(SalePayments::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_sale_payments_sale")
@@ -2669,6 +2731,8 @@ async fn sale_payments(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// sales or purchases that made it owed. No running balance column, because that is a
 /// read-modify-write two concurrent payments can interleave.
 async fn trade_credit(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
     manager
         .create_table(
             Table::create()
@@ -2680,8 +2744,8 @@ async fn trade_credit(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(CustomerReceives::Reference).string().null())
                 // When the money arrived, which is not when the row was written: a
                 // receipt for last Tuesday is entered today.
-                .col(ColumnDef::new(CustomerReceives::PaidAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(CustomerReceives::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(CustomerReceives::PaidAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(CustomerReceives::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_customer_receives_customer")
@@ -2705,8 +2769,8 @@ async fn trade_credit(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .col(ColumnDef::new(SupplierPayments::SupplierId).integer().not_null())
                 .col(ColumnDef::new(SupplierPayments::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
                 .col(ColumnDef::new(SupplierPayments::Reference).string().null())
-                .col(ColumnDef::new(SupplierPayments::PaidAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
-                .col(ColumnDef::new(SupplierPayments::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(SupplierPayments::PaidAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(SupplierPayments::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
                 .foreign_key(
                     &mut ForeignKey::create()
                         .name("fk_supplier_payments_supplier")
