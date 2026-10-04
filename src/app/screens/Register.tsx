@@ -19,12 +19,21 @@ interface Tender {
     method: string;
     /** Kept as typed text so the exact digits reach the wire, not a parsed float. */
     amount: string;
+    /** Card number and PIN, only used when the method is stored value. */
+    cardNo: string;
+    pin: string;
 }
+
+const DEFAULT_TENDERS: Tender[] = [
+    { method: "Cash", amount: "", cardNo: "", pin: "" },
+    { method: "Card", amount: "", cardNo: "", pin: "" },
+];
 
 const PAYMENT_METHODS: SelectItemType[] = [
     { id: "Cash", label: "Cash" },
     { id: "Card", label: "Card" },
     { id: "Qris", label: "QRIS" },
+    { id: "GiftCard", label: "Gift card" },
 ];
 
 const ORDER_TYPES: SelectItemType[] = [
@@ -93,10 +102,7 @@ const RegisterScreen = () => {
     // Split is opt-in. The single-tender path is one field and one keypress, and
     // should not become two rows to fill in for the common case.
     const [split, setSplit] = useState(false);
-    const [tenders, setTenders] = useState<Tender[]>([
-        { method: "Cash", amount: "" },
-        { method: "Card", amount: "" },
-    ]);
+    const [tenders, setTenders] = useState<Tender[]>(DEFAULT_TENDERS);
     // "" is a walk-in, which is what most of a counter's sales are.
     const [customerKey, setCustomerKey] = useState("");
     const [customers, setCustomers] = useState<SelectItemType[]>([]);
@@ -244,7 +250,13 @@ const RegisterScreen = () => {
     const tenderLines = (): PaymentLine[] =>
         tenders
             .filter((t) => t.amount.trim() !== "")
-            .map((t) => ({ method: t.method, amount: toDecimal(t.amount), reference: null }));
+            .map((t) => ({
+                method: t.method,
+                amount: toDecimal(t.amount),
+                reference: null,
+                giftCardNo: t.method === "GiftCard" && t.cardNo.trim() !== "" ? t.cardNo.trim() : null,
+                giftCardPin: t.method === "GiftCard" && t.pin.trim() !== "" ? t.pin.trim() : null,
+            }));
 
     const tenderSum = tenderLines().reduce((total, t) => decAdd(total, t.amount), "0");
     // Same rule the server applies, so the cashier sees it before the sale is refused.
@@ -263,9 +275,11 @@ const RegisterScreen = () => {
             // Order-level discount and tax stay zero: nothing configures them yet.
             discountTotal: "0",
             taxTotal,
-            // Blank means paid in full; a smaller figure books a credit sale.
+            // Split tenders replace the single paid/method pair — the server takes
+            // the total from their sum, so the two cannot disagree.
             paidTotal: paidDigits === "" ? null : toDecimal(paidDigits),
             paymentMethod,
+            payments: split ? tenderLines() : null,
             note: note.trim() === "" ? null : note.trim(),
             // Always promote. A draft that moves no stock is a separate flow.
             promote: true,
@@ -280,6 +294,7 @@ const RegisterScreen = () => {
             setPaid("");
             setNote("");
             setOrderType("InStore");
+            setTenders(DEFAULT_TENDERS);
             // The backend returns the balances it committed, so take those over
             // what was cached, then forget them so the next scan refetches.
             for (const entry of view.stockOnHand) requested.current.delete(entry.itemId);
@@ -644,6 +659,36 @@ const RegisterScreen = () => {
                                             )
                                         }
                                     />
+                                    {tender.method === "GiftCard" && (
+                                        <>
+                                            <Input
+                                                label="Card"
+                                                aria-label={`Card number for tender ${index + 1}`}
+                                                value={tender.cardNo}
+                                                onChange={(value) =>
+                                                    setTenders((current) =>
+                                                        current.map((t, i) =>
+                                                            i === index ? { ...t, cardNo: String(value) } : t,
+                                                        ),
+                                                    )
+                                                }
+                                                className="w-32"
+                                            />
+                                            <Input
+                                                label="PIN"
+                                                aria-label={`Card PIN for tender ${index + 1}`}
+                                                value={tender.pin}
+                                                onChange={(value) =>
+                                                    setTenders((current) =>
+                                                        current.map((t, i) =>
+                                                            i === index ? { ...t, pin: String(value) } : t,
+                                                        ),
+                                                    )
+                                                }
+                                                className="w-24"
+                                            />
+                                        </>
+                                    )}
                                 </div>
                             ))}
                             {splitOver && (

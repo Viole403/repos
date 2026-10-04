@@ -25,6 +25,7 @@ import { Promotions } from "./screens/Promotions";
 import { Installments } from "./screens/Installments";
 import { Warranties } from "./screens/Warranties";
 import { Servicings } from "./screens/Servicings";
+import { GiftCards } from "./screens/GiftCards";
 import { Combos } from "./screens/Combos";
 import { Units } from "./screens/Units";
 import { enabledRoutes, navItems } from "./nav-config";
@@ -44,6 +45,7 @@ const screens: Record<string, ReactNode> = {
     "/sales/installments": <Installments />,
     "/sales/warranties": <Warranties />,
     "/sales/servicings": <Servicings />,
+    "/sales/gift-cards": <GiftCards />,
     "/catalog/combos": <Combos />,
     "/catalog/items": <ItemsList />,
     "/catalog/units": <Units />,

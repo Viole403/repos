@@ -240,6 +240,10 @@ export interface PaymentLine {
     amount: Decimal;
     /** Gateway reference, receipt number, or whatever the tender produces. */
     reference?: string | null;
+    /** Required when the method is stored value. The card to debit. */
+    giftCardNo?: string | null;
+    /** The card's PIN, when the card has one. */
+    giftCardPin?: string | null;
 }
 
 export interface SalePayment {
@@ -942,6 +946,43 @@ export const collectServicingPayment = (id: number, amount: Decimal) =>
 export const listServicings = (customerId: number | null = null, query: PageQuery = {}) =>
     call<Page<ServicingSummary>>("list_servicings", { customerId, query });
 export const getServicing = (id: number) => call<ServicingView>("get_servicing", { id });
+
+/** Stored value. The balance is derived server-side — this screen never computes money. */
+export interface GiftCardSummary {
+    id: number;
+    cardNo: string;
+    balance: Decimal;
+    createdAt: string;
+}
+
+export interface GiftCardTransactionView {
+    id: number;
+    giftCardId: number;
+    saleId: number | null;
+    /** `Sell` | `Reload` | `Redeem`. */
+    kind: string;
+    amount: Decimal;
+    balanceAfter: Decimal;
+    paymentMethod: string | null;
+    createdAt: string;
+}
+
+export interface GiftCardView {
+    card: {
+        id: number;
+        cardNo: string;
+        createdAt: string;
+    };
+    balance: Decimal;
+    transactions: GiftCardTransactionView[];
+}
+
+export const sellGiftCard = (cardNo: string, amount: Decimal, paymentMethod: string, pin?: string) =>
+    call<GiftCardView>("sell_gift_card", { cardNo, amount, paymentMethod, pin: pin ?? null });
+export const reloadGiftCard = (cardNo: string, amount: Decimal, paymentMethod: string) =>
+    call<GiftCardView>("reload_gift_card", { cardNo, amount, paymentMethod });
+export const listGiftCards = (query: PageQuery = {}) => call<Page<GiftCardSummary>>("list_gift_cards", { query });
+export const getGiftCard = (cardNo: string) => call<GiftCardView>("get_gift_card", { cardNo });
 
 export const discardDraft = (saleId: number) => call<void>("discard_draft", { saleId });
 
