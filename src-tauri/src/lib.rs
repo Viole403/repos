@@ -2749,6 +2749,229 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Promotion application
+    //
+    // Exercised through checkout, not the pure function: what matters is the money
+    // on the stored rows, and that is only observable after a full write.
+    // -----------------------------------------------------------------------
+
+    fn percent_promo(item_id: i32, percent: i64) -> commands::PromotionInput {
+        commands::PromotionInput {
+            title: "Test percent".into(),
+            kind: "ItemPercent".into(),
+            target_item_id: Some(item_id),
+            reward_item_id: None,
+            percent: Some(Decimal::new(percent, 0)),
+            amount: None,
+            min_total: None,
+            buy_qty: None,
+            get_qty: None,
+            start_at: "2020-01-01".into(),
+            end_at: "2030-12-31".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_applies_an_item_percent_promo() {
+        let db = db::init_for_tests().await;
+        let cola = seed_item(&db, "Cola").await;
+        seed_stock(&db, cola, dec(10)).await;
+        commands::create_promotion_in(&db, percent_promo(cola, 10)).await.expect("promo");
+
+        let view = sell_one_item(&db, cola, Decimal::new(100_000, 3), None, None)
+            .await
+            .expect("checkout");
+        assert_eq!(view.lines[0].discount, Decimal::new(10_000, 3));
+        assert_eq!(view.sale.grand_total, Decimal::new(90_000, 3));
+    }
+
+    #[tokio::test]
+    async fn a_manual_discount_beats_a_promo_instead_of_stacking() {
+        let db = db::init_for_tests().await;
+        let cola = seed_item(&db, "Cola").await;
+        seed_stock(&db, cola, dec(10)).await;
+        commands::create_promotion_in(&db, percent_promo(cola, 50)).await.expect("promo");
+
+        let view = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![commands::CheckoutLine {
+                    item_id: cola,
+                    quantity: Decimal::new(1_000, 3),
+                    unit_price: Decimal::new(100_000, 3),
+                    discount: Some(Decimal::new(5_000, 3)),
+                }],
+                discount_total: Some(Decimal::ZERO),
+                tax_total: Some(Decimal::ZERO),
+                paid_total: None,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: Some(true),
+                customer_id: None,
+                payments: None,
+            },
+        )
+        .await
+        .expect("checkout");
+        // The 5.000 manual discount stands; the 50% promo adds nothing.
+        assert_eq!(view.lines[0].discount, Decimal::new(5_000, 3));
+        assert_eq!(view.sale.grand_total, Decimal::new(95_000, 3));
+    }
+
+    #[tokio::test]
+    async fn an_order_promo_needs_its_minimum_and_the_best_wins() {
+        let db = db::init_for_tests().await;
+        let cola = seed_item(&db, "Cola").await;
+        seed_stock(&db, cola, dec(10)).await;
+        // 5% and 20% both apply, so the best wins; the fixed 50 needs a 200
+        // subtotal the 100 sale never reaches, so the minimum gate excludes it.
+        for (title, kind, value, min) in [
+            ("Five percent", "OrderPercent", Decimal::new(5, 0), Decimal::ZERO),
+            ("Twenty percent", "OrderPercent", Decimal::new(20, 0), Decimal::ZERO),
+            ("Fifty fixed", "OrderFixed", Decimal::new(50_000, 3), Decimal::new(200_000, 3)),
+        ] {
+            commands::create_promotion_in(
+                &db,
+                commands::PromotionInput {
+                    title: title.into(),
+                    kind: kind.into(),
+                    target_item_id: None,
+                    reward_item_id: None,
+                    percent: if kind == "OrderPercent" { Some(value) } else { None },
+                    amount: if kind == "OrderFixed" { Some(value) } else { None },
+                    min_total: Some(min),
+                    buy_qty: None,
+                    get_qty: None,
+                    start_at: "2020-01-01".into(),
+                    end_at: "2030-12-31".into(),
+                },
+            )
+            .await
+            .expect("promo");
+        }
+
+        let view = sell_one_item(&db, cola, Decimal::new(100_000, 3), None, None)
+            .await
+            .expect("checkout");
+        assert_eq!(view.sale.discount_total, Decimal::new(20_000, 3));
+        assert_eq!(view.sale.grand_total, Decimal::new(80_000, 3));
+    }
+
+    #[tokio::test]
+    async fn an_expired_promo_changes_nothing() {
+        let db = db::init_for_tests().await;
+        let cola = seed_item(&db, "Cola").await;
+        seed_stock(&db, cola, dec(10)).await;
+        let mut input = percent_promo(cola, 10);
+        input.start_at = "2020-01-01".into();
+        input.end_at = "2020-12-31".into();
+        commands::create_promotion_in(&db, input).await.expect("promo");
+
+        let view = sell_one_item(&db, cola, Decimal::new(100_000, 3), None, None)
+            .await
+            .expect("checkout");
+        assert_eq!(view.lines[0].discount, Decimal::ZERO);
+        assert_eq!(view.sale.grand_total, Decimal::new(100_000, 3));
+    }
+
+    #[tokio::test]
+    async fn buy_get_discounts_the_reward_lines_in_the_cart() {
+        let db = db::init_for_tests().await;
+        let cola = seed_item(&db, "Cola").await;
+        let chips = seed_item(&db, "Chips").await;
+        seed_stock(&db, cola, dec(10)).await;
+        seed_stock(&db, chips, dec(10)).await;
+        commands::create_promotion_in(
+            &db,
+            commands::PromotionInput {
+                title: "Buy 2 cola get 1 chips".into(),
+                kind: "BuyGet".into(),
+                target_item_id: Some(cola),
+                reward_item_id: Some(chips),
+                percent: None,
+                amount: None,
+                min_total: None,
+                buy_qty: Some(Decimal::new(2_000, 3)),
+                get_qty: Some(Decimal::new(1_000, 3)),
+                start_at: "2020-01-01".into(),
+                end_at: "2030-12-31".into(),
+            },
+        )
+        .await
+        .expect("promo");
+
+        let view = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![
+                    commands::CheckoutLine {
+                        item_id: cola,
+                        quantity: Decimal::new(2_000, 3),
+                        unit_price: Decimal::new(50_000, 3),
+                        discount: None,
+                    },
+                    commands::CheckoutLine {
+                        item_id: chips,
+                        quantity: Decimal::new(1_000, 3),
+                        unit_price: Decimal::new(20_000, 3),
+                        discount: None,
+                    },
+                ],
+                discount_total: Some(Decimal::ZERO),
+                tax_total: Some(Decimal::ZERO),
+                paid_total: None,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: Some(true),
+                customer_id: None,
+                payments: None,
+            },
+        )
+        .await
+        .expect("checkout");
+        let chips_line = view.lines.iter().find(|l| l.item_id == chips).expect("chips line");
+        assert_eq!(chips_line.discount, Decimal::new(20_000, 3));
+        assert_eq!(view.sale.grand_total, Decimal::new(100_000, 3));
+    }
+
+    #[tokio::test]
+    async fn promote_applies_the_promos_live_at_promote_time() {
+        let db = db::init_for_tests().await;
+        let cola = seed_item(&db, "Cola").await;
+        seed_stock(&db, cola, dec(10)).await;
+
+        let draft = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![commands::CheckoutLine {
+                    item_id: cola,
+                    quantity: Decimal::new(1_000, 3),
+                    unit_price: Decimal::new(100_000, 3),
+                    discount: None,
+                }],
+                discount_total: Some(Decimal::ZERO),
+                tax_total: Some(Decimal::ZERO),
+                paid_total: None,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: Some(false),
+                customer_id: None,
+                payments: None,
+            },
+        )
+        .await
+        .expect("park");
+        assert_eq!(draft.lines[0].discount, Decimal::ZERO);
+
+        commands::create_promotion_in(&db, percent_promo(cola, 10)).await.expect("promo");
+        let view = commands::promote_draft_in(&db, draft.sale.id, None, None)
+            .await
+            .expect("promote");
+        assert_eq!(view.lines[0].discount, Decimal::new(10_000, 3));
+        assert_eq!(view.sale.grand_total, Decimal::new(90_000, 3));
+    }
+
     #[tokio::test]
     async fn list_quotations_is_newest_first_with_customer_names() {
         let db = db::init_for_tests().await;

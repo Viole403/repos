@@ -2168,6 +2168,25 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     let sale_id = header.id;
     let invoice_no = invoice_no_for(sale_id);
 
+    // Promotions apply at completion, not at park time: a draft stores manual-only
+    // lines, and the rules are re-read when it promotes — the catalog may have
+    // changed while it waited, same reason the shelf is re-read then.
+    let promo_lines: Vec<PromoLine> = input
+        .lines
+        .iter()
+        .map(|line| PromoLine {
+            item_id: line.item_id,
+            quantity: line.quantity,
+            unit_price: line.unit_price,
+            manual: line.discount.unwrap_or(Decimal::ZERO),
+        })
+        .collect();
+    let promo = if promoted {
+        apply_promotions(&txn, &promo_lines, now).await?
+    } else {
+        PromoOutcome { line_promos: vec![Decimal::ZERO; promo_lines.len()], order_promo: Decimal::ZERO }
+    };
+
     let mut subtotal = Decimal::ZERO;
     let mut line_discount_total = Decimal::ZERO;
     let mut lines = Vec::with_capacity(input.lines.len());
@@ -2176,9 +2195,9 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     // reports one row holding the final balance rather than two stale ones.
     let mut seen: HashMap<i32, usize> = HashMap::with_capacity(input.lines.len());
 
-    for line in &input.lines {
+    for (index, line) in input.lines.iter().enumerate() {
         let (item_name, available) = guard_line_sellable(&txn, line).await?;
-        let discount = line.discount.unwrap_or(Decimal::ZERO);
+        let discount = line.discount.unwrap_or(Decimal::ZERO) + promo.line_promos[index];
         let gross = line.unit_price * line.quantity;
 
         lines.push(
@@ -2224,7 +2243,7 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     // once to obtain the primary key, once with the real invoice number and totals.
     // Both statements are in the same transaction, so no reader ever sees the
     // half-filled row.
-    let discount_total = line_discount_total + input.discount_total.unwrap_or(Decimal::ZERO);
+    let discount_total = line_discount_total + input.discount_total.unwrap_or(Decimal::ZERO) + promo.order_promo;
     guard_discount_within_subtotal(discount_total, subtotal)?;
     let tax_total = input.tax_total.unwrap_or(Decimal::ZERO);
     let grand_total = subtotal - discount_total + tax_total;
@@ -2450,6 +2469,25 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
     })?;
     guard_discount_within_subtotal(discount_total, subtotal)?;
 
+    // Promotions are evaluated at promote time, not park time: the rules live in the
+    // catalog and may have changed while the draft waited — same reason the shelf
+    // and the line totals are re-read below rather than trusted.
+    let promo_lines: Vec<PromoLine> = stored
+        .iter()
+        .map(|l| PromoLine {
+            item_id: l.item_id,
+            quantity: l.quantity,
+            unit_price: l.unit_price,
+            manual: l.discount,
+        })
+        .collect();
+    let promo = apply_promotions(&txn, &promo_lines, now).await?;
+    // The stored header figures are manual-only; the promo line discounts land on
+    // the rows below, so they join the header total here — otherwise the receipt
+    // shows discounted lines under an undiscounted grand total.
+    let promo_lines_sum: Decimal = promo.line_promos.iter().sum();
+    let discount_total = discount_total + promo_lines_sum + promo.order_promo;
+
     let grand_total = subtotal - discount_total + tax_total;
     let paid = paid_total.unwrap_or(grand_total);
 
@@ -2457,7 +2495,7 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
     let mut stock_on_hand: Vec<ItemOnHand> = Vec::with_capacity(stored.len());
     let mut seen: HashMap<i32, usize> = HashMap::with_capacity(stored.len());
 
-    for stored_line in &stored {
+    for (index, stored_line) in stored.iter().enumerate() {
         let line = CheckoutLine {
             item_id: stored_line.item_id,
             quantity: stored_line.quantity,
@@ -2468,14 +2506,16 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
         // because another till may have sold this stock while the draft waited. Also
         // rejects the sale if the item was soft-deleted in the meantime.
         let (_, available) = guard_line_sellable(&txn, &line).await?;
-        let net = stored_line.unit_price * stored_line.quantity - stored_line.discount;
+        let discount = stored_line.discount + promo.line_promos[index];
+        let net = stored_line.unit_price * stored_line.quantity - discount;
 
-        let line_row = if net == stored_line.line_total {
+        let line_row = if discount == stored_line.discount && net == stored_line.line_total {
             stored_line.clone()
         } else {
             // Persist the rebuilt figure, so the stored row matches the money actually
             // charged rather than the provisional one written at draft time.
             let mut am: sale_detail::ActiveModel = stored_line.clone().into();
+            am.discount = Set(discount);
             am.line_total = Set(net);
             am.update(&txn).await?
         };
@@ -3826,9 +3866,11 @@ async fn resolve_promotion<C: ConnectionTrait>(conn: &C, input: &PromotionInput)
     Ok(resolved)
 }
 
-/// A live promotion overlapping this one's dates on the same scope. Two discounts
-/// on one item stop being explainable at the till, so the second one is refused
-/// instead of stacked — same reason a manual discount beats a promo at checkout.
+/// A live promotion overlapping this one's dates on the same scope. Item promos
+/// collide per item and BuyGet collides per buy item: two discounts on one line
+/// stop being explainable at the till, so the second one is refused instead of
+/// stacked. Order promos are exempt — several can coexist because only the best
+/// one ever applies — which is also why "best wins" needs no tie-break.
 async fn overlapping_promotion<C: ConnectionTrait>(
     conn: &C,
     kind: &str,
@@ -3837,18 +3879,16 @@ async fn overlapping_promotion<C: ConnectionTrait>(
     end_at: NaiveDateTime,
     exclude_id: Option<i32>,
 ) -> CmdResult<Option<promotion::Model>> {
+    if kind != "BuyGet" && kind != "ItemPercent" && kind != "ItemFixed" {
+        return Ok(None);
+    }
+    let target = target_item_id.ok_or_else(|| CmdError::Validation("promotion has no target item".into()))?;
     let mut q = promotion::Entity::find()
         .filter(promotion::Column::DelStatus.eq(LIVE))
         .filter(promotion::Column::Kind.eq(kind))
+        .filter(promotion::Column::TargetItemId.eq(target))
         .filter(promotion::Column::StartAt.lt(end_at))
         .filter(promotion::Column::EndAt.gt(start_at));
-    // Item promos collide per item; order promos collide with each other outright.
-    // A BuyGet collides on its buy item: two freebies on one trigger is the same
-    // unexplainable stack.
-    if kind == "BuyGet" || kind == "ItemPercent" || kind == "ItemFixed" {
-        let target = target_item_id.ok_or_else(|| CmdError::Validation("promotion has no target item".into()))?;
-        q = q.filter(promotion::Column::TargetItemId.eq(target));
-    }
     if let Some(id) = exclude_id {
         q = q.filter(promotion::Column::Id.ne(id));
     }
@@ -3987,6 +4027,105 @@ pub async fn delete_promotion_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdRe
         return Err(CmdError::NotFound("promotion".into()));
     }
     Ok(())
+}
+
+/// One cart line as the promotion engine sees it. Manual discounts ride along so
+/// the engine can leave them alone: a cashier's explicit discount always wins and
+/// a promo never stacks on top of it.
+struct PromoLine {
+    item_id: i32,
+    quantity: Decimal,
+    unit_price: Decimal,
+    manual: Decimal,
+}
+
+struct PromoOutcome {
+    /// Promo discount per line, aligned with the input order.
+    line_promos: Vec<Decimal>,
+    /// The winning order-level promo amount, already capped.
+    order_promo: Decimal,
+}
+
+/// Discounts the till applies by itself. Pure computation over loaded rows: the
+/// only database touch is reading the active rules, so this is unit-testable
+/// through checkout rather than needing its own harness.
+async fn apply_promotions<C: ConnectionTrait>(
+    conn: &C,
+    lines: &[PromoLine],
+    at: NaiveDateTime,
+) -> CmdResult<PromoOutcome> {
+    let promos: Vec<promotion::Model> = promotion::Entity::find()
+        .filter(promotion::Column::DelStatus.eq(LIVE))
+        .filter(promotion::Column::StartAt.lte(at))
+        .filter(promotion::Column::EndAt.gt(at))
+        .all(conn)
+        .await?;
+
+    let subtotal: Decimal = lines.iter().map(|l| l.unit_price * l.quantity).sum();
+    let mut line_promos = vec![Decimal::ZERO; lines.len()];
+
+    for (i, line) in lines.iter().enumerate() {
+        if line.manual > Decimal::ZERO {
+            continue;
+        }
+        let gross = line.unit_price * line.quantity;
+        let mut best = Decimal::ZERO;
+        for promo in promos.iter().filter(|p| {
+            (p.kind == "ItemPercent" || p.kind == "ItemFixed") && p.target_item_id == Some(line.item_id)
+        }) {
+            let value = match promo.kind.as_str() {
+                "ItemPercent" => gross * promo.percent.unwrap_or(Decimal::ZERO) / Decimal::new(100, 0),
+                _ => promo.amount.unwrap_or(Decimal::ZERO) * line.quantity,
+            };
+            // Capped at the line: a fixed amount larger than a cheap line is a
+            // free item, not a negative one.
+            best = best.max(value.min(gross));
+        }
+        line_promos[i] = best.round_dp(MONEY_SCALE);
+    }
+
+    for (i, line) in lines.iter().enumerate() {
+        let gross = line.unit_price * line.quantity;
+        let mut earned_value = Decimal::ZERO;
+        for promo in promos.iter().filter(|p| p.kind == "BuyGet") {
+            let Some(target) = promo.target_item_id else { continue };
+            let bought: Decimal = lines
+                .iter()
+                .filter(|l| l.item_id == target)
+                .map(|l| l.quantity)
+                .sum();
+            let sets = (bought / promo.buy_qty.unwrap_or(Decimal::ONE)).floor();
+            if sets <= Decimal::ZERO {
+                continue;
+            }
+            // Valued at this line's own price: the free units are worth what the
+            // customer would otherwise have paid for them here.
+            if Some(line.item_id) == promo.reward_item_id && line.manual <= Decimal::ZERO {
+                earned_value += sets * promo.get_qty.unwrap_or(Decimal::ZERO) * line.unit_price;
+            }
+        }
+        if earned_value > Decimal::ZERO {
+            line_promos[i] = (line_promos[i] + earned_value.min(gross)).round_dp(MONEY_SCALE);
+        }
+    }
+
+    let mut order_promo = Decimal::ZERO;
+    for promo in promos.iter().filter(|p| p.kind == "OrderPercent" || p.kind == "OrderFixed") {
+        if subtotal < promo.min_total.unwrap_or(Decimal::ZERO) {
+            continue;
+        }
+        let value = match promo.kind.as_str() {
+            "OrderPercent" => subtotal * promo.percent.unwrap_or(Decimal::ZERO) / Decimal::new(100, 0),
+            _ => promo.amount.unwrap_or(Decimal::ZERO),
+        };
+        order_promo = order_promo.max(value);
+    }
+    // Capped at what is left after the line promos: the grand total cannot go
+    // negative no matter how the rules combine.
+    let line_total: Decimal = line_promos.iter().sum();
+    order_promo = order_promo.min((subtotal - line_total).max(Decimal::ZERO)).round_dp(MONEY_SCALE);
+
+    Ok(PromoOutcome { line_promos, order_promo })
 }
 
 // ---------------------------------------------------------------------------
