@@ -52,6 +52,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::ManagerApprovals),
             Box::new(Migrations::ItemSubCategories),
             Box::new(Migrations::ItemVariationDepth),
+            Box::new(Migrations::ItemBatches),
         ]
     }
 }
@@ -85,6 +86,7 @@ pub enum Migrations {
     ManagerApprovals,
     ItemSubCategories,
     ItemVariationDepth,
+    ItemBatches,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -148,6 +150,7 @@ impl MigrationName for Migrations {
         Migrations::ManagerApprovals => "manager_approvals",
         Migrations::ItemSubCategories => "item_sub_categories",
         Migrations::ItemVariationDepth => "item_variation_depth",
+        Migrations::ItemBatches => "item_batches",
         }
     }
 }
@@ -183,6 +186,7 @@ impl MigrationTrait for Migrations {
             Migrations::ManagerApprovals => manager_approvals(manager).await?,
             Migrations::ItemSubCategories => item_sub_categories(manager).await?,
             Migrations::ItemVariationDepth => item_variation_depth(manager).await?,
+            Migrations::ItemBatches => item_batches(manager).await?,
         }
         Ok(())
     }
@@ -190,6 +194,21 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::ItemBatches => {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(StockMovements::Table)
+                            .drop_column(StockMovements::BatchId)
+                            .to_owned(),
+                    )
+                    .await?;
+                manager
+                    .drop_table(
+                        Table::drop().table(ItemBatches::Table).if_exists().to_owned(),
+                    )
+                    .await?;
+            }
             Migrations::ItemVariationDepth => {
                 manager
                     .alter_table(
@@ -1701,6 +1720,112 @@ async fn item_variation_depth(manager: &SchemaManager<'_>) -> Result<(), DbErr> 
     Ok(())
 }
 
+/// Per-lot dates for perishables and medicine. The reference stores an expiry
+/// string per line description with no quantity split, so two lots of the same
+/// product cannot be told apart at the till — FEFO needs to know which lot a
+/// unit came from, and an expired lot must refuse to sell rather than sitting in
+/// the same pile as a fresh one.
+///
+/// `batch_id` on the ledger is the whole design: on-hand per lot is `SUM(quantity)`
+/// over the rows naming that lot, exactly as item-level on-hand already is. There
+/// is deliberately no quantity column on `item_batches` for the same reason there
+/// is none on `items` — a second figure that can disagree with the ledger is a
+/// bug waiting to happen.
+async fn item_batches(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(ItemBatches::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(ItemBatches::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(ItemBatches::ItemId).integer().not_null())
+                .col(ColumnDef::new(ItemBatches::BatchNo).string().not_null())
+                // A date, not a timestamp: an expiry is a calendar day, and a time
+                // component only invites timezone arguments at the till.
+                .col(ColumnDef::new(ItemBatches::ExpiryDate).date().null())
+                .col(ColumnDef::new(ItemBatches::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(ItemBatches::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(ItemBatches::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_item_batches_item")
+                        .from(ItemBatches::Table, ItemBatches::ItemId)
+                        .to(Items::Table, Items::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .alter_table(
+            Table::alter()
+                .table(StockMovements::Table)
+                .add_column(ColumnDef::new(StockMovements::BatchId).integer().null().to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    // Same SQLite limitation as every other added-column FK: it cannot be added
+    // after the fact, so only Postgres gets the constraint. The application
+    // always writes a live batch id or NULL.
+    if manager.get_database_backend() != sea_orm::DbBackend::Sqlite {
+        manager
+            .create_foreign_key(
+                ForeignKey::create()
+                    .name("fk_stock_movements_batch")
+                    .from(StockMovements::Table, StockMovements::BatchId)
+                    .to(ItemBatches::Table, ItemBatches::Id)
+                    .on_delete(ForeignKeyAction::SetNull)
+                    .to_owned(),
+            )
+            .await?;
+    }
+
+    // FEFO reads batches for one item ordered by expiry, and the ledger read is
+    // filtered per lot — both are index lookups rather than scans.
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_item_batches_item")
+                .table(ItemBatches::Table)
+                .col(ItemBatches::ItemId)
+                .to_owned(),
+        )
+        .await?;
+
+    // Unique per item rather than globally: two products from the same
+    // manufacturer print the same lot number, and that is not a clash. A
+    // composite key, so it is an index rather than a column's `unique_key`.
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .unique()
+                .name("idx_item_batches_item_no")
+                .table(ItemBatches::Table)
+                .col(ItemBatches::ItemId)
+                .col(ItemBatches::BatchNo)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_stock_movements_batch")
+                .table(StockMovements::Table)
+                .col(StockMovements::BatchId)
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
+}
+
 /// Stored value: a card number with a transaction ledger behind it. The balance is
 /// `SUM(amount)` — never a mutated column — and every row carries `balance_after`
 /// like the stock ledger, so a discrepancy points at one row.
@@ -3136,11 +3261,24 @@ enum StockMovements {
     ItemId,
     SaleId,
     InstallmentSaleId,
+    BatchId,
     MovementType,
     Quantity,
     Reference,
     BalanceAfter,
     CreatedAt,
+}
+
+#[derive(Iden)]
+enum ItemBatches {
+    Table,
+    Id,
+    ItemId,
+    BatchNo,
+    ExpiryDate,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
 }
 
 
