@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::db;
 use crate::entities::auth::users;
-use crate::entities::catalog::{brand, item, item_category, unit};
+use crate::entities::catalog::{brand, item, item_category, item_sub_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
 use crate::entities::sales::{booking, combo_item, combo_sale, credit_note, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, loyalty_entry, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, service_rating, servicing, stock_movement, warranty};
@@ -1479,12 +1479,19 @@ pub async fn create_item_category(input: CategoryInput) -> CmdResult<item_catego
     // validation messages to probe the command.
     crate::commands_auth::require_permission(db(), "item_category-create").await?;
     let name = required(&input.name, "category name")?;
-    let db = db();
+    create_item_category_in(db(), name, input.description, input.sort_id).await
+}
 
+pub(crate) async fn create_item_category_in<C: ConnectionTrait>(
+    conn: &C,
+    name: String,
+    description: Option<String>,
+    sort_id: i32,
+) -> CmdResult<item_category::Model> {
     let existing = item_category::Entity::find()
         .filter(item_category::Column::Name.eq(&name))
         .filter(item_category::Column::DelStatus.eq(LIVE))
-        .one(db)
+        .one(conn)
         .await?;
     if existing.is_some() {
         return Err(CmdError::Conflict(format!("item category '{name}' already exists")));
@@ -1493,14 +1500,14 @@ pub async fn create_item_category(input: CategoryInput) -> CmdResult<item_catego
     let now = crate::migration::now();
     Ok(item_category::ActiveModel {
         name: Set(name),
-        description: Set(input.description),
-        sort_id: Set(input.sort_id),
+        description: Set(description),
+        sort_id: Set(sort_id),
         del_status: Set(LIVE.to_owned()),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
     }
-    .insert(db)
+    .insert(conn)
     .await?)
 }
 
@@ -1515,6 +1522,116 @@ pub async fn delete_item_category(id: i32) -> CmdResult<()> {
         return Err(CmdError::NotFound("item category".into()));
     };
     let mut model: item_category::ActiveModel = found.into();
+    model.del_status = Set(DELETED.to_owned());
+    model.updated_at = Set(crate::migration::now());
+    model.update(db).await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubCategoryInput {
+    pub category_id: i32,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub sort_id: i32,
+}
+
+/// A sub-category's parent must be live: orphan rows group nothing.
+async fn guard_sub_category_parent<C: ConnectionTrait>(
+    conn: &C,
+    category_id: i32,
+) -> CmdResult<()> {
+    item_category::Entity::find_by_id(category_id)
+        .filter(item_category::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("item category".into()))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_item_sub_categories(
+    category_id: Option<i32>,
+    query: PageQuery,
+) -> CmdResult<Page<item_sub_category::Model>> {
+    crate::commands_auth::require_permission(db(), "item_category-list").await?;
+    list_item_sub_categories_in(db(), category_id, &query).await
+}
+
+pub(crate) async fn list_item_sub_categories_in<C: ConnectionTrait>(
+    conn: &C,
+    category_id: Option<i32>,
+    query: &PageQuery,
+) -> CmdResult<Page<item_sub_category::Model>> {
+    let mut q = item_sub_category::Entity::find()
+        .filter(item_sub_category::Column::DelStatus.eq(LIVE));
+    if let Some(category_id) = category_id {
+        q = q.filter(item_sub_category::Column::CategoryId.eq(category_id));
+    }
+    if let Some(term) = query.term() {
+        q = q.filter(item_sub_category::Column::Name.contains(like_term(&term)));
+    }
+    let total = q.clone().count(conn).await?;
+    let rows = q
+        .order_by_asc(item_sub_category::Column::SortId)
+        .order_by_asc(item_sub_category::Column::Name)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+    Ok(Page::new(rows, total, query))
+}
+
+#[tauri::command]
+pub async fn create_item_sub_category(
+    input: SubCategoryInput,
+) -> CmdResult<item_sub_category::Model> {
+    crate::commands_auth::require_permission(db(), "item_category-create").await?;
+    create_item_sub_category_in(db(), input).await
+}
+
+pub(crate) async fn create_item_sub_category_in<C: ConnectionTrait>(
+    conn: &C,
+    input: SubCategoryInput,
+) -> CmdResult<item_sub_category::Model> {
+    let name = required(&input.name, "sub-category name")?;
+    guard_sub_category_parent(conn, input.category_id).await?;
+    let existing = item_sub_category::Entity::find()
+        .filter(item_sub_category::Column::CategoryId.eq(input.category_id))
+        .filter(item_sub_category::Column::Name.eq(&name))
+        .filter(item_sub_category::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?;
+    if existing.is_some() {
+        return Err(CmdError::Conflict(format!(
+            "sub-category '{name}' already exists in this category"
+        )));
+    }
+    let now = crate::migration::now();
+    Ok(item_sub_category::ActiveModel {
+        category_id: Set(input.category_id),
+        name: Set(name),
+        description: Set(input.description),
+        sort_id: Set(input.sort_id),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?)
+}
+
+#[tauri::command]
+pub async fn delete_item_sub_category(id: i32) -> CmdResult<()> {
+    crate::commands_auth::require_permission(db(), "item_category-destroy").await?;
+    let db = db();
+    let Some(found) = item_sub_category::Entity::find_by_id(id).one(db).await? else {
+        return Err(CmdError::NotFound("item sub-category".into()));
+    };
+    let mut model: item_sub_category::ActiveModel = found.into();
     model.del_status = Set(DELETED.to_owned());
     model.updated_at = Set(crate::migration::now());
     model.update(db).await?;
@@ -1539,6 +1656,8 @@ pub struct ItemInput {
     #[serde(default)]
     pub category_id: Option<i32>,
     #[serde(default)]
+    pub sub_category_id: Option<i32>,
+    #[serde(default)]
     pub brand_id: Option<i32>,
     #[serde(default)]
     pub purchase_unit_id: Option<i32>,
@@ -1556,6 +1675,8 @@ pub struct ItemInput {
     pub alert_quantity: Option<Decimal>,
     #[serde(default)]
     pub loyalty_point: Decimal,
+    #[serde(default)]
+    pub photo: Option<String>,
 }
 
 fn one() -> Decimal {
@@ -1584,6 +1705,43 @@ fn validate(input: &ItemInput) -> CmdResult<()> {
     if input.conversion_rate <= Decimal::ZERO {
         return Err(CmdError::Validation(
             "conversion rate must be greater than zero".into(),
+        ));
+    }
+    // A data URI is the only photo shape that survives a desktop database file
+    // moving between machines; a filesystem path would dangle. Capped so one
+    // product shot cannot bloat the row into megabytes.
+    if let Some(photo) = input.photo.as_deref() {
+        if !(photo.starts_with("data:image/") && photo.contains(";base64,")) {
+            return Err(CmdError::Validation("photo must be a data URI image".into()));
+        }
+        if photo.len() > 1_000_000 {
+            return Err(CmdError::Validation("photo is too large".into()));
+        }
+    }
+    Ok(())
+}
+
+/// A sub-category belongs to exactly one category, so an item naming one must
+/// also name its parent — otherwise the two columns disagree about where the
+/// item lives and the category sidebar lies.
+async fn guard_sub_category_belongs<C: ConnectionTrait>(
+    conn: &C,
+    category_id: Option<i32>,
+    sub_category_id: Option<i32>,
+) -> CmdResult<()> {
+    let Some(sub_id) = sub_category_id else {
+        return Ok(());
+    };
+    let Some(sub) = item_sub_category::Entity::find_by_id(sub_id)
+        .filter(item_sub_category::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+    else {
+        return Err(CmdError::NotFound("item sub-category".into()));
+    };
+    if category_id != Some(sub.category_id) {
+        return Err(CmdError::Validation(
+            "sub-category does not belong to the chosen category".into(),
         ));
     }
     Ok(())
@@ -1621,9 +1779,11 @@ pub async fn list_items(query: PageQuery) -> CmdResult<Page<ItemView>> {
     // Lookup tables are small and shared across every item, so each is loaded once
     // per request and indexed by id — one round trip each instead of a join per row.
     let categories = item_category::Entity::find().all(db).await?;
+    let sub_categories = item_sub_category::Entity::find().all(db).await?;
     let brands = brand::Entity::find().all(db).await?;
     let units = unit::Entity::find().all(db).await?;
     let categories = by_id(categories.into_iter().map(|r| (r.id, r.name)));
+    let sub_categories = by_id(sub_categories.into_iter().map(|r| (r.id, r.name)));
     let brands = by_id(brands.into_iter().map(|r| (r.id, r.name)));
     let units = by_id(units.into_iter().map(|r| (r.id, r.unit_name)));
 
@@ -1638,6 +1798,8 @@ pub async fn list_items(query: PageQuery) -> CmdResult<Page<ItemView>> {
             description: i.description,
             category_id: i.category_id,
             category_name: i.category_id.and_then(|id| categories.get(&id).cloned()),
+            sub_category_id: i.sub_category_id,
+            sub_category_name: i.sub_category_id.and_then(|id| sub_categories.get(&id).cloned()),
             brand_id: i.brand_id,
             brand_name: i.brand_id.and_then(|id| brands.get(&id).cloned()),
             purchase_unit_id: i.purchase_unit_id,
@@ -1688,13 +1850,20 @@ pub async fn create_item(input: ItemInput) -> CmdResult<item::Model> {
     // session before anything else, so an unauthorised caller cannot use
     // validation messages to probe the command.
     crate::commands_auth::require_permission(db(), "item-create").await?;
+    create_item_in(db(), input).await
+}
+
+pub(crate) async fn create_item_in<C: ConnectionTrait>(
+    conn: &C,
+    input: ItemInput,
+) -> CmdResult<item::Model> {
     validate(&input)?;
-    let db = db();
+    guard_sub_category_belongs(conn, input.category_id, input.sub_category_id).await?;
 
     let code = required(&input.code, "item code")?;
     let existing = item::Entity::find()
         .filter(item::Column::Code.eq(&code))
-        .one(db)
+        .one(conn)
         .await?;
     if existing.is_some() {
         return Err(CmdError::Conflict(format!("item code '{code}' already exists")));
@@ -1708,6 +1877,7 @@ pub async fn create_item(input: ItemInput) -> CmdResult<item::Model> {
         generic_name: Set(input.generic_name),
         description: Set(input.description),
         category_id: Set(input.category_id),
+        sub_category_id: Set(input.sub_category_id),
         brand_id: Set(input.brand_id),
         purchase_unit_id: Set(input.purchase_unit_id),
         sale_unit_id: Set(input.sale_unit_id),
@@ -1717,13 +1887,13 @@ pub async fn create_item(input: ItemInput) -> CmdResult<item::Model> {
         whole_sale_price: Set(input.whole_sale_price),
         alert_quantity: Set(input.alert_quantity),
         loyalty_point: Set(input.loyalty_point),
-        photo: Set(None),
+        photo: Set(input.photo),
         del_status: Set(LIVE.to_owned()),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
     }
-    .insert(db)
+    .insert(conn)
     .await?)
 }
 
@@ -1733,10 +1903,18 @@ pub async fn update_item(id: i32, input: ItemInput) -> CmdResult<item::Model> {
     // session before anything else, so an unauthorised caller cannot use
     // validation messages to probe the command.
     crate::commands_auth::require_permission(db(), "item-edit").await?;
-    validate(&input)?;
-    let db = db();
+    update_item_in(db(), id, input).await
+}
 
-    let Some(found) = item::Entity::find_by_id(id).one(db).await? else {
+pub(crate) async fn update_item_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+    input: ItemInput,
+) -> CmdResult<item::Model> {
+    validate(&input)?;
+    guard_sub_category_belongs(conn, input.category_id, input.sub_category_id).await?;
+
+    let Some(found) = item::Entity::find_by_id(id).one(conn).await? else {
         return Err(CmdError::NotFound("item".into()));
     };
 
@@ -1744,7 +1922,7 @@ pub async fn update_item(id: i32, input: ItemInput) -> CmdResult<item::Model> {
     let clash = item::Entity::find()
         .filter(item::Column::Code.eq(&code))
         .filter(item::Column::Id.ne(id))
-        .one(db)
+        .one(conn)
         .await?;
     if clash.is_some() {
         return Err(CmdError::Conflict(format!("item code '{code}' already exists")));
@@ -1757,6 +1935,7 @@ pub async fn update_item(id: i32, input: ItemInput) -> CmdResult<item::Model> {
     model.generic_name = Set(input.generic_name);
     model.description = Set(input.description);
     model.category_id = Set(input.category_id);
+    model.sub_category_id = Set(input.sub_category_id);
     model.brand_id = Set(input.brand_id);
     model.purchase_unit_id = Set(input.purchase_unit_id);
     model.sale_unit_id = Set(input.sale_unit_id);
@@ -1766,9 +1945,10 @@ pub async fn update_item(id: i32, input: ItemInput) -> CmdResult<item::Model> {
     model.whole_sale_price = Set(input.whole_sale_price);
     model.alert_quantity = Set(input.alert_quantity);
     model.loyalty_point = Set(input.loyalty_point);
+    model.photo = Set(input.photo);
     model.updated_at = Set(crate::migration::now());
 
-    Ok(model.update(db).await?)
+    Ok(model.update(conn).await?)
 }
 
 #[tauri::command]

@@ -38,6 +38,9 @@ pub fn run() {
             commands::list_item_categories,
             commands::create_item_category,
             commands::delete_item_category,
+            commands::list_item_sub_categories,
+            commands::create_item_sub_category,
+            commands::delete_item_sub_category,
             commands::list_items,
             commands::create_item,
             commands::update_item,
@@ -4360,5 +4363,91 @@ mod tests {
         assert_eq!(page.total, 2);
         assert_eq!(page.rows[0].id, second.id);
         assert!(page.rows.iter().all(|r| r.customer_name.as_deref() == Some("Regular")));
+    }
+
+    async fn seed_category(db: &DatabaseConnection, name: &str) -> i32 {
+        commands::create_item_category_in(db, name.to_owned(), None, 0)
+            .await
+            .expect("seed category")
+            .id
+    }
+
+    async fn seed_sub_category(db: &DatabaseConnection, category_id: i32, name: &str) -> i32 {
+        commands::create_item_sub_category_in(
+            db,
+            commands::SubCategoryInput {
+                category_id,
+                name: name.to_owned(),
+                description: None,
+                sort_id: 0,
+            },
+        )
+        .await
+        .expect("seed sub-category")
+        .id
+    }
+
+    fn item_input(code: &str) -> commands::ItemInput {
+        commands::ItemInput {
+            name: format!("Item {code}"),
+            code: code.to_owned(),
+            alternative_name: None,
+            generic_name: None,
+            description: None,
+            category_id: None,
+            sub_category_id: None,
+            brand_id: None,
+            purchase_unit_id: None,
+            sale_unit_id: None,
+            conversion_rate: Decimal::ONE,
+            purchase_price: Decimal::ZERO,
+            sale_price: Decimal::ZERO,
+            whole_sale_price: None,
+            alert_quantity: None,
+            loyalty_point: Decimal::ZERO,
+            photo: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sub_category_links_and_the_item_names_it() {
+        let db = db::init_for_tests().await;
+        let drinks = seed_category(&db, "Drinks").await;
+        let snacks = seed_category(&db, "Snacks").await;
+        let cola = seed_sub_category(&db, drinks, "Cola").await;
+
+        let page = commands::list_item_sub_categories_in(&db, Some(drinks), &page_one())
+            .await
+            .expect("list");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].name, "Cola");
+
+        let mut input = item_input("cola-1");
+        input.category_id = Some(drinks);
+        input.sub_category_id = Some(cola);
+        let row = commands::create_item_in(&db, input).await.expect("create item");
+        assert_eq!(row.sub_category_id, Some(cola));
+
+        // A sub-category from another category is a disagreement, not a guess.
+        let mut wrong = item_input("cola-2");
+        wrong.category_id = Some(snacks);
+        wrong.sub_category_id = Some(cola);
+        assert!(commands::create_item_in(&db, wrong).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn item_photo_must_be_a_small_data_uri_image() {
+        let db = db::init_for_tests().await;
+
+        let plain = item_input("plain-1");
+        assert!(commands::create_item_in(&db, plain).await.is_ok());
+
+        let mut path = item_input("path-1");
+        path.photo = Some("/tmp/shelf.jpg".into());
+        assert!(commands::create_item_in(&db, path).await.is_err());
+
+        let mut huge = item_input("huge-1");
+        huge.photo = Some(format!("data:image/png;base64,{}", "A".repeat(1_000_000)));
+        assert!(commands::create_item_in(&db, huge).await.is_err());
     }
 }
