@@ -4,6 +4,8 @@
 //! comment.
 
 pub mod booking;
+pub mod combo_item;
+pub mod combo_sale;
 pub mod promotion;
 pub mod quotation;
 pub mod quotation_detail;
