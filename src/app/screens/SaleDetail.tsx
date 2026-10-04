@@ -86,6 +86,18 @@ export const SaleDetail = () => {
                                 {formatMoney(view.sale.grandTotal)}
                             </span>
                         </div>
+                        {view.payments.length > 1 && (
+                            <div className="flex w-64 flex-col gap-1">
+                                <span className="text-sm text-tertiary">Paid by</span>
+                                {view.payments.map((tender) => (
+                                    <div key={tender.id} className="flex items-center justify-between text-sm">
+                                        <span className="text-secondary">{tender.method}</span>
+                                        <span className="tabular-nums text-primary">{formatMoney(tender.amount)}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
                         {/* Below the total means the customer walked out owing money, which
                             is a credit sale rather than a completed one. */}
                         {view.sale.paidTotal !== view.sale.grandTotal && (
