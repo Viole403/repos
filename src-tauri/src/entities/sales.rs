@@ -6,6 +6,8 @@
 pub mod booking;
 pub mod combo_item;
 pub mod combo_sale;
+pub mod installment_sale;
+pub mod installment_sale_detail;
 pub mod promotion;
 pub mod quotation;
 pub mod quotation_detail;
