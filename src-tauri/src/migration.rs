@@ -43,6 +43,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::Installments),
             Box::new(Migrations::InstallmentStockLink),
             Box::new(Migrations::InstallmentDownMethod),
+            Box::new(Migrations::WarrantyAndServicing),
         ]
     }
 }
@@ -67,6 +68,7 @@ pub enum Migrations {
     Installments,
     InstallmentStockLink,
     InstallmentDownMethod,
+    WarrantyAndServicing,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -121,6 +123,7 @@ impl MigrationName for Migrations {
         Migrations::Installments => "installments",
         Migrations::InstallmentStockLink => "installment_stock_link",
         Migrations::InstallmentDownMethod => "installment_down_method",
+        Migrations::WarrantyAndServicing => "warranty_and_servicing",
         }
     }
 }
@@ -147,6 +150,7 @@ impl MigrationTrait for Migrations {
             Migrations::Installments => installments(manager).await?,
             Migrations::InstallmentStockLink => installment_stock_link(manager).await?,
             Migrations::InstallmentDownMethod => installment_down_method(manager).await?,
+            Migrations::WarrantyAndServicing => warranty_and_servicing(manager).await?,
         }
         Ok(())
     }
@@ -154,6 +158,18 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::WarrantyAndServicing => {
+                for t in [Servicings::Table.into_iden(), Warranties::Table.into_iden()] {
+                    manager.drop_table(Table::drop().table(t).if_exists().to_owned()).await?;
+                }
+                let conn = manager.get_connection();
+                for name in WARRANTY_PERMISSIONS {
+                    permissions::Entity::delete_many()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .exec(conn)
+                        .await?;
+                }
+            }
             Migrations::InstallmentDownMethod => {
                 manager
                     .alter_table(
@@ -1103,6 +1119,139 @@ async fn installment_stock_link(manager: &SchemaManager<'_>) -> Result<(), DbErr
     Ok(())
 }
 
+/// Repair tickets and paid repair jobs. A warranty is a product sent back through
+/// the pipeline (customer → vendor → customer); a servicing is a repair the shop
+/// bills for. Both name the product as free text like the reference — the unit on
+/// the bench is not necessarily a catalog row anymore.
+async fn warranty_and_servicing(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(Warranties::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Warranties::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(Warranties::CustomerId).integer().not_null())
+                .col(ColumnDef::new(Warranties::ProductName).string().not_null())
+                .col(ColumnDef::new(Warranties::ProductSerialNo).string().null())
+                .col(ColumnDef::new(Warranties::Description).text().null())
+                .col(ColumnDef::new(Warranties::ReceivingDate).custom(TIMESTAMP).not_null())
+                .col(ColumnDef::new(Warranties::DeliveryDate).custom(TIMESTAMP).null())
+                .col(ColumnDef::new(Warranties::CurrentStatus).string().not_null().default("R_F_C"))
+                .col(ColumnDef::new(Warranties::TechnicianId).integer().null())
+                .col(ColumnDef::new(Warranties::PresentLocation).string().null())
+                .col(ColumnDef::new(Warranties::SenderServiceCenter).string().null())
+                .col(ColumnDef::new(Warranties::ReceiverServiceCenter).string().null())
+                .col(ColumnDef::new(Warranties::CreatedBy).integer().null())
+                .col(ColumnDef::new(Warranties::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(Warranties::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Warranties::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_warranties_customer")
+                        .from(Warranties::Table, Warranties::CustomerId)
+                        .to(Customers::Table, Customers::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_warranties_technician")
+                        .from(Warranties::Table, Warranties::TechnicianId)
+                        .to(Users::Table, Users::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(Servicings::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Servicings::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(Servicings::CustomerId).integer().not_null())
+                .col(ColumnDef::new(Servicings::ProductName).string().not_null())
+                .col(ColumnDef::new(Servicings::ProductModel).string().null())
+                .col(ColumnDef::new(Servicings::ProblemDescription).text().null())
+                .col(ColumnDef::new(Servicings::ReceivingDate).custom(TIMESTAMP).not_null())
+                .col(ColumnDef::new(Servicings::DeliveryDate).custom(TIMESTAMP).null())
+                .col(ColumnDef::new(Servicings::ServicingCharge).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(Servicings::PaidAmount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Servicings::CurrentStatus).string().not_null().default("Received"))
+                .col(ColumnDef::new(Servicings::TechnicianId).integer().null())
+                .col(ColumnDef::new(Servicings::CreatedBy).integer().null())
+                .col(ColumnDef::new(Servicings::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(Servicings::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Servicings::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_servicings_customer")
+                        .from(Servicings::Table, Servicings::CustomerId)
+                        .to(Customers::Table, Customers::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_servicings_technician")
+                        .from(Servicings::Table, Servicings::TechnicianId)
+                        .to(Users::Table, Users::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_warranties_customer_id")
+                .table(Warranties::Table)
+                .col(Warranties::CustomerId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_servicings_customer_id")
+                .table(Servicings::Table)
+                .col(Servicings::CustomerId)
+                .to_owned(),
+        )
+        .await?;
+
+    let conn = manager.get_connection();
+    let now = now();
+    for name in WARRANTY_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set("service".to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+    Ok(())
+}
+
 /// The down payment's tender method, so a cash down payment can later count
 /// toward the register's expected cash. Stored beside the amount rather than as
 /// a schedule row, mirroring the reference — which keeps it on the header too.
@@ -1805,6 +1954,59 @@ const INSTALLMENT_PERMISSIONS: &[&str] = &[
     "installment-create",
     "installment-show",
     "installment-collect",
+];
+
+#[derive(Iden)]
+enum Warranties {
+    Table,
+    Id,
+    CustomerId,
+    ProductName,
+    ProductSerialNo,
+    Description,
+    ReceivingDate,
+    DeliveryDate,
+    CurrentStatus,
+    TechnicianId,
+    PresentLocation,
+    SenderServiceCenter,
+    ReceiverServiceCenter,
+    CreatedBy,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum Servicings {
+    Table,
+    Id,
+    CustomerId,
+    ProductName,
+    ProductModel,
+    ProblemDescription,
+    ReceivingDate,
+    DeliveryDate,
+    ServicingCharge,
+    PaidAmount,
+    CurrentStatus,
+    TechnicianId,
+    CreatedBy,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+/// Permissions this migration owns, for the down arm above.
+const WARRANTY_PERMISSIONS: &[&str] = &[
+    "warranty-list",
+    "warranty-create",
+    "warranty-show",
+    "warranty-status",
+    "servicing-list",
+    "servicing-create",
+    "servicing-show",
+    "servicing-collect",
 ];
 
 #[derive(Iden)]
