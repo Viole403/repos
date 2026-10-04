@@ -875,6 +875,83 @@ pub async fn my_permissions() -> CmdResult<Vec<String>> {
     permission_names_in(conn, id).await
 }
 
+/// Set a user's approval PIN. An operator may set their own; anyone else's needs
+/// `user-edit` — otherwise any cashier could arm their own second pair of eyes.
+#[tauri::command]
+pub async fn set_user_pin(user_id: i32, pin: String) -> CmdResult<()> {
+    let conn = db();
+    let me = auth::current_user_id().ok_or_else(|| CmdError::Forbidden("you are not signed in".into()))?;
+    if me != user_id {
+        require(conn, me, "user-edit").await?;
+    }
+    set_user_pin_in(conn, user_id, &pin).await
+}
+
+pub async fn set_user_pin_in<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+    pin: &str,
+) -> CmdResult<()> {
+    let pin = pin.trim();
+    if pin.len() < 4 || !pin.chars().all(|c| c.is_ascii_digit()) {
+        return Err(CmdError::Validation("PIN must be at least 4 digits".into()));
+    }
+    let row = users::Entity::find_by_id(user_id)
+        .filter(users::Column::DelStatus.eq("Live"))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("user".into()))?;
+
+    let owned = pin.to_owned();
+    let pin_hash = tokio::task::spawn_blocking(move || auth::hash_password(&owned))
+        .await
+        .map_err(|err| CmdError::Validation(format!("could not hash the PIN: {err}")))?
+        .map_err(CmdError::Validation)?;
+
+    let mut am: users::ActiveModel = row.into();
+    am.pin_hash = Set(Some(pin_hash));
+    am.update(conn).await?;
+    Ok(())
+}
+
+/// Check a PIN against every live account and return the one it belongs to —
+/// but only if that account may approve. A correct PIN on an account without
+/// `sale-approve` is the same answer as a wrong PIN: "no".
+#[tauri::command]
+pub async fn verify_approval_pin(pin: String) -> CmdResult<UserView> {
+    let conn = db();
+    verify_approval_pin_in(conn, &pin).await
+}
+
+pub async fn verify_approval_pin_in<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    pin: &str,
+) -> CmdResult<UserView> {
+    let pin = pin.trim();
+    if pin.is_empty() {
+        return Err(CmdError::Validation("PIN is required".into()));
+    }
+    let candidates = users::Entity::find()
+        .filter(users::Column::DelStatus.eq("Live"))
+        .filter(users::Column::PinHash.is_not_null())
+        .all(conn)
+        .await?;
+
+    // Argon2 off the async worker, one candidate at a time — there are at most a
+    // handful of PIN-holding accounts per install, so no batching needed.
+    for row in candidates {
+        let stored = row.pin_hash.clone().expect("filtered not-null");
+        let attempt = pin.to_owned();
+        let matches = tokio::task::spawn_blocking(move || auth::verify_password(&attempt, &stored))
+            .await
+            .unwrap_or(false);
+        if matches && has_permission_in(conn, row.id, "sale-approve").await? {
+            return Ok(UserView::from(row));
+        }
+    }
+    Err(CmdError::Validation("PIN is incorrect".into()))
+}
+
 /// Backends phrase unique violations differently, so match by substring.
 fn is_unique_violation(err: &sea_orm::RuntimeErr) -> bool {
     let text = err.to_string().to_lowercase();

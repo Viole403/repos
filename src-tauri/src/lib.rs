@@ -128,6 +128,8 @@ pub fn run() {
             commands::list_supplier_payments,
             commands_auth::has_permission,
             commands_auth::my_permissions,
+            commands_auth::set_user_pin,
+            commands_auth::verify_approval_pin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -142,6 +144,7 @@ mod tests {
     use crate::commands::{CheckoutInput, CheckoutLine, PageQuery};
     use crate::entities::auth::permissions;
     use crate::entities::auth::users;
+    use crate::entities::auth::{role_permissions, roles, user_roles};
     use crate::entities::catalog::{item, unit};
     use crate::migration::Migrator;
     use sea_orm_migration::MigratorTrait;
@@ -430,6 +433,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments,
+                approved_by: None,
             },
         )
         .await
@@ -450,6 +454,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -463,6 +468,7 @@ mod tests {
             reason: "Damaged".into(),
             note: None,
             lines: vec![commands::ReturnLine { sale_detail_id, quantity }],
+            approved_by: None,
         }
     }
 
@@ -495,6 +501,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -543,6 +550,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -631,6 +639,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await;
@@ -679,6 +688,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -726,6 +736,7 @@ mod tests {
                     customer_id: None,
                     order_type: None,
                     payments: None,
+                    approved_by: None,
                 },
             )
             .await
@@ -750,6 +761,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             }
         )
         .await
@@ -777,6 +789,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -814,6 +827,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -855,6 +869,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -885,6 +900,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -950,6 +966,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -1103,6 +1120,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -1147,6 +1165,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -1321,6 +1340,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -1574,6 +1594,7 @@ mod tests {
                 customer_id: Some(customer),
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -1610,6 +1631,7 @@ mod tests {
                 customer_id: Some(4242),
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -1647,6 +1669,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -1763,6 +1786,7 @@ mod tests {
                 customer_id: None,
                 order_type: Some("DineIn".into()),
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -1791,6 +1815,7 @@ mod tests {
                 customer_id: None,
                 order_type: Some("Delivery".into()),
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -1830,6 +1855,7 @@ mod tests {
                 customer_id: None,
                 order_type: Some("Online".into()),
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -2153,6 +2179,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: Some(gift_tender("GC-002", Decimal::new(30_000_000, 3))),
+                approved_by: None,
             },
         )
         .await
@@ -2187,6 +2214,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: Some(gift_tender("GC-003", Decimal::new(30_000_000, 3))),
+                approved_by: None,
             },
         )
         .await
@@ -2230,6 +2258,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: Some(tender),
+                approved_by: None,
             },
         )
         .await
@@ -2262,6 +2291,7 @@ mod tests {
                     gift_card_no: None,
                     gift_card_pin: None,
                 }]),
+                approved_by: None,
             },
         )
         .await
@@ -2288,6 +2318,7 @@ mod tests {
                 customer_id: Some(customer_id),
                 order_type: None,
                 payments,
+                approved_by: None,
             },
         )
         .await
@@ -2352,6 +2383,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -2386,6 +2418,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -2415,6 +2448,7 @@ mod tests {
                 customer_id: Some(customer),
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -2514,6 +2548,7 @@ mod tests {
                 customer_id: Some(customer),
                 order_type: None,
                 payments: Some(tender),
+                approved_by: None,
             },
         )
         .await
@@ -2585,6 +2620,101 @@ mod tests {
         assert!(format!("{err}").contains("another customer"));
     }
 
+    async fn grant_sale_approve(db: &DatabaseConnection, user_id: i32) {
+        let now = crate::migration::now();
+        let role = roles::ActiveModel {
+            name: Set("Approver".into()),
+            guard_name: Set("Approver".into()),
+            role_type: Set("Staff".into()),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("seed role")
+        .id;
+        let permission = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq("sale-approve"))
+            .one(db)
+            .await
+            .expect("query")
+            .expect("sale-approve is seeded")
+            .id;
+        user_roles::ActiveModel { role_id: Set(role), user_id: Set(user_id), ..Default::default() }
+            .insert(db)
+            .await
+            .expect("assign role");
+        role_permissions::ActiveModel { role_id: Set(role), permission_id: Set(permission), ..Default::default() }
+            .insert(db)
+            .await
+            .expect("grant");
+    }
+
+    #[tokio::test]
+    async fn an_approval_pin_verifies_only_a_holder() {
+        let db = db::init_for_tests().await;
+        let manager = seed_user(&db).await;
+        let clerk = seed_user(&db).await;
+        grant_sale_approve(&db, manager).await;
+        commands_auth::set_user_pin_in(&db, manager, "1357").await.expect("set PIN");
+        commands_auth::set_user_pin_in(&db, clerk, "9999").await.expect("set PIN");
+
+        // The clerk's own PIN is correct digits on a live account — but the
+        // account holds no `sale-approve`, so it verifies to nothing.
+        let err = commands_auth::verify_approval_pin_in(&db, "9999")
+            .await
+            .expect_err("clerk PIN must not verify");
+        assert!(format!("{err}").contains("incorrect"));
+
+        let view = commands_auth::verify_approval_pin_in(&db, "1357").await.expect("holder verifies");
+        assert_eq!(view.id, manager);
+    }
+
+    #[tokio::test]
+    async fn a_holder_approves_and_signs_the_row() {
+        let db = db::init_for_tests().await;
+        let manager = seed_user(&db).await;
+        grant_sale_approve(&db, manager).await;
+        commands_auth::set_user_pin_in(&db, manager, "1357").await.expect("set PIN");
+
+        let view = commands_auth::verify_approval_pin_in(&db, "1357").await.expect("verify");
+        assert_eq!(view.id, manager);
+
+        let mug = seed_item(&db, "mug").await;
+        seed_stock(&db, mug, dec(5)).await;
+        let mut input = commands::CheckoutInput {
+            lines: vec![line(mug, dec(1), dec(15000))],
+            discount_total: None,
+            tax_total: None,
+            paid_total: None,
+            payment_method: Some("Cash".into()),
+            note: None,
+            promote: None,
+            customer_id: None,
+            order_type: None,
+            payments: None,
+            approved_by: Some(manager),
+        };
+        input.lines[0].discount = Some(Decimal::new(1_000_000, 3));
+        let view = commands::checkout_in(&db, input).await.expect("discounted checkout");
+        assert_eq!(view.sale.approved_by, Some(manager));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_pin_approves_nothing() {
+        let db = db::init_for_tests().await;
+        let manager = seed_user(&db).await;
+        grant_sale_approve(&db, manager).await;
+        commands_auth::set_user_pin_in(&db, manager, "1357").await.expect("set PIN");
+
+        let err = commands_auth::verify_approval_pin_in(&db, "0000")
+            .await
+            .expect_err("wrong PIN");
+        assert!(format!("{err}").contains("incorrect"));
+    }
+
     #[tokio::test]
     async fn a_sale_takes_one_rating() {
         let db = db::init_for_tests().await;
@@ -2637,6 +2767,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: Some(tender),
+                approved_by: None,
             },
         )
         .await
@@ -2717,6 +2848,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -3010,6 +3142,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -3801,6 +3934,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -3918,6 +4052,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -3951,6 +4086,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await
@@ -4109,6 +4245,7 @@ mod tests {
                 customer_id: None,
                 order_type: None,
                 payments: None,
+                approved_by: None,
             },
         )
         .await

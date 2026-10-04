@@ -932,6 +932,10 @@ pub struct ReturnInput {
     pub reason: String,
     pub note: Option<String>,
     pub lines: Vec<ReturnLine>,
+    /// Who approved this return. Always required — a return always moves money
+    /// or stock back, so there is no unapproved path.
+    #[serde(default)]
+    pub approved_by: Option<i32>,
 }
 
 /// The `return` reasons a shop needs. A closed set so a report can group them; free
@@ -982,8 +986,44 @@ impl From<sale_return::Model> for ReturnView {
 }
 
 #[tauri::command]
+/// Confirm a `sale-approve` holder signed off, returning their id for the row.
+///
+/// A holder approves their own outright — no PIN round-trip needed when the
+/// second pair of eyes is the operator themselves. Otherwise the id must name
+/// a *live holder*, never the operator: self-approval is the hole this gate exists
+/// to close, and the check runs server-side so a client cannot skip it.
+async fn require_approval(approved_by: Option<i32>) -> CmdResult<i32> {
+    let conn = db();
+    let me = crate::auth::current_user_id();
+    if let Some(me) = me {
+        if crate::commands_auth::has_permission_in(conn, me, "sale-approve").await? {
+            return Ok(me);
+        }
+    }
+    let approver = approved_by
+        .ok_or_else(|| CmdError::Forbidden("a manager approval is required".into()))?;
+    if Some(approver) == me {
+        return Err(CmdError::Forbidden("approval must come from someone else".into()));
+    }
+    let holder = users::Entity::find_by_id(approver)
+        .filter(users::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::Forbidden("approval is not from an active account".into()))?;
+    let _ = holder;
+    if !crate::commands_auth::has_permission_in(conn, approver, "sale-approve").await? {
+        return Err(CmdError::Forbidden("approver may not approve sales".into()));
+    }
+    Ok(approver)
+}
+
+#[tauri::command]
 pub async fn create_return(input: ReturnInput) -> CmdResult<ReturnView> {
     crate::commands_auth::require_permission(db(), "sale-create").await?;
+    // A return always moves money or stock back, so it always needs a second
+    // pair of eyes unless the operator may approve their own.
+    let mut input = input;
+    input.approved_by = Some(require_approval(input.approved_by).await?);
     create_return_in(db(), input, crate::auth::current_user_id()).await
 }
 
@@ -1104,6 +1144,7 @@ pub async fn create_return_in<C: ConnectionTrait + TransactionTrait>(
     let mut am: sale_return::ActiveModel = header.into();
     am.return_no = Set(return_no.clone());
     am.refunded_total = Set(refunded.round_dp(MONEY_SCALE));
+    am.approved_by = Set(input.approved_by);
     let return_row = am.update(&txn).await?;
 
     // Stock comes back: positive quantity, so the shelf grows by exactly what went out.
@@ -1902,6 +1943,11 @@ pub struct CheckoutInput {
     /// figure can only come from one place.
     #[serde(default)]
     pub payments: Option<Vec<PaymentLine>>,
+    /// Who approved a discount on this sale. Required on a discounted sale unless
+    /// the operator may approve their own — the `sale-approve` holder's id, from
+    /// `verify_approval_pin`.
+    #[serde(default)]
+    pub approved_by: Option<i32>,
 }
 
 /// One tender against a sale.
@@ -2188,6 +2234,15 @@ pub async fn checkout(input: CheckoutInput) -> CmdResult<SaleView> {
     // session before anything else, so an unauthorised caller cannot use
     // validation messages to probe the command.
     crate::commands_auth::require_permission(db(), "sale-create").await?;
+    // A discount is the till charging less than the catalog says. Anyone may
+    // ring a full-price sale; charging less needs a second pair of eyes unless
+    // the operator may approve their own.
+    let discounted = input.lines.iter().any(|l| l.discount.unwrap_or(Decimal::ZERO) > Decimal::ZERO)
+        || input.discount_total.unwrap_or(Decimal::ZERO) > Decimal::ZERO;
+    let mut input = input;
+    if discounted {
+        input.approved_by = Some(require_approval(input.approved_by).await?);
+    }
     checkout_in(db(), input).await
 }
 
@@ -2391,6 +2446,7 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     let rounding = cash_rounding(grand_total, cash_only);
     let rounded_total = grand_total + rounding;
     header.rounding = Set(rounding);
+    header.approved_by = Set(input.approved_by);
     if let Some(lines) = payments.as_ref() {
         let tendered: Decimal = lines.iter().map(|l| l.amount).sum();
         if tendered > rounded_total {
@@ -2622,6 +2678,7 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
         customer_id: None,
         order_type: None,
         payments: None,
+        approved_by: None,
     })?;
     guard_discount_within_subtotal(discount_total, subtotal)?;
 
