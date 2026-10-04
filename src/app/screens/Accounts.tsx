@@ -6,7 +6,7 @@ import { Input } from "@/components/base/input/input";
 import { Select } from "@/components/base/select/select";
 import type { SelectItemType } from "@/components/base/select/select-shared";
 import { Dialog, Modal, ModalOverlay } from "@/components/application/modals/modal";
-import { createUser, deleteUser, listRoles, listUsers, setUserRole } from "@/app/ipc";
+import { createUser, deleteUser, listRoles, listUsers, setUserPin, setUserRole } from "@/app/ipc";
 import type { RoleView, UserView } from "@/app/ipc";
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
@@ -29,6 +29,9 @@ export const Accounts = () => {
     const [form, setForm] = useState(blank);
     const [saving, setSaving] = useState(false);
     const [pendingDelete, setPendingDelete] = useState<UserView | null>(null);
+    const [pinFor, setPinFor] = useState<UserView | null>(null);
+    const [pin, setPin] = useState("");
+    const [pinError, setPinError] = useState<string | null>(null);
 
     const refresh = useCallback(async () => {
         try {
@@ -104,6 +107,20 @@ export const Accounts = () => {
         }
     };
 
+    const savePin = async () => {
+        if (!pinFor) return;
+        setPinError(null);
+        setActionError(null);
+        try {
+            await setUserPin(pinFor.id, pin);
+            setPinFor(null);
+            setPin("");
+            setReload((n) => n + 1);
+        } catch (cause) {
+            setPinError(messageOf(cause));
+        }
+    };
+
     return (
         <div className="flex flex-col gap-5 p-5">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
@@ -164,13 +181,27 @@ export const Accounts = () => {
                                         </Select>
                                     </Table.Cell>
                                     <Table.Cell>
-                                        <Button
-                                            size="sm"
-                                            color="tertiary"
-                                            iconLeading={Trash01}
-                                            aria-label={`Delete ${row.name}`}
-                                            onPress={() => setPendingDelete(row)}
-                                        />
+                                        <div className="flex items-center gap-1">
+                                            <Button
+                                                size="sm"
+                                                color="tertiary"
+                                                aria-label={`Set approval PIN for ${row.name}`}
+                                                onPress={() => {
+                                                    setPinFor(row);
+                                                    setPin("");
+                                                    setPinError(null);
+                                                }}
+                                            >
+                                                PIN
+                                            </Button>
+                                            <Button
+                                                size="sm"
+                                                color="tertiary"
+                                                iconLeading={Trash01}
+                                                aria-label={`Delete ${row.name}`}
+                                                onPress={() => setPendingDelete(row)}
+                                            />
+                                        </div>
                                     </Table.Cell>
                                 </Table.Row>
                             ))}
@@ -248,6 +279,48 @@ export const Accounts = () => {
                                     </Button>
                                 </div>
                             </form>
+                        </Dialog>
+                    </Modal>
+                </ModalOverlay>
+            )}
+
+            {pinFor && (
+                <ModalOverlay isOpen onOpenChange={(open) => !open && setPinFor(null)}>
+                    <Modal className="max-w-md">
+                        <Dialog className="p-6">
+                            <div className="flex flex-col gap-4">
+                                <h2 className="text-display-xs font-semibold text-primary">
+                                    Approval PIN for {pinFor.name}
+                                </h2>
+                                <p className="text-md text-secondary">
+                                    At least 4 digits. This PIN approves discounts and returns — give it
+                                    only to someone who may approve sales.
+                                </p>
+
+                                {pinError !== null && (
+                                    <p className="rounded-lg bg-error-secondary px-3 py-2 text-sm text-error-primary">
+                                        {pinError}
+                                    </p>
+                                )}
+
+                                <Input
+                                    label="PIN"
+                                    type="password"
+                                    inputMode="numeric"
+                                    value={pin}
+                                    onChange={setPin}
+                                    autoFocus
+                                />
+
+                                <div className="flex justify-end gap-2">
+                                    <Button color="secondary" onPress={() => setPinFor(null)}>
+                                        Cancel
+                                    </Button>
+                                    <Button color="primary" onPress={() => void savePin()}>
+                                        Set PIN
+                                    </Button>
+                                </div>
+                            </div>
                         </Dialog>
                     </Modal>
                 </ModalOverlay>
