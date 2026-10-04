@@ -41,6 +41,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::Combos),
             Box::new(Migrations::SaleOrderType),
             Box::new(Migrations::Installments),
+            Box::new(Migrations::InstallmentStockLink),
         ]
     }
 }
@@ -63,6 +64,7 @@ pub enum Migrations {
     Combos,
     SaleOrderType,
     Installments,
+    InstallmentStockLink,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -115,6 +117,7 @@ impl MigrationName for Migrations {
         Migrations::Combos => "combos",
         Migrations::SaleOrderType => "sale_order_type",
         Migrations::Installments => "installments",
+        Migrations::InstallmentStockLink => "installment_stock_link",
         }
     }
 }
@@ -139,6 +142,7 @@ impl MigrationTrait for Migrations {
             Migrations::Combos => combos(manager).await?,
             Migrations::SaleOrderType => sale_order_type(manager).await?,
             Migrations::Installments => installments(manager).await?,
+            Migrations::InstallmentStockLink => installment_stock_link(manager).await?,
         }
         Ok(())
     }
@@ -146,6 +150,16 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::InstallmentStockLink => {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(StockMovements::Table)
+                            .drop_column(StockMovements::InstallmentSaleId)
+                            .to_owned(),
+                    )
+                    .await?;
+            }
             Migrations::Installments => {
                 for t in [
                     InstallmentSaleDetails::Table.into_iden(),
@@ -1024,6 +1038,46 @@ async fn sale_order_type(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                         .default("InStore")
                         .to_owned(),
                 )
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Links the stock ledger to installment sales. The goods leave the shelf the day
+/// the credit sale is written — not when the last due clears — so the handover
+/// writes a negative ledger row exactly like a counter sale does.
+async fn installment_stock_link(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .alter_table(
+            Table::alter()
+                .table(StockMovements::Table)
+                .add_column(
+                    ColumnDef::new(StockMovements::InstallmentSaleId).integer().null().to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    // SET NULL, not CASCADE: a ledger row outlives the credit sale that caused it.
+    manager
+        .create_foreign_key(
+            ForeignKey::create()
+                .name("fk_stock_movements_installment_sale")
+                .from(StockMovements::Table, StockMovements::InstallmentSaleId)
+                .to(InstallmentSales::Table, InstallmentSales::Id)
+                .on_delete(ForeignKeyAction::SetNull)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_stock_movements_installment_sale_id")
+                .table(StockMovements::Table)
+                .col(StockMovements::InstallmentSaleId)
                 .to_owned(),
         )
         .await?;
@@ -2055,6 +2109,7 @@ enum StockMovements {
     Id,
     ItemId,
     SaleId,
+    InstallmentSaleId,
     MovementType,
     Quantity,
     Reference,
