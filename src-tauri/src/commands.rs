@@ -2258,7 +2258,7 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
         tax_total: Set(Decimal::ZERO),
         grand_total: Set(Decimal::ZERO),
         paid_total: Set(Decimal::ZERO),
-        payment_method: Set(payment_method),
+        payment_method: Set(payment_method.clone()),
         customer_id: Set(customer_id),
         order_type: Set(order_type),
         note: Set(input.note),
@@ -2382,21 +2382,30 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     // tender list summing above the total is change the cashier holds, not a payment,
     // so that is refused rather than recorded as a negative sale.
     let payments = input.payments.filter(|lines| !lines.is_empty());
+    // Round-off applies to cash only: coins are physical, card and QRIS totals are
+    // exact to the rupiah. A split sale rounds only when every tender is cash.
+    let cash_only = match payments.as_ref() {
+        Some(lines) => lines.iter().all(|l| l.method.trim() == "Cash"),
+        None => payment_method.trim() == "Cash",
+    };
+    let rounding = cash_rounding(grand_total, cash_only);
+    let rounded_total = grand_total + rounding;
+    header.rounding = Set(rounding);
     if let Some(lines) = payments.as_ref() {
         let tendered: Decimal = lines.iter().map(|l| l.amount).sum();
-        if tendered > grand_total {
+        if tendered > rounded_total {
             return Err(CmdError::Validation(format!(
-                "payments total {tendered}, which is more than the sale total {grand_total}"
+                "payments total {tendered}, which is more than the sale total {rounded_total}"
             )));
         }
         header.paid_total = Set(tendered);
         header.payment_method = Set(summarise_methods(lines));
     } else {
-        header.paid_total = Set(input.paid_total.unwrap_or(grand_total));
+        header.paid_total = Set(input.paid_total.unwrap_or(rounded_total));
     }
     // Only the `Set` fields above reach the SET clause — the rest came in as
     // `Unchanged` from the `Model -> ActiveModel` conversion — so this is a
-    // six-column UPDATE keyed on the primary key, not a rewrite of the row.
+    // targeted UPDATE keyed on the primary key, not a rewrite of the row.
     let row = header.update(&txn).await?;
 
     // Drafts earn nothing: a draft is a basket nobody has paid for. Walk-ins earn
@@ -2719,7 +2728,8 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
             tax_total: Set(tax_total),
             grand_total: Set(grand_total),
             paid_total: Set(paid),
-            payment_method: Set(method),
+            payment_method: Set(method.clone()),
+            rounding: Set(cash_rounding(grand_total, method.trim() == "Cash")),
             updated_at: Set(now),
             ..Default::default()
         })
@@ -5420,6 +5430,23 @@ pub async fn get_servicing_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResul
         .await?
         .map(|c| c.name);
     Ok(ServicingView { servicing: row, customer_name, due_amount: due })
+}
+
+/// Cash round-off to the nearest Rp100, half up. Only physical cash has no
+/// Rp50-shaped hole problem — card, QRIS, gift and loyalty totals stay exact.
+/// The signed difference posts on the sale row, so `SUM(rounding)` is exactly
+/// what round-off gained or cost the till.
+fn cash_rounding(grand_total: Decimal, cash_only: bool) -> Decimal {
+    if !cash_only {
+        return Decimal::ZERO;
+    }
+    // Below Rp100 there is nothing to round to — rounding a Rp30 total to Rp0
+    // would write a sale nobody pays for.
+    if grand_total < Decimal::new(100, 0) {
+        return Decimal::ZERO;
+    }
+    let hundreds = (grand_total / Decimal::new(100, 0) + Decimal::new(5, 1)).trunc();
+    (hundreds * Decimal::new(100, 0) - grand_total).round_dp(MONEY_SCALE)
 }
 
 // ---------------------------------------------------------------------------

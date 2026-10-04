@@ -2325,6 +2325,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cash_sale_rounds_to_the_nearest_hundred() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "candy").await;
+        seed_stock(&db, item, dec(10)).await;
+
+        let view = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![commands::CheckoutLine {
+                    item_id: item,
+                    quantity: dec(1),
+                    unit_price: Decimal::new(12_450_000, 3),
+                    discount: None,
+                }],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: None,
+                customer_id: None,
+                order_type: None,
+                payments: None,
+            },
+        )
+        .await
+        .expect("cash checkout");
+
+        assert_eq!(view.sale.grand_total, Decimal::new(12_450_000, 3));
+        assert_eq!(view.sale.rounding, Decimal::new(50_000, 3));
+        assert_eq!(view.sale.paid_total, Decimal::new(12_500_000, 3));
+    }
+
+    #[tokio::test]
+    async fn a_card_sale_keeps_the_exact_total() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "candy").await;
+        seed_stock(&db, item, dec(10)).await;
+
+        let view = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![commands::CheckoutLine {
+                    item_id: item,
+                    quantity: dec(1),
+                    unit_price: Decimal::new(12_450_000, 3),
+                    discount: None,
+                }],
+                discount_total: None,
+                tax_total: None,
+                paid_total: None,
+                payment_method: Some("Card".into()),
+                note: None,
+                promote: None,
+                customer_id: None,
+                order_type: None,
+                payments: None,
+            },
+        )
+        .await
+        .expect("card checkout");
+
+        assert_eq!(view.sale.rounding, Decimal::ZERO);
+        assert_eq!(view.sale.paid_total, view.sale.grand_total);
+    }
+
+    #[tokio::test]
     async fn a_draft_earns_nothing_until_it_completes() {
         let db = db::init_for_tests().await;
         let customer = seed_customer(&db, "Lala", Decimal::ZERO).await;
