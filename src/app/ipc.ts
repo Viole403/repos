@@ -390,6 +390,56 @@ export const listSales = (filter: SaleFilter = {}, query: PageQuery = {}) =>
 export const getSale = (id: number) => call<SaleView>("get_sale", { id });
 export const listSalePayments = (saleId: number) => call<SalePayment[]>("list_sale_payments", { saleId });
 
+export interface QuotationLine {
+    itemId: number;
+    quantity: Decimal;
+    unitPrice: Decimal;
+    discount?: Decimal | null;
+}
+
+export interface QuotationInput {
+    customerId: number;
+    /** `YYYY-MM-DD`. Defaults to today server-side. */
+    quotedAt?: string | null;
+    referenceNo?: string | null;
+    discountTotal?: Decimal | null;
+    note?: string | null;
+    lines: QuotationLine[];
+}
+
+export interface QuotationDetail {
+    id: number;
+    quotationId: number;
+    itemId: number;
+    itemName: string;
+    quantity: Decimal;
+    unitPrice: Decimal;
+    discount: Decimal;
+    lineTotal: Decimal;
+}
+
+export interface QuotationView {
+    id: number;
+    quotationNo: string;
+    customerId: number;
+    customerName: string | null;
+    quotedAt: Timestamp;
+    referenceNo: string | null;
+    subtotal: Decimal;
+    discountTotal: Decimal;
+    grandTotal: Decimal;
+    note: string | null;
+    createdAt: Timestamp;
+    lines: QuotationDetail[];
+}
+
+export const listQuotations = (query: PageQuery = {}) => call<Page<QuotationView>>("list_quotations", { query });
+export const getQuotation = (id: number) => call<QuotationView>("get_quotation", { id });
+export const createQuotation = (input: QuotationInput) => call<QuotationView>("create_quotation", { input });
+export const updateQuotation = (id: number, input: QuotationInput) =>
+    call<QuotationView>("update_quotation", { id, input });
+export const deleteQuotation = (id: number) => call<void>("delete_quotation", { id });
+
 export interface ReturnLine {
     /** Which line of the original sale this reverses. */
     saleDetailId: number;
