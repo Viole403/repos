@@ -24,7 +24,7 @@ use crate::db::db;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
+use crate::entities::sales::{register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -2585,6 +2585,388 @@ pub(crate) async fn discard_draft_in<C: ConnectionTrait>(conn: &C, sale_id: i32)
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Registers
+// ---------------------------------------------------------------------------
+
+const REGISTER_OPEN: &str = "Open";
+const REGISTER_CLOSED: &str = "Closed";
+
+/// One tender bucket. Shared by the opening float and the close summary so both
+/// sides spell a per-method figure the same way.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MethodTotal {
+    pub method: String,
+    pub amount: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenRegisterInput {
+    pub opening_balance: Decimal,
+    pub opening_details: Option<Vec<MethodTotal>>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseRegisterInput {
+    /// What the cashier counted in the drawer.
+    pub closing_balance: Decimal,
+    pub note: Option<String>,
+}
+
+/// A shift's numbers, derived at read time for an open register and snapshotted at
+/// close. Only cash touches the drawer, so card and QRIS tenders reconcile elsewhere:
+/// `cash_total` is what the drawer should hold, `other_total` is everything paid by
+/// other means.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterSummary {
+    pub sales_count: u64,
+    pub sales_total: Decimal,
+    pub collected_total: Decimal,
+    pub cash_total: Decimal,
+    pub other_total: Decimal,
+    pub refunded_total: Decimal,
+    pub receipts_total: Decimal,
+    pub expected_balance: Decimal,
+    pub methods: Vec<MethodTotal>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterView {
+    pub id: i32,
+    pub status: String,
+    pub opened_at: NaiveDateTime,
+    pub closed_at: Option<NaiveDateTime>,
+    pub opening_balance: Decimal,
+    pub opening_details: Option<Vec<MethodTotal>>,
+    pub closing_balance: Option<Decimal>,
+    pub expected_balance: Option<Decimal>,
+    /// Counted minus expected. Negative means the drawer is short.
+    pub variance: Option<Decimal>,
+    pub note: Option<String>,
+}
+
+impl RegisterView {
+    fn from_row(row: register::Model) -> CmdResult<Self> {
+        let opening_details = row
+            .opening_details
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| CmdError::Validation(format!("stored opening details are not valid JSON: {e}")))?;
+        let variance = match (row.closing_balance, row.expected_balance) {
+            (Some(counted), Some(expected)) => Some((counted - expected).round_dp(MONEY_SCALE)),
+            _ => None,
+        };
+        Ok(Self {
+            id: row.id,
+            status: row.status,
+            opened_at: row.opened_at,
+            closed_at: row.closed_at,
+            opening_balance: row.opening_balance,
+            opening_details,
+            closing_balance: row.closing_balance,
+            expected_balance: row.expected_balance,
+            variance,
+            note: row.note,
+        })
+    }
+}
+
+#[tauri::command]
+pub async fn open_register(input: OpenRegisterInput) -> CmdResult<RegisterView> {
+    crate::commands_auth::require_permission(db(), "register-open").await?;
+    let Some(user_id) = crate::auth::current_user_id() else {
+        return Err(CmdError::Forbidden("you are not signed in".into()));
+    };
+    open_register_in(db(), user_id, input).await
+}
+
+pub async fn open_register_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    user_id: i32,
+    input: OpenRegisterInput,
+) -> CmdResult<RegisterView> {
+    if input.opening_balance < Decimal::ZERO {
+        return Err(CmdError::Validation("opening float cannot be negative".into()));
+    }
+    if let Some(details) = input.opening_details.as_ref() {
+        let mut total = Decimal::ZERO;
+        for d in details {
+            if d.amount < Decimal::ZERO {
+                return Err(CmdError::Validation(format!("opening amount for {} cannot be negative", d.method)));
+            }
+            total += d.amount;
+        }
+        // The breakdown is the cashier's own count, so a mismatch with the float is
+        // a typo rather than a second figure to reconcile — refuse it now.
+        if total.round_dp(MONEY_SCALE) != input.opening_balance.round_dp(MONEY_SCALE) {
+            return Err(CmdError::Validation(format!(
+                "opening details total {total}, not the {float} float given",
+                float = input.opening_balance
+            )));
+        }
+    }
+
+    let txn = conn.begin().await?;
+    if open_register_row(&txn, user_id).await?.is_some() {
+        return Err(CmdError::Conflict("a register is already open for this user".into()));
+    }
+
+    let now = crate::migration::now();
+    let row = register::ActiveModel {
+        user_id: Set(user_id),
+        status: Set(REGISTER_OPEN.to_owned()),
+        opened_at: Set(now),
+        closed_at: Set(None),
+        opening_balance: Set(input.opening_balance),
+        opening_details: Set(input
+            .opening_details
+            .map(|d| serde_json::to_string(&d))
+            .transpose()
+            .map_err(|e| CmdError::Validation(format!("opening details are not valid JSON: {e}")))?),
+        closing_balance: Set(None),
+        expected_balance: Set(None),
+        note: Set(input.note),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
+    txn.commit().await?;
+
+    RegisterView::from_row(row)
+}
+
+async fn open_register_row<C: ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+) -> CmdResult<Option<register::Model>> {
+    Ok(register::Entity::find()
+        .filter(register::Column::UserId.eq(user_id))
+        .filter(register::Column::Status.eq(REGISTER_OPEN))
+        .order_by_desc(register::Column::Id)
+        .one(conn)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn current_register() -> CmdResult<Option<RegisterView>> {
+    crate::commands_auth::require_permission(db(), "register-summary").await?;
+    let Some(user_id) = crate::auth::current_user_id() else {
+        return Err(CmdError::Forbidden("you are not signed in".into()));
+    };
+    current_register_in(db(), user_id).await
+}
+
+pub async fn current_register_in<C: ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+) -> CmdResult<Option<RegisterView>> {
+    Ok(match open_register_row(conn, user_id).await? {
+        Some(row) => Some(RegisterView::from_row(row)?),
+        None => None,
+    })
+}
+
+#[tauri::command]
+pub async fn list_registers() -> CmdResult<Vec<RegisterView>> {
+    crate::commands_auth::require_permission(db(), "register-list").await?;
+    let Some(user_id) = crate::auth::current_user_id() else {
+        return Err(CmdError::Forbidden("you are not signed in".into()));
+    };
+    let rows = register::Entity::find()
+        .filter(register::Column::UserId.eq(user_id))
+        .order_by_desc(register::Column::Id)
+        .all(db())
+        .await?;
+    rows.into_iter().map(RegisterView::from_row).collect()
+}
+
+#[tauri::command]
+pub async fn register_summary() -> CmdResult<Option<RegisterSummary>> {
+    crate::commands_auth::require_permission(db(), "register-summary").await?;
+    let Some(user_id) = crate::auth::current_user_id() else {
+        return Err(CmdError::Forbidden("you are not signed in".into()));
+    };
+    register_summary_in(db(), user_id).await
+}
+
+pub async fn register_summary_in<C: ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+) -> CmdResult<Option<RegisterSummary>> {
+    Ok(match open_register_row(conn, user_id).await? {
+        Some(row) => Some(summarise_register(conn, &row, crate::migration::now()).await?),
+        None => None,
+    })
+}
+
+async fn summarise_register<C: ConnectionTrait>(
+    conn: &C,
+    row: &register::Model,
+    to: NaiveDateTime,
+) -> CmdResult<RegisterSummary> {
+    let sales: Vec<(Decimal, Decimal)> = sale::Entity::find()
+        .select_only()
+        .column(sale::Column::GrandTotal)
+        .column(sale::Column::PaidTotal)
+        .filter(sale::Column::Status.eq(SALE_STATUS_COMPLETED))
+        .filter(sale::Column::CreatedAt.gte(row.opened_at))
+        .filter(sale::Column::CreatedAt.lt(to))
+        .into_tuple()
+        .all(conn)
+        .await?;
+    let sales_count = sales.len() as u64;
+    let (sales_total, collected_total) = sales
+        .into_iter()
+        .fold((Decimal::ZERO, Decimal::ZERO), |(g, p), (grand, paid)| {
+            (g + grand, p + paid)
+        });
+
+    let sale_ids: Vec<i32> = sale::Entity::find()
+        .select_only()
+        .column(sale::Column::Id)
+        .filter(sale::Column::Status.eq(SALE_STATUS_COMPLETED))
+        .filter(sale::Column::CreatedAt.gte(row.opened_at))
+        .filter(sale::Column::CreatedAt.lt(to))
+        .into_tuple()
+        .all(conn)
+        .await?;
+    let mut by_method: HashMap<String, Decimal> = HashMap::new();
+    let mut tendered_sale_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    if !sale_ids.is_empty() {
+        let tenders: Vec<(i32, String, Decimal)> = sale_payment::Entity::find()
+            .select_only()
+            .column(sale_payment::Column::SaleId)
+            .column(sale_payment::Column::Method)
+            .column(sale_payment::Column::Amount)
+            .filter(sale_payment::Column::SaleId.is_in(sale_ids))
+            .into_tuple()
+            .all(conn)
+            .await?;
+        for (sale_id, method, amount) in tenders {
+            tendered_sale_ids.insert(sale_id);
+            *by_method.entry(method).or_insert(Decimal::ZERO) += amount;
+        }
+    }
+    // A single-tender sale writes no tender rows — the header carries the method and
+    // the figure instead — so those sales fall back to the header. Only sales with
+    // no rows qualify, so a tender is never counted twice.
+    let mut untendered_q = sale::Entity::find()
+        .select_only()
+        .column(sale::Column::PaidTotal)
+        .column(sale::Column::PaymentMethod)
+        .filter(sale::Column::Status.eq(SALE_STATUS_COMPLETED))
+        .filter(sale::Column::CreatedAt.gte(row.opened_at))
+        .filter(sale::Column::CreatedAt.lt(to));
+    // `NOT IN ()` is not valid SQL, so the filter only applies when there is
+    // something to exclude.
+    if !tendered_sale_ids.is_empty() {
+        untendered_q = untendered_q
+            .filter(sale::Column::Id.is_not_in(tendered_sale_ids.into_iter().collect::<Vec<_>>()));
+    }
+    let untendered: Vec<(Decimal, String)> = untendered_q.into_tuple().all(conn).await?;
+    for (paid, method) in untendered {
+        *by_method.entry(method).or_insert(Decimal::ZERO) += paid;
+    }
+    let mut methods: Vec<MethodTotal> = by_method
+        .into_iter()
+        .map(|(method, amount)| MethodTotal { method, amount: amount.round_dp(MONEY_SCALE) })
+        .collect();
+    methods.sort_by(|a, b| a.method.cmp(&b.method));
+    let cash_total = methods
+        .iter()
+        .filter(|m| m.method == "Cash")
+        .map(|m| m.amount)
+        .sum::<Decimal>();
+    let other_total = (collected_total - cash_total).round_dp(MONEY_SCALE);
+
+    let refunded_total: Option<Decimal> = sale_return::Entity::find()
+        .select_only()
+        .column_as(sale_return::Column::RefundedTotal.sum(), "total")
+        .filter(sale_return::Column::CreatedAt.gte(row.opened_at))
+        .filter(sale_return::Column::CreatedAt.lt(to))
+        .into_tuple()
+        .one(conn)
+        .await?
+        .flatten();
+    let refunded_total = refunded_total.unwrap_or(Decimal::ZERO);
+
+    let receipts_total: Option<Decimal> = customer_receive::Entity::find()
+        .select_only()
+        .column_as(customer_receive::Column::Amount.sum(), "total")
+        .filter(customer_receive::Column::CreatedAt.gte(row.opened_at))
+        .filter(customer_receive::Column::CreatedAt.lt(to))
+        .into_tuple()
+        .one(conn)
+        .await?
+        .flatten();
+    let receipts_total = receipts_total.unwrap_or(Decimal::ZERO);
+
+    // Only cash touches the drawer: card and QRIS settle to the bank, and a refund
+    // hands cash back out of it. Receipts are debt collected at the till in cash.
+    let expected_balance =
+        (row.opening_balance + cash_total + receipts_total - refunded_total).round_dp(MONEY_SCALE);
+
+    Ok(RegisterSummary {
+        sales_count,
+        sales_total: sales_total.round_dp(MONEY_SCALE),
+        collected_total: collected_total.round_dp(MONEY_SCALE),
+        cash_total: cash_total.round_dp(MONEY_SCALE),
+        other_total,
+        refunded_total: refunded_total.round_dp(MONEY_SCALE),
+        receipts_total: receipts_total.round_dp(MONEY_SCALE),
+        expected_balance,
+        methods,
+    })
+}
+
+#[tauri::command]
+pub async fn close_register(input: CloseRegisterInput) -> CmdResult<RegisterView> {
+    crate::commands_auth::require_permission(db(), "register-close").await?;
+    let Some(user_id) = crate::auth::current_user_id() else {
+        return Err(CmdError::Forbidden("you are not signed in".into()));
+    };
+    close_register_in(db(), user_id, input).await
+}
+
+pub async fn close_register_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    user_id: i32,
+    input: CloseRegisterInput,
+) -> CmdResult<RegisterView> {
+    if input.closing_balance < Decimal::ZERO {
+        return Err(CmdError::Validation("counted cash cannot be negative".into()));
+    }
+
+    let txn = conn.begin().await?;
+    let Some(row) = open_register_row(&txn, user_id).await? else {
+        return Err(CmdError::Conflict("no open register for this user".into()));
+    };
+
+    let now = crate::migration::now();
+    let summary = summarise_register(&txn, &row, now).await?;
+
+    let mut am: register::ActiveModel = row.into();
+    am.status = Set(REGISTER_CLOSED.to_owned());
+    am.closed_at = Set(Some(now));
+    am.closing_balance = Set(Some(input.closing_balance));
+    am.expected_balance = Set(Some(summary.expected_balance));
+    if let Some(note) = input.note {
+        am.note = Set(Some(note));
+    }
+    let row = am.update(&txn).await?;
+    txn.commit().await?;
+
+    RegisterView::from_row(row)
 }
 
 // ---------------------------------------------------------------------------

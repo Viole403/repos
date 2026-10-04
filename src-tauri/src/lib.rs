@@ -48,6 +48,11 @@ pub fn run() {
             commands::list_draft_sales,
             commands::promote_draft,
             commands::discard_draft,
+            commands::open_register,
+            commands::current_register,
+            commands::list_registers,
+            commands::register_summary,
+            commands::close_register,
             commands_auth::login,
             commands_auth::logout,
             commands_auth::current_user,
@@ -94,12 +99,38 @@ mod tests {
     use super::*;
     use crate::commands::{CheckoutInput, CheckoutLine, PageQuery};
     use crate::entities::auth::permissions;
+    use crate::entities::auth::users;
     use crate::entities::catalog::{item, unit};
     use crate::migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use crate::entities::sales::stock_movement::MovementType;
     use crate::entities::sales::{sale, sale_detail, stock_movement};
     use crate::entities::trade::{customer, supplier, supplier_payment};
+
+    fn days_ago(n: i64) -> chrono::NaiveDateTime {
+        crate::migration::now() - chrono::Duration::days(n)
+    }
+
+    /// A cashier row for FK-scoped tests. The hash is a placeholder: nothing here
+    /// signs in, and paying Argon2's cost per test would slow the suite for no
+    /// coverage.
+    async fn seed_user(db: &DatabaseConnection) -> i32 {
+        let now = crate::migration::now();
+        users::ActiveModel {
+            name: Set("Cashier".into()),
+            email: Set(format!("cashier-{}@till.test", now.and_utc().timestamp_micros())),
+            password_hash: Set("not-a-real-hash".into()),
+            del_status: Set("Live".into()),
+            two_factor_enabled: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("seed user")
+        .id
+    }
     use sea_orm::prelude::Decimal;
     use sea_orm::ActiveValue::Set;
     use sea_orm::{
@@ -2024,5 +2055,215 @@ mod tests {
         assert_eq!(listed.len(), 2, "both returns are listed against the sale");
         let refunded: Decimal = listed.iter().map(|r| r.refunded_total).sum();
         assert_eq!(refunded, Decimal::new(15_000, 3));
+    }
+
+    // -----------------------------------------------------------------------
+    // Registers
+    //
+    // Reached through the `_in` forms with an explicit user id: the scope *is*
+    // the user, so there is no session cell to read and nothing for parallel
+    // tests to race on.
+    // -----------------------------------------------------------------------
+
+    fn open_input(opening: Decimal) -> commands::OpenRegisterInput {
+        commands::OpenRegisterInput {
+            opening_balance: opening,
+            opening_details: None,
+            note: None,
+        }
+    }
+
+    async fn open_for(db: &DatabaseConnection, user_id: i32, opening: Decimal) -> i32 {
+        commands::open_register_in(db, user_id, open_input(opening))
+            .await
+            .expect("open register")
+            .id
+    }
+
+    #[tokio::test]
+    async fn open_register_creates_an_open_shift() {
+        let db = db::init_for_tests().await;
+        let user = seed_user(&db).await;
+        let view = commands::open_register_in(&db, user, open_input(Decimal::new(100_000, 3)))
+            .await
+            .expect("open");
+        assert_eq!(view.status, "Open");
+        assert_eq!(view.opening_balance, Decimal::new(100_000, 3));
+        assert!(view.closed_at.is_none());
+        assert!(view.closing_balance.is_none());
+        assert!(view.expected_balance.is_none());
+    }
+
+    #[tokio::test]
+    async fn second_open_while_one_is_open_is_refused() {
+        let db = db::init_for_tests().await;
+        let user = seed_user(&db).await;
+        open_for(&db, user, Decimal::ZERO).await;
+        let err = commands::open_register_in(&db, user, open_input(Decimal::ZERO)).await;
+        assert!(
+            matches!(err, Err(commands::CmdError::Conflict(_))),
+            "two open shifts for one user means sales land in the wrong window"
+        );
+    }
+
+    #[tokio::test]
+    async fn registers_are_scoped_to_the_user_who_opened_them() {
+        let db = db::init_for_tests().await;
+        let user = seed_user(&db).await;
+        let other = seed_user(&db).await;
+        open_for(&db, user, Decimal::ZERO).await;
+        // A second cashier on the same till is a different shift, not a conflict.
+        open_for(&db, other, Decimal::ZERO).await;
+        let mine = commands::current_register_in(&db, other).await.unwrap();
+        assert!(mine.is_some());
+    }
+
+    #[tokio::test]
+    async fn close_without_an_open_shift_is_refused() {
+        let db = db::init_for_tests().await;
+        let user = seed_user(&db).await;
+        let err = commands::close_register_in(
+            &db,
+            user,
+            commands::CloseRegisterInput { closing_balance: Decimal::ZERO, note: None },
+        )
+        .await;
+        assert!(matches!(err, Err(commands::CmdError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn close_twice_is_refused() {
+        let db = db::init_for_tests().await;
+        let user = seed_user(&db).await;
+        open_for(&db, user, Decimal::ZERO).await;
+        let close = || {
+            commands::close_register_in(
+                &db,
+                user,
+                commands::CloseRegisterInput { closing_balance: Decimal::ZERO, note: None },
+            )
+        };
+        close().await.expect("first close");
+        assert!(
+            matches!(close().await, Err(commands::CmdError::Conflict(_))),
+            "closing twice would snapshot — and report — the same shift twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_snapshots_expected_from_sales_in_window() {
+        let db = db::init_for_tests().await;
+        let user = seed_user(&db).await;
+        let cola = seed_item(&db, "Cola").await;
+        seed_stock(&db, cola, dec(10)).await;
+        // Yesterday's sale belongs to no open shift.
+        seed_sale(&db, days_ago(1), dec(999), None, "Completed").await;
+
+        open_for(&db, user, Decimal::new(100_000, 3)).await;
+        sell_one_item(&db, cola, Decimal::new(50_000, 3), None, None)
+            .await
+            .expect("cash sale");
+
+        let view = commands::close_register_in(
+            &db,
+            user,
+            commands::CloseRegisterInput { closing_balance: Decimal::new(150_000, 3), note: None },
+        )
+        .await
+        .expect("close");
+        assert_eq!(view.status, "Closed");
+        assert_eq!(view.expected_balance, Some(Decimal::new(150_000, 3)));
+        assert_eq!(view.variance, Some(Decimal::ZERO));
+    }
+
+    #[tokio::test]
+    async fn close_counts_card_tenders_outside_the_drawer() {
+        let db = db::init_for_tests().await;
+        let user = seed_user(&db).await;
+        let cola = seed_item(&db, "Cola").await;
+        seed_stock(&db, cola, dec(10)).await;
+        open_for(&db, user, Decimal::ZERO).await;
+
+        sell_one_item(
+            &db,
+            cola,
+            Decimal::new(100_000, 3),
+            None,
+            Some(vec![
+                commands::PaymentLine { method: "Cash".into(), amount: Decimal::new(30_000, 3), reference: None },
+                commands::PaymentLine { method: "Card".into(), amount: Decimal::new(70_000, 3), reference: None },
+            ]),
+        )
+        .await
+        .expect("split sale");
+
+        let summary = commands::register_summary_in(&db, user).await.expect("summary").expect("open");
+        assert_eq!(summary.cash_total, Decimal::new(30_000, 3));
+        assert_eq!(summary.other_total, Decimal::new(70_000, 3));
+        assert_eq!(summary.expected_balance, Decimal::new(30_000, 3));
+    }
+
+    #[tokio::test]
+    async fn close_subtracts_refunds_and_adds_receipts() {
+        let db = db::init_for_tests().await;
+        let user = seed_user(&db).await;
+        let cola = seed_item(&db, "Cola").await;
+        seed_stock(&db, cola, dec(10)).await;
+        open_for(&db, user, Decimal::ZERO).await;
+
+        let (sale_id, line_id) = sell_one(&db, cola, dec(2), Decimal::new(25_000, 3)).await;
+        let mut input = return_line(line_id, dec(1));
+        input.sale_id = sale_id;
+        commands::create_return_in(&db, input, None).await.expect("return half");
+
+        let customer = seed_customer(&db, "Regular", Decimal::ZERO).await;
+        commands::record_customer_receipt_in(
+            &db,
+            customer,
+            commands::ReceiveInput { amount: Decimal::new(10_000, 3), reference: None, paid_at: None },
+        )
+        .await
+        .expect("receipt");
+
+        let summary = commands::register_summary_in(&db, user).await.expect("summary").expect("open");
+        assert_eq!(summary.refunded_total, Decimal::new(25_000, 3));
+        assert_eq!(summary.receipts_total, Decimal::new(10_000, 3));
+        // 50 cash in, 25 refunded out, 10 debt collected: 35 expected.
+        assert_eq!(summary.expected_balance, Decimal::new(35_000, 3));
+    }
+
+    #[tokio::test]
+    async fn opening_details_must_match_the_float() {
+        let db = db::init_for_tests().await;
+        let user = seed_user(&db).await;
+        let err = commands::open_register_in(
+            &db,
+            7,
+            commands::OpenRegisterInput {
+                opening_balance: Decimal::new(100_000, 3),
+                opening_details: Some(vec![commands::MethodTotal {
+                    method: "Cash".into(),
+                    amount: Decimal::new(90_000, 3),
+                }]),
+                note: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(err, Err(commands::CmdError::Validation(_))),
+            "a breakdown that does not add up is a typo, not a second figure"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_opening_is_refused() {
+        let db = db::init_for_tests().await;
+        let user = seed_user(&db).await;
+        assert!(
+            matches!(
+                commands::open_register_in(&db, user, open_input(Decimal::new(-1, 3))).await,
+                Err(commands::CmdError::Validation(_))
+            )
+        );
     }
 }
