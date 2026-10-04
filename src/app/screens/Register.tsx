@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useNavigate } from "react-router-dom";
 import { CheckCircle, Delete, Minus, Plus, Scan, XClose } from "@untitledui/icons";
 import { Badge } from "@/components/base/badges/badges";
 import { Button } from "@/components/base/buttons/button";
@@ -40,6 +41,7 @@ const SHORTCUTS: readonly (readonly [string, string])[] = [
     ["+ / -", "Change quantity by one"],
     ["Delete", "Remove the selected line"],
     ["F2", "Complete the sale"],
+    ["F3", "Hold the cart"],
     ["Esc", "Clear the barcode box"],
 ];
 
@@ -56,6 +58,7 @@ type SaleState =
     | { kind: "idle" }
     | { kind: "saving" }
     | { kind: "done"; view: SaleView }
+    | { kind: "held"; invoiceNo: string }
     | { kind: "failed"; message: string };
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
@@ -68,6 +71,7 @@ const messageOf = (error: unknown): string => (error instanceof Error ? error.me
 const normalizeMoney = (raw: string): string => raw.replace(/\./g, "").replace(",", ".");
 
 const RegisterScreen = () => {
+    const navigate = useNavigate();
     const cart = useCart();
     const { lines, subtotal, discountTotal, taxTotal, grandTotal, itemCount, canCheckout } = cart;
     const { add: addToCart, clear: clearCart, remove: removeLine, setQuantity } = cart;
@@ -281,6 +285,48 @@ const RegisterScreen = () => {
         }
     }, [canCheckout, paidInvalid, paidDigits, sale.kind, lines, taxTotal, paymentMethod, customerKey, split, tenderSum, grandTotal, note, clearCart, focusCode]);
 
+    /**
+     * Parks the cart as a draft: same lines, customer and note, but `promote: false`
+     * moves no stock — and no tenders go with it, because nothing has been paid yet
+     * and the payment is decided when the hold completes. Sending tender rows now
+     * would leave `paid_total` disagreeing with their sum on promote.
+     */
+    const holdCart = useCallback(async () => {
+        if (lines.length === 0 || sale.kind === "saving") return;
+
+        const input: CheckoutInput = {
+            lines: lines.map((line) => ({
+                itemId: line.itemId,
+                quantity: line.quantity,
+                unitPrice: line.unitPrice,
+                discount: line.discount,
+            })),
+            discountTotal: "0",
+            taxTotal,
+            paidTotal: null,
+            paymentMethod,
+            note: note.trim() === "" ? null : note.trim(),
+            promote: false,
+            payments: null,
+            customerId: customerKey === "" ? null : Number(customerKey),
+        };
+
+        setSale({ kind: "saving" });
+        try {
+            const view = await checkout(input);
+            setSale({ kind: "held", invoiceNo: view.sale.invoiceNo });
+            setPaid("");
+            setNote("");
+            setCustomerKey("");
+            clearCart();
+            setSelectedItemId(null);
+            focusCode();
+        } catch (error) {
+            setSale({ kind: "failed", message: messageOf(error) });
+            focusCode();
+        }
+    }, [lines, sale.kind, taxTotal, paymentMethod, note, customerKey, clearCart, focusCode]);
+
     useEffect(() => {
         const onKeyDown = (event: KeyboardEvent) => {
             // Never swallow a chord the browser or OS owns.
@@ -290,9 +336,9 @@ const RegisterScreen = () => {
             const editable = target !== null && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
             const inBarcode = target === codeRef.current;
             // Typing in any field beats the shortcuts, so no keystroke is stolen
-            // mid-word. F2 is exempt: no text field uses it, and blocking it would
-            // strand a cashier who just keyed a paid amount.
-            if (event.key !== "F2" && editable && !(inBarcode && TYPING_SAFE.has(event.key))) return;
+            // mid-word. F2 and F3 are exempt: no text field uses them, and blocking
+            // them would strand a cashier who just keyed a paid amount.
+            if (event.key !== "F2" && event.key !== "F3" && editable && !(inBarcode && TYPING_SAFE.has(event.key))) return;
 
             switch (event.key) {
                 case "/":
@@ -331,6 +377,10 @@ const RegisterScreen = () => {
                     event.preventDefault();
                     void submitSale();
                     break;
+                case "F3":
+                    event.preventDefault();
+                    void holdCart();
+                    break;
                 default:
                     break;
             }
@@ -338,7 +388,7 @@ const RegisterScreen = () => {
 
         window.addEventListener("keydown", onKeyDown);
         return () => window.removeEventListener("keydown", onKeyDown);
-    }, [focusCode, moveSelection, stepQuantity, removeSelected, submitSale, code, lines.length]);
+    }, [focusCode, moveSelection, stepQuantity, removeSelected, submitSale, holdCart, code, lines.length]);
 
     const available = (line: CartLine): Decimal | null => (line.itemId in onHand ? onHand[line.itemId] : null);
     const change = decSub(paidDigits === "" ? grandTotal : paidDigits, grandTotal);
@@ -406,6 +456,16 @@ const RegisterScreen = () => {
             {sale.kind === "failed" && (
                 <p className="rounded-lg bg-error-secondary px-3 py-2 text-sm text-error-primary">
                     <span className="font-semibold">Sale rejected.</span> {sale.message}
+                </p>
+            )}
+            {sale.kind === "held" && (
+                <p className="rounded-lg bg-secondary px-3 py-2 text-sm text-secondary">
+                    <span className="font-semibold text-primary">{sale.invoiceNo}</span> held — no stock moved and
+                    nothing was charged. Resume it from{" "}
+                    <Button color="link-gray" size="sm" onPress={() => navigate("/sales/holds")}>
+                        Sales → Holds
+                    </Button>
+                    .
                 </p>
             )}
 
@@ -645,6 +705,16 @@ const RegisterScreen = () => {
                     </Button>
 
                     <Button
+                        size="lg"
+                        color="secondary"
+                        isLoading={false}
+                        isDisabled={lines.length === 0 || sale.kind === "saving"}
+                        onPress={() => void holdCart()}
+                    >
+                        Hold cart
+                    </Button>
+
+                    <Button
                         color="secondary-destructive"
                         iconLeading={XClose}
                         isDisabled={lines.length === 0 || sale.kind === "saving"}
@@ -667,7 +737,7 @@ const RegisterScreen = () => {
                             </div>
                         ))}
                         <p className="border-t border-secondary pt-2 text-xs text-tertiary">
-                            Shortcuts pause while you type, except F2. Nothing here overrides a Ctrl or Cmd chord.
+                            Shortcuts pause while you type, except F2 / F3. Nothing here overrides a Ctrl or Cmd chord.
                         </p>
                     </div>
                 </div>
