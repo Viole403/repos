@@ -366,6 +366,7 @@ export interface SaleFilter {
 
 export const listSales = (filter: SaleFilter = {}, query: PageQuery = {}) =>
     call<Page<SaleSummary>>("list_sales", { filter, query });
+export const getSale = (id: number) => call<SaleView>("get_sale", { id });
 
 // ---------------------------------------------------------------- trade
 export interface CustomerView {

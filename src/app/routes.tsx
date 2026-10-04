@@ -12,6 +12,7 @@ import { Setup } from "./screens/Setup";
 import { Accounts } from "./screens/Accounts";
 import { Roles } from "./screens/Roles";
 import { Sales } from "./screens/Sales";
+import { SaleDetail } from "./screens/SaleDetail";
 import { Customers } from "./screens/Customers";
 import { Suppliers } from "./screens/Suppliers";
 import { Register } from "./screens/Register";
@@ -32,6 +33,7 @@ const screens: Record<string, ReactNode> = {
     "/catalog/brands": <Brands />,
     "/catalog/categories": <ItemCategories />,
     "/sales": <Sales />,
+    "/sales/:id": <SaleDetail />,
     "/customers": <Customers />,
     "/purchase/suppliers": <Suppliers />,
     "/settings/accounts": <Accounts />,
@@ -53,6 +55,19 @@ const children: RouteObject[] = navItems.flatMap((item) => {
         if (!screen) throw new Error(`No screen registered for enabled route "${path}". Add it to screens in src/app/routes.tsx.`);
         return path === "/" ? { index: true, element: screen } : { path, element: screen };
     });
+});
+
+/**
+ * Routes with no sidebar entry, because they are reached from a list rather than
+ * from the sidebar. Still listed through `screens`, so the "enabled entry has no
+ * screen" check below covers them too.
+ */
+const detailRoutes: string[] = ["/sales/:id"];
+
+const withoutNavEntry: RouteObject[] = detailRoutes.map((path) => {
+    const screen = screens[path];
+    if (!screen) throw new Error(`No screen registered for detail route "${path}".`);
+    return { path, element: screen };
 });
 
 /**
@@ -88,7 +103,7 @@ export const routes: RouteObject[] = [
         children: [
             {
                 element: <AppShell />,
-                children,
+                children: [...children, ...withoutNavEntry],
             },
         ],
     },
