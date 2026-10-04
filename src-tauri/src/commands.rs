@@ -799,7 +799,7 @@ pub async fn get_sale_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResult<Sal
         stock_on_hand.push(ItemOnHand { item_id, quantity: on_hand_in(conn, item_id).await? });
     }
 
-    Ok(SaleView { sale, lines, stock_on_hand, payments: list_payments_in(conn, id).await? })
+    Ok(SaleView { sale, lines, stock_on_hand, payments: list_payments_in(conn, id).await?, loyalty_earned: 0 })
 }
 
 /// A sale row with the customer named, so the list does not show ids.
@@ -1940,6 +1940,9 @@ pub struct SaleView {
     /// One entry per tender. Empty for a sale paid in a single method recorded the
     /// pre-split way, and for a draft that has not been paid.
     pub payments: Vec<sale_payment::Model>,
+    /// Points this sale earned, so the till and the mirror can say so. Zero for
+    /// walk-ins and drafts — nobody earned anything.
+    pub loyalty_earned: i64,
 }
 
 /// One word for a split sale: `"Cash + Card"` beats `"Split"` because a receipt or a
@@ -2398,9 +2401,10 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
 
     // Drafts earn nothing: a draft is a basket nobody has paid for. Walk-ins earn
     // nothing either — there is no account to credit.
+    let mut loyalty_earned = 0;
     if promoted {
         if let Some(customer_id) = customer_id {
-            earn_loyalty(&txn, customer_id, row.paid_total, row.id).await?;
+            loyalty_earned = earn_loyalty(&txn, customer_id, row.paid_total, row.id).await?;
         }
     }
 
@@ -2426,6 +2430,7 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
         lines,
         stock_on_hand,
         payments: list_payments_in(&txn, sale_id).await?,
+        loyalty_earned,
     };
     // Committed last: everything above is invisible to other readers until here.
     txn.commit().await?;
@@ -2731,8 +2736,9 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
 
     // Completing the draft is the spend: a parked basket earns nothing until the
     // money is real, exactly like a direct checkout.
+    let mut loyalty_earned = 0;
     if let Some(customer_id) = header.customer_id {
-        earn_loyalty(&txn, customer_id, paid, sale_id).await?;
+        loyalty_earned = earn_loyalty(&txn, customer_id, paid, sale_id).await?;
     }
 
     // Read the header back instead of assembling it here, so the view is what the
@@ -2747,6 +2753,7 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
         lines,
         stock_on_hand,
         payments: list_payments_in(&txn, sale_id).await?,
+        loyalty_earned,
     };
     // Committed last: the movements and the status flip become visible together, or
     // neither does.
@@ -5702,18 +5709,18 @@ async fn loyalty_points_in<C: ConnectionTrait>(
 }
 
 /// Credits the spend. Runs inside the checkout/promote transaction, so the sale
-/// and its points commit together.
+/// and its points commit together. Returns the points, so the till can say so.
 async fn earn_loyalty<C: ConnectionTrait>(
     conn: &C,
     customer_id: i32,
     paid_total: Decimal,
     sale_id: i32,
-) -> CmdResult<()> {
+) -> CmdResult<i64> {
     let points = i64::try_from((paid_total / Decimal::new(1_000, 0)).floor())
         .map_err(|_| CmdError::Validation("sale total is out of points range".into()))?
         * LOYALTY_PER_THOUSAND;
     if points <= 0 {
-        return Ok(());
+        return Ok(0);
     }
     loyalty_entry::ActiveModel {
         customer_id: Set(customer_id),
@@ -5725,7 +5732,7 @@ async fn earn_loyalty<C: ConnectionTrait>(
     }
     .insert(conn)
     .await?;
-    Ok(())
+    Ok(points)
 }
 
 /// Spends points as a tender. No balance cap: the shortfall becomes signed debt
@@ -5869,6 +5876,36 @@ pub async fn list_ratings(query: PageQuery) -> CmdResult<Page<service_rating::Mo
         .all(db)
         .await?;
     Ok(Page::new(rows, total, &query))
+}
+
+// ---------------------------------------------------------------------------
+// Customer display
+// ---------------------------------------------------------------------------
+
+/// Opens the customer-facing mirror window, focusing it if it is already open.
+///
+/// Unguarded like `health_check`: opening a window reads and writes nothing.
+/// What the mirror shows is client-side cart state pushed over Tauri events;
+/// the rating tap it offers goes through the guarded `submit_rating`.
+#[tauri::command]
+pub async fn open_customer_display(app: tauri::AppHandle) -> CmdResult<()> {
+    use tauri::Manager;
+    if let Some(window) = app.get_webview_window("customer-display") {
+        window
+            .set_focus()
+            .map_err(|e| CmdError::Validation(format!("cannot focus customer display: {e}")))?;
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "customer-display",
+        tauri::WebviewUrl::App("index.html#/display".into()),
+    )
+    .title("Customer Display")
+    .maximized(true)
+    .build()
+    .map_err(|e| CmdError::Validation(format!("cannot open customer display: {e}")))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

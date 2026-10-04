@@ -103,6 +103,7 @@ pub fn run() {
             commands::list_loyalty,
             commands::submit_rating,
             commands::list_ratings,
+            commands::open_customer_display,
             commands::sell_gift_card,
             commands::reload_gift_card,
             commands::list_gift_cards,
@@ -2300,10 +2301,11 @@ mod tests {
         let mug = seed_item(&db, "mug").await;
         seed_stock(&db, mug, dec(5)).await;
 
-        sell_to_customer(&db, mug, customer, None).await;
+        let sale = sell_to_customer(&db, mug, customer, None).await;
 
         // 2 × 15000 = 30000 paid in full, so 30 points.
         assert_eq!(loyalty_of(&db, customer).await, 30);
+        assert_eq!(sale.loyalty_earned, 30, "the till can say what was earned");
         let input = commands::CustomerInput {
             name: "Kiki".into(),
             code: None,
