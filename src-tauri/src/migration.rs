@@ -53,6 +53,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::ItemSubCategories),
             Box::new(Migrations::ItemVariationDepth),
             Box::new(Migrations::ItemBatches),
+            Box::new(Migrations::FixedAssets),
         ]
     }
 }
@@ -87,6 +88,7 @@ pub enum Migrations {
     ItemSubCategories,
     ItemVariationDepth,
     ItemBatches,
+    FixedAssets,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -151,6 +153,7 @@ impl MigrationName for Migrations {
         Migrations::ItemSubCategories => "item_sub_categories",
         Migrations::ItemVariationDepth => "item_variation_depth",
         Migrations::ItemBatches => "item_batches",
+        Migrations::FixedAssets => "fixed_assets",
         }
     }
 }
@@ -187,6 +190,7 @@ impl MigrationTrait for Migrations {
             Migrations::ItemSubCategories => item_sub_categories(manager).await?,
             Migrations::ItemVariationDepth => item_variation_depth(manager).await?,
             Migrations::ItemBatches => item_batches(manager).await?,
+            Migrations::FixedAssets => fixed_assets(manager).await?,
         }
         Ok(())
     }
@@ -194,6 +198,31 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::FixedAssets => {
+                manager
+                    .drop_table(
+                        Table::drop()
+                            .table(FixedAssetMovements::Table)
+                            .if_exists()
+                            .to_owned(),
+                    )
+                    .await?;
+                manager
+                    .drop_table(
+                        Table::drop()
+                            .table(FixedAssetItems::Table)
+                            .if_exists()
+                            .to_owned(),
+                    )
+                    .await?;
+                let conn = manager.get_connection();
+                for name in FIXED_ASSET_PERMISSIONS {
+                    permissions::Entity::delete_many()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .exec(conn)
+                        .await?;
+                }
+            }
             Migrations::ItemBatches => {
                 manager
                     .alter_table(
@@ -1826,6 +1855,106 @@ async fn item_batches(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// Fixed assets — the fridge, the forklift, the till itself. A shop tracks these,
+/// but they are **not sellable stock**: they never reach the shelf, never decrement
+/// on a sale, and their quantity is not a fraction. So this is a separate catalog
+/// from `items`, not a flag on it.
+///
+/// The reference splits this across four tables (`fixed_asset_stock_ins` plus
+/// `_details`, and the matching `_outs`). Four tables where a signed ledger does the
+/// same job: `fixed_asset_movements` records an asset arriving or leaving with a
+/// quantity and the price it went at, and on-hand is `SUM(quantity)` over them — the
+/// same derivation as stock, so the two subsystems agree on what a ledger is.
+async fn fixed_assets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(FixedAssetItems::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(FixedAssetItems::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(FixedAssetItems::Name).string().not_null())
+                .col(ColumnDef::new(FixedAssetItems::Code).string().not_null().unique_key())
+                .col(ColumnDef::new(FixedAssetItems::Description).string().null())
+                .col(ColumnDef::new(FixedAssetItems::PurchasePrice).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(FixedAssetItems::SalePrice).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(FixedAssetItems::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(FixedAssetItems::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(FixedAssetItems::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(FixedAssetMovements::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(FixedAssetMovements::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(FixedAssetMovements::AssetItemId).integer().not_null())
+                // `In` when the asset arrives (bought, donated, found) and `Out`
+                // when it leaves (sold, written off, scrapped).
+                .col(ColumnDef::new(FixedAssetMovements::MovementKind).string().not_null())
+                .col(ColumnDef::new(FixedAssetMovements::Quantity).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                // What it went at, kept per movement rather than on the item: the
+                // same fridge can be bought at one price and sold at another, and
+                // a valuation wants the purchase figures.
+                .col(ColumnDef::new(FixedAssetMovements::UnitPrice).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(FixedAssetMovements::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(FixedAssetMovements::ReferenceNo).string().null())
+                .col(ColumnDef::new(FixedAssetMovements::Note).string().null())
+                .col(ColumnDef::new(FixedAssetMovements::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                // CASCADE: a movement with no asset is a line with no meaning, and an
+                // asset's history is not a financial record the way a sale is.
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_fixed_asset_movements_item")
+                        .from(FixedAssetMovements::Table, FixedAssetMovements::AssetItemId)
+                        .to(FixedAssetItems::Table, FixedAssetItems::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_fixed_asset_movements_item")
+                .table(FixedAssetMovements::Table)
+                .col(FixedAssetMovements::AssetItemId)
+                .to_owned(),
+        )
+        .await?;
+
+    let conn = manager.get_connection();
+    let now = now();
+    for name in FIXED_ASSET_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        let group = name.split_once('-').map(|(g, _)| g).unwrap_or("fixed_asset");
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set(group.to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// Stored value: a card number with a transaction ledger behind it. The balance is
 /// `SUM(amount)` — never a mutated column — and every row carries `balance_after`
 /// like the stock ledger, so a discrepancy points at one row.
@@ -2977,6 +3106,13 @@ enum Registers {
 }
 
 /// Permissions this migration owns, for the down arm above.
+const FIXED_ASSET_PERMISSIONS: &[&str] = &[
+    "fixed_asset-list",
+    "fixed_asset-create",
+    "fixed_asset-destroy",
+];
+
+/// Permissions this migration owns, for the down arm above.
 const REGISTER_PERMISSIONS: &[&str] = &[
     "register-open",
     "register-close",
@@ -3279,6 +3415,34 @@ enum ItemBatches {
     DelStatus,
     CreatedAt,
     UpdatedAt,
+}
+
+#[derive(Iden)]
+enum FixedAssetItems {
+    Table,
+    Id,
+    Name,
+    Code,
+    Description,
+    PurchasePrice,
+    SalePrice,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum FixedAssetMovements {
+    Table,
+    Id,
+    AssetItemId,
+    MovementKind,
+    Quantity,
+    UnitPrice,
+    Amount,
+    ReferenceNo,
+    Note,
+    CreatedAt,
 }
 
 
