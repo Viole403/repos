@@ -16,6 +16,9 @@ pub struct Model {
     pub refunded_total: Decimal,
     /// The account that authorised it, for the audit trail.
     pub returned_by: Option<i32>,
+    /// The `sale-approve` holder who authorised the return. Always set — a
+    /// return always moves money or stock back.
+    pub approved_by: Option<i32>,
     pub note: Option<String>,
     pub created_at: chrono::NaiveDateTime,
 }

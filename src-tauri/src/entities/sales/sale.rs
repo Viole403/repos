@@ -37,6 +37,9 @@ pub struct Model {
     pub customer_id: Option<i32>,
     /// Closed vocabulary (`ORDER_TYPES` in commands): counter, pickup, delivery, online.
     pub order_type: String,
+    /// The `sale-approve` holder who authorised a discount on this sale.
+    /// `None` means no approval was needed — full price needs no second eyes.
+    pub approved_by: Option<i32>,
     pub note: Option<String>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
