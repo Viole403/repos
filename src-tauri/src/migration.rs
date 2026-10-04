@@ -51,6 +51,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::CreditNotes),
             Box::new(Migrations::ManagerApprovals),
             Box::new(Migrations::ItemSubCategories),
+            Box::new(Migrations::ItemVariationDepth),
         ]
     }
 }
@@ -83,6 +84,7 @@ pub enum Migrations {
     CreditNotes,
     ManagerApprovals,
     ItemSubCategories,
+    ItemVariationDepth,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -145,6 +147,7 @@ impl MigrationName for Migrations {
         Migrations::CreditNotes => "credit_notes",
         Migrations::ManagerApprovals => "manager_approvals",
         Migrations::ItemSubCategories => "item_sub_categories",
+        Migrations::ItemVariationDepth => "item_variation_depth",
         }
     }
 }
@@ -179,6 +182,7 @@ impl MigrationTrait for Migrations {
             Migrations::CreditNotes => credit_notes(manager).await?,
             Migrations::ManagerApprovals => manager_approvals(manager).await?,
             Migrations::ItemSubCategories => item_sub_categories(manager).await?,
+            Migrations::ItemVariationDepth => item_variation_depth(manager).await?,
         }
         Ok(())
     }
@@ -186,6 +190,32 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::ItemVariationDepth => {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(Items::Table)
+                            .drop_column(Items::ParentId)
+                            .to_owned(),
+                    )
+                    .await?;
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(Items::Table)
+                            .drop_column(Items::Symbology)
+                            .to_owned(),
+                    )
+                    .await?;
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(Items::Table)
+                            .drop_column(Items::Weighed)
+                            .to_owned(),
+                    )
+                    .await?;
+            }
             Migrations::ItemSubCategories => {
                 manager
                     .alter_table(
@@ -1595,6 +1625,82 @@ async fn item_sub_categories(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// Variation depth on the item itself. The reference's variations are child
+/// items (`parent_id` self-link) carrying a `variation_details` JSON blob —
+/// size, colour, flavour — not a separate `variations` table; a T-shirt's
+/// sizes are rows, and each holds its own stock. Same here: `parent_id` names
+/// the template, NULL means standalone. `symbology` names how `code` scans —
+/// a `0`-prefixed EAN-8 is not an internal SKU, and mixing them makes dedupe
+/// wrong. `weighed` marks price-per-kg goods whose quantity comes from a
+/// scale; checkout still takes the number, the scale half is Stage 11 USB.
+async fn item_variation_depth(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Items::Table)
+                .add_column(ColumnDef::new(Items::ParentId).integer().null().to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Items::Table)
+                .add_column(ColumnDef::new(Items::Symbology).string().null().to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Items::Table)
+                .add_column(ColumnDef::new(Items::Weighed).boolean().not_null().default(false).to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    // Same SQLite rule as the sub-category link: no FK on an existing table,
+    // so only Postgres gets the constraint. The guard below enforces it anyway.
+    if manager.get_database_backend() != sea_orm::DbBackend::Sqlite {
+        manager
+            .create_foreign_key(
+                ForeignKey::create()
+                    .name("fk_items_parent")
+                    .from(Items::Table, Items::ParentId)
+                    .to(Items::Table, Items::Id)
+                    .on_delete(ForeignKeyAction::SetNull)
+                    .to_owned(),
+            )
+            .await?;
+    }
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_items_parent")
+                .table(Items::Table)
+                .col(Items::ParentId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_items_code")
+                .table(Items::Table)
+                .col(Items::Code)
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
+}
+
 /// Stored value: a card number with a transaction ledger behind it. The balance is
 /// `SUM(amount)` — never a mutated column — and every row carries `balance_after`
 /// like the stock ledger, so a discrepancy points at one row.
@@ -2979,6 +3085,9 @@ enum Items {
     AlertQuantity,
     LoyaltyPoint,
     Photo,
+    ParentId,
+    Symbology,
+    Weighed,
     DelStatus,
     CreatedAt,
     UpdatedAt,
