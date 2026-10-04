@@ -45,6 +45,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::InstallmentDownMethod),
             Box::new(Migrations::WarrantyAndServicing),
             Box::new(Migrations::GiftCards),
+            Box::new(Migrations::Loyalty),
         ]
     }
 }
@@ -71,6 +72,7 @@ pub enum Migrations {
     InstallmentDownMethod,
     WarrantyAndServicing,
     GiftCards,
+    Loyalty,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -127,6 +129,7 @@ impl MigrationName for Migrations {
         Migrations::InstallmentDownMethod => "installment_down_method",
         Migrations::WarrantyAndServicing => "warranty_and_servicing",
         Migrations::GiftCards => "gift_cards",
+        Migrations::Loyalty => "loyalty",
         }
     }
 }
@@ -155,6 +158,7 @@ impl MigrationTrait for Migrations {
             Migrations::InstallmentDownMethod => installment_down_method(manager).await?,
             Migrations::WarrantyAndServicing => warranty_and_servicing(manager).await?,
             Migrations::GiftCards => gift_cards(manager).await?,
+            Migrations::Loyalty => loyalty(manager).await?,
         }
         Ok(())
     }
@@ -162,6 +166,11 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::Loyalty => {
+                manager
+                    .drop_table(Table::drop().table(LoyaltyEntries::Table).if_exists().to_owned())
+                    .await?;
+            }
             Migrations::GiftCards => {
                 for t in [GiftCardTransactions::Table.into_iden(), GiftCards::Table.into_iden()] {
                     manager.drop_table(Table::drop().table(t).if_exists().to_owned()).await?;
@@ -1135,6 +1144,60 @@ async fn installment_stock_link(manager: &SchemaManager<'_>) -> Result<(), DbErr
     Ok(())
 }
 
+/// Loyalty points as a ledger, like stock: immutable Earn/Redeem/Void rows, never
+/// a mutated balance. One point per Rp1.000 of paid total (floored), redeemable
+/// at Rp1 each — fixed until the settings table lands and can hold the rate.
+///
+/// This supersedes `customers.loyalty_points`, which stops being written: a
+/// stored balance is a read-modify-write that two concurrent sales interleave,
+/// the same reason stock and money are ledgers here. The column stays (dropping
+/// it strands old databases); the views derive from this table instead.
+async fn loyalty(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(LoyaltyEntries::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(LoyaltyEntries::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(LoyaltyEntries::CustomerId).integer().not_null())
+                .col(ColumnDef::new(LoyaltyEntries::SaleId).integer().null())
+                // `Earn`, `Redeem` or `Void`. Signed `points`: earn is positive.
+                .col(ColumnDef::new(LoyaltyEntries::Kind).string().not_null())
+                .col(ColumnDef::new(LoyaltyEntries::Points).integer().not_null())
+                .col(ColumnDef::new(LoyaltyEntries::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_loyalty_entries_customer")
+                        .from(LoyaltyEntries::Table, LoyaltyEntries::CustomerId)
+                        .to(Customers::Table, Customers::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_loyalty_entries_sale")
+                        .from(LoyaltyEntries::Table, LoyaltyEntries::SaleId)
+                        .to(Sales::Table, Sales::Id)
+                        .on_delete(ForeignKeyAction::SetNull)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_loyalty_entries_customer_id")
+                .table(LoyaltyEntries::Table)
+                .col(LoyaltyEntries::CustomerId)
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
+}
+
 /// Stored value: a card number with a transaction ledger behind it. The balance is
 /// `SUM(amount)` — never a mutated column — and every row carries `balance_after`
 /// like the stock ledger, so a discrepancy points at one row.
@@ -2072,6 +2135,17 @@ const INSTALLMENT_PERMISSIONS: &[&str] = &[
     "installment-show",
     "installment-collect",
 ];
+
+#[derive(Iden)]
+enum LoyaltyEntries {
+    Table,
+    Id,
+    CustomerId,
+    SaleId,
+    Kind,
+    Points,
+    CreatedAt,
+}
 
 #[derive(Iden)]
 enum GiftCards {
