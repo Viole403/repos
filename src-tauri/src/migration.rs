@@ -13,7 +13,7 @@ use sea_orm_migration::prelude::*;
 // Schema builder types re-exported by sea-orm-migration's prelude.
 use sea_orm::sea_query::{ColumnDef, ForeignKey, ForeignKeyAction, Index, Table};
 
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbBackend, EntityTrait, QueryFilter};
 
 use crate::entities::auth::permissions;
 
@@ -54,6 +54,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::ItemVariationDepth),
             Box::new(Migrations::ItemBatches),
             Box::new(Migrations::FixedAssets),
+            Box::new(Migrations::LoyaltyPointsWidth),
         ]
     }
 }
@@ -89,6 +90,7 @@ pub enum Migrations {
     ItemVariationDepth,
     ItemBatches,
     FixedAssets,
+    LoyaltyPointsWidth,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -176,6 +178,7 @@ impl MigrationName for Migrations {
         Migrations::ItemVariationDepth => "item_variation_depth",
         Migrations::ItemBatches => "item_batches",
         Migrations::FixedAssets => "fixed_assets",
+        Migrations::LoyaltyPointsWidth => "loyalty_points_width",
         }
     }
 }
@@ -213,6 +216,7 @@ impl MigrationTrait for Migrations {
             Migrations::ItemVariationDepth => item_variation_depth(manager).await?,
             Migrations::ItemBatches => item_batches(manager).await?,
             Migrations::FixedAssets => fixed_assets(manager).await?,
+            Migrations::LoyaltyPointsWidth => loyalty_points_width(manager).await?,
         }
         Ok(())
     }
@@ -220,6 +224,20 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::LoyaltyPointsWidth => {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(LoyaltyEntries::Table)
+                            .modify_column(
+                                ColumnDef::new(LoyaltyEntries::Points)
+                                    .integer()
+                                    .not_null(),
+                            )
+                            .to_owned(),
+                    )
+                    .await?;
+            }
             Migrations::FixedAssets => {
                 manager
                     .drop_table(
@@ -1913,6 +1931,42 @@ async fn item_batches(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// same job: `fixed_asset_movements` records an asset arriving or leaving with a
 /// quantity and the price it went at, and on-hand is `SUM(quantity)` over them — the
 /// same derivation as stock, so the two subsystems agree on what a ledger is.
+/// Widens `loyalty_entries.points` from 4 to 8 bytes.
+///
+/// The entity declares `i64`, which sqlx reads as `INT8` on Postgres — but the
+/// original migration created the column with `.integer()`, which is `INT4` there.
+/// Every read of that column then failed to decode. SQLite hid it: its `INTEGER`
+/// is 64-bit regardless of how the column was declared, so the mismatch cannot
+/// exist on that backend.
+///
+/// A data migration rather than an edit to `loyalty()`, because an existing
+/// database has already applied that variant and would otherwise keep the narrow
+/// column forever.
+async fn loyalty_points_width(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    // SQLite is a genuine no-op here rather than a skipped step: its `INTEGER` is a
+    // signed 64-bit type whatever the declaration says, so the column already holds
+    // the full `i64` range and there is nothing to widen. sea-query cannot express
+    // the `ALTER` at all on that backend — it panics with `Sqlite not support
+    // modifying table column`, which fails every test in the suite rather than one.
+    if manager.get_database_backend() == DbBackend::Sqlite {
+        return Ok(());
+    }
+
+    manager
+        .alter_table(
+            Table::alter()
+                .table(LoyaltyEntries::Table)
+                .modify_column(
+                    ColumnDef::new(LoyaltyEntries::Points)
+                        .big_integer()
+                        .not_null(),
+                )
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn fixed_assets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let ts = timestamp_type(manager.get_database_backend());
 
