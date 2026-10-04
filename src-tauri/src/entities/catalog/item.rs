@@ -30,6 +30,12 @@ pub struct Model {
     pub alert_quantity: Option<Decimal>,
     pub loyalty_point: Decimal,
     pub photo: Option<String>,
+    /// Template item for a variation (size, colour); NULL means standalone.
+    pub parent_id: Option<i32>,
+    /// How `code` scans: EAN-13, EAN-8, UPC-A, CODE-39/93/128, CODABAR, QR.
+    pub symbology: Option<String>,
+    /// Price-per-kg goods: quantity comes from a scale, not a count.
+    pub weighed: bool,
     pub del_status: String,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
@@ -63,6 +69,9 @@ pub struct ItemView {
     pub alert_quantity: Option<Decimal>,
     pub loyalty_point: Decimal,
     pub photo: Option<String>,
+    pub parent_id: Option<i32>,
+    pub symbology: Option<String>,
+    pub weighed: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -97,6 +106,12 @@ pub enum Relation {
         to = "super::unit::Column::Id"
     )]
     SaleUnit,
+    #[sea_orm(
+        belongs_to = "crate::entities::catalog::item::Entity",
+        from = "Column::ParentId",
+        to = "Column::Id"
+    )]
+    Parent,
 }
 
 // Inverse relations for the `has_many` declared on brand/category/unit.
