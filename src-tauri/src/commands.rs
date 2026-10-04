@@ -2163,6 +2163,171 @@ pub(crate) async fn list_stock_in<C: ConnectionTrait>(
     Ok(Page::new(rows, total, query))
 }
 
+/// Reasons a count differs from the ledger. Closed so variance reports group
+/// without string matching; free text rides in the note.
+pub const COUNT_REASONS: &[&str] = &[
+    "Cycle count",
+    "Annual count",
+    "Damaged found",
+    "Theft suspected",
+    "Data correction",
+    "Other",
+];
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StockMoveInput {
+    pub item_id: i32,
+    pub quantity: Decimal,
+    pub reference: Option<String>,
+}
+
+/// The item must be live: dead catalog rows take no stock.
+async fn guard_stock_item<C: ConnectionTrait>(conn: &C, item_id: i32) -> CmdResult<()> {
+    item::Entity::find_by_id(item_id)
+        .filter(item::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("item".into()))?;
+    Ok(())
+}
+
+/// One inbound or corrective ledger row. The caller names the movement; the
+/// balance is always read fresh inside the same call so it cannot go stale.
+async fn append_stock_row<C: ConnectionTrait>(
+    conn: &C,
+    item_id: i32,
+    movement: MovementType,
+    quantity: Decimal,
+    reference: Option<String>,
+) -> CmdResult<stock_movement::Model> {
+    guard_stock_item(conn, item_id).await?;
+    let balance_after = on_hand_in(conn, item_id).await? + quantity;
+    let now = crate::migration::now();
+    Ok(stock_movement::ActiveModel {
+        item_id: Set(item_id),
+        sale_id: Set(None),
+        movement_type: Set(movement.as_str().to_owned()),
+        quantity: Set(quantity),
+        reference: Set(reference),
+        balance_after: Set(balance_after),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?)
+}
+
+#[tauri::command]
+pub async fn record_goods_receipt(input: StockMoveInput) -> CmdResult<stock_movement::Model> {
+    crate::commands_auth::require_permission(db(), "stock-stock").await?;
+    record_goods_receipt_in(db(), input).await
+}
+
+pub(crate) async fn record_goods_receipt_in<C: ConnectionTrait>(
+    conn: &C,
+    input: StockMoveInput,
+) -> CmdResult<stock_movement::Model> {
+    if input.quantity <= Decimal::ZERO {
+        return Err(CmdError::Validation("receipt quantity must be greater than zero".into()));
+    }
+    append_stock_row(conn, input.item_id, MovementType::GoodsReceipt, input.quantity, input.reference).await
+}
+
+#[tauri::command]
+pub async fn record_opening_stock(input: StockMoveInput) -> CmdResult<stock_movement::Model> {
+    crate::commands_auth::require_permission(db(), "stock-stock").await?;
+    record_opening_stock_in(db(), input).await
+}
+
+pub(crate) async fn record_opening_stock_in<C: ConnectionTrait>(
+    conn: &C,
+    input: StockMoveInput,
+) -> CmdResult<stock_movement::Model> {
+    if input.quantity <= Decimal::ZERO {
+        return Err(CmdError::Validation("opening quantity must be greater than zero".into()));
+    }
+    // Opening is the first word, not a rewrite: once an item has history, later
+    // arrivals are receipts and later corrections are adjustments.
+    let moved = stock_movement::Entity::find()
+        .filter(stock_movement::Column::ItemId.eq(input.item_id))
+        .count(conn)
+        .await?;
+    if moved > 0 {
+        return Err(CmdError::Conflict("opening stock is already recorded for this item".into()));
+    }
+    append_stock_row(conn, input.item_id, MovementType::OpeningBalance, input.quantity, input.reference).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StockCountInput {
+    pub item_id: i32,
+    /// What the counter saw on the shelf. The expected figure is never sent —
+    /// the count is blind by construction, so the shelf cannot anchor the count.
+    pub counted: Decimal,
+    pub reason: String,
+    pub note: Option<String>,
+}
+
+#[tauri::command]
+pub async fn record_stock_count(input: StockCountInput) -> CmdResult<stock_movement::Model> {
+    crate::commands_auth::require_permission(db(), "stock-stock").await?;
+    record_stock_count_in(db(), input).await
+}
+
+pub(crate) async fn record_stock_count_in<C: ConnectionTrait>(
+    conn: &C,
+    input: StockCountInput,
+) -> CmdResult<stock_movement::Model> {
+    let reason = required(&input.reason, "count reason")?;
+    if !COUNT_REASONS.contains(&reason.as_str()) {
+        return Err(CmdError::Validation(format!(
+            "'{reason}' is not a count reason — the list is closed so reports can group them"
+        )));
+    }
+    if input.counted < Decimal::ZERO {
+        return Err(CmdError::Validation("counted quantity cannot be negative".into()));
+    }
+    guard_stock_item(conn, input.item_id).await?;
+    let on_hand = on_hand_in(conn, input.item_id).await?;
+    let diff = input.counted - on_hand;
+    if diff == Decimal::ZERO {
+        return Err(CmdError::Validation("count matches the ledger — nothing to post".into()));
+    }
+    let reference = match input.note {
+        Some(note) if !note.trim().is_empty() => format!("{reason}: {}", note.trim()),
+        _ => reason,
+    };
+    append_stock_row(conn, input.item_id, MovementType::Adjustment, diff, Some(reference)).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DamageInput {
+    pub item_id: i32,
+    pub quantity: Decimal,
+    pub note: Option<String>,
+}
+
+#[tauri::command]
+pub async fn record_damage(input: DamageInput) -> CmdResult<stock_movement::Model> {
+    crate::commands_auth::require_permission(db(), "stock-stock").await?;
+    record_damage_in(db(), input).await
+}
+
+pub(crate) async fn record_damage_in<C: ConnectionTrait>(
+    conn: &C,
+    input: DamageInput,
+) -> CmdResult<stock_movement::Model> {
+    if input.quantity <= Decimal::ZERO {
+        return Err(CmdError::Validation("damage quantity must be greater than zero".into()));
+    }
+    // Damage leaves the shelf like a sale, but it is not a sale: no revenue, no
+    // customer, its own movement so reports separate shrinkage from turnover.
+    append_stock_row(conn, input.item_id, MovementType::Damage, -input.quantity, input.note).await
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutLine {

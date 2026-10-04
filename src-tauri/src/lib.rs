@@ -48,6 +48,10 @@ pub fn run() {
             commands::list_stock_movements,
             commands::stock_on_hand,
             commands::list_stock,
+            commands::record_goods_receipt,
+            commands::record_opening_stock,
+            commands::record_stock_count,
+            commands::record_damage,
             commands::checkout,
             commands::list_draft_sales,
             commands::promote_draft,
@@ -4449,5 +4453,79 @@ mod tests {
         let mut huge = item_input("huge-1");
         huge.photo = Some(format!("data:image/png;base64,{}", "A".repeat(1_000_000)));
         assert!(commands::create_item_in(&db, huge).await.is_err());
+    }
+
+    fn stock_move(item_id: i32, quantity: Decimal) -> commands::StockMoveInput {
+        commands::StockMoveInput { item_id, quantity, reference: None }
+    }
+
+    #[tokio::test]
+    async fn goods_receipt_opening_damage_and_count_move_the_ledger() {
+        let db = db::init_for_tests().await;
+        let rice = seed_item(&db, "Rice").await;
+
+        commands::record_opening_stock_in(&db, stock_move(rice, dec(100)))
+            .await
+            .expect("opening");
+        assert_eq!(commands::stock_on_hand_in(&db, rice).await.unwrap(), dec(100));
+
+        // Opening is the first word: a second one is refused, later arrivals are
+        // receipts.
+        assert!(commands::record_opening_stock_in(&db, stock_move(rice, dec(10))).await.is_err());
+        commands::record_goods_receipt_in(&db, stock_move(rice, dec(50)))
+            .await
+            .expect("receipt");
+        assert_eq!(commands::stock_on_hand_in(&db, rice).await.unwrap(), dec(150));
+
+        commands::record_damage_in(
+            &db,
+            commands::DamageInput { item_id: rice, quantity: dec(5), note: Some("torn sack".into()) },
+        )
+        .await
+        .expect("damage");
+        assert_eq!(commands::stock_on_hand_in(&db, rice).await.unwrap(), dec(145));
+
+        // The count is blind: the caller sends what it saw, the server posts the
+        // difference against the ledger it reads itself.
+        commands::record_stock_count_in(
+            &db,
+            commands::StockCountInput {
+                item_id: rice,
+                counted: dec(140),
+                reason: "Cycle count".into(),
+                note: None,
+            },
+        )
+        .await
+        .expect("count posts the -5 difference");
+        assert_eq!(commands::stock_on_hand_in(&db, rice).await.unwrap(), dec(140));
+
+        // A count that matches posts nothing, and a bad reason is refused.
+        assert!(
+            commands::record_stock_count_in(
+                &db,
+                commands::StockCountInput {
+                    item_id: rice,
+                    counted: dec(140),
+                    reason: "Cycle count".into(),
+                    note: None,
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            commands::record_stock_count_in(
+                &db,
+                commands::StockCountInput {
+                    item_id: rice,
+                    counted: dec(139),
+                    reason: "Guessed".into(),
+                    note: None,
+                },
+            )
+            .await
+            .is_err()
+        );
     }
 }
