@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
-import { SearchLg } from "@untitledui/icons";
+import { ArrowRight, SearchLg } from "@untitledui/icons";
 import { Table, TableCard } from "@/components/application/table/table";
 import { Button } from "@/components/base/buttons/button";
 import { Input } from "@/components/base/input/input";
 import { Select } from "@/components/base/select/select";
 import type { SelectItemType } from "@/components/base/select/select-shared";
+import { useNavigate } from "react-router-dom";
 import { formatMoney, formatTimestamp } from "@/app/format";
 import { listSales } from "@/app/ipc";
 import type { SaleSummary } from "@/app/ipc";
@@ -20,6 +21,7 @@ const STATUSES: SelectItemType[] = [
 const today = () => new Date().toISOString().slice(0, 10);
 
 export const Sales = () => {
+    const navigate = useNavigate();
     const [rows, setRows] = useState<SaleSummary[]>([]);
     const [total, setTotal] = useState(0);
     const [page, setPage] = useState(1);
@@ -124,6 +126,7 @@ export const Sales = () => {
                             <Table.Head label="Method" />
                             <Table.Head label="Total" />
                             <Table.Head label="Status" />
+                            <Table.Head label="" className="w-12" />
                         </Table.Header>
                         <Table.Body>
                             {rows.map((row) => (
@@ -136,6 +139,15 @@ export const Sales = () => {
                                     <Table.Cell>{row.paymentMethod}</Table.Cell>
                                     <Table.Cell className="tabular-nums">{formatMoney(row.grandTotal)}</Table.Cell>
                                     <Table.Cell className="text-tertiary">{row.status}</Table.Cell>
+                                    <Table.Cell>
+                                        <Button
+                                            size="sm"
+                                            color="tertiary"
+                                            iconLeading={ArrowRight}
+                                            aria-label={`Open ${row.invoiceNo}`}
+                                            onPress={() => navigate(`/sales/${row.id}`)}
+                                        />
+                                    </Table.Cell>
                                 </Table.Row>
                             ))}
                         </Table.Body>
