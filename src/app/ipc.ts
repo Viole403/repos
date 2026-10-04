@@ -587,6 +587,49 @@ export const promoteDraft = (saleId: number, paidTotal?: Decimal, paymentMethod?
 
 export const discardDraft = (saleId: number) => call<void>("discard_draft", { saleId });
 
+export interface MethodTotal {
+    method: string;
+    amount: Decimal;
+}
+
+export interface RegisterView {
+    id: number;
+    status: string;
+    openedAt: Timestamp;
+    closedAt: Timestamp | null;
+    openingBalance: Decimal;
+    openingDetails: MethodTotal[] | null;
+    closingBalance: Decimal | null;
+    expectedBalance: Decimal | null;
+    /** Counted minus expected. Negative means the drawer is short. */
+    variance: Decimal | null;
+    note: string | null;
+}
+
+export interface RegisterSummary {
+    salesCount: number;
+    salesTotal: Decimal;
+    collectedTotal: Decimal;
+    cashTotal: Decimal;
+    otherTotal: Decimal;
+    refundedTotal: Decimal;
+    receiptsTotal: Decimal;
+    expectedBalance: Decimal;
+    methods: MethodTotal[];
+}
+
+export const openRegister = (input: { openingBalance: Decimal; openingDetails?: MethodTotal[] | null; note?: string | null }) =>
+    call<RegisterView>("open_register", { input });
+
+export const currentRegister = () => call<RegisterView | null>("current_register");
+
+export const listRegisters = () => call<RegisterView[]>("list_registers");
+
+export const registerSummary = () => call<RegisterSummary | null>("register_summary");
+
+export const closeRegister = (input: { closingBalance: Decimal; note?: string | null }) =>
+    call<RegisterView>("close_register", { input });
+
 export const listStockMovements = (itemId: number, query: PageQuery = {}) => call<Page<StockMovement>>("list_stock_movements", { itemId, query });
 export const stockOnHand = (itemId: number) => call<Decimal>("stock_on_hand", { itemId });
 
