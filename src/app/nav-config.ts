@@ -16,8 +16,34 @@ import {
     User01,
 } from "@untitledui/icons";
 
-/** Module map of the product. `disabled` = no screen yet; hrefs are hash-prefixed. See AGENTS.md. */
-type NavEntry = NavItemType | NavItemDividerType;
+/**
+ * Module map of the product. `disabled` = no screen yet; hrefs are hash-prefixed. See
+ * AGENTS.md.
+ *
+ * `permission` hides an entry from an operator who cannot use it. Only the
+ * administrative screens declare one: the trading screens are what a cashier opens,
+ * and hiding the catalog from someone who can only sell would leave them with a
+ * register and nothing to ring up.
+ */
+interface NavEntryItem extends Omit<NavItemType, "items"> {
+    href: string;
+    permission?: string;
+}
+
+interface NavEntryGroup extends Omit<NavItemType, "items" | "href"> {
+    items: NavEntryItem[];
+}
+
+type NavEntry = NavEntryItem | NavEntryGroup | NavItemDividerType;
+
+const isDivider = (entry: NavEntry): entry is NavItemDividerType =>
+    "divider" in entry && Boolean(entry.divider);
+
+const isGroup = (entry: NavEntry): entry is NavEntryGroup =>
+    "items" in entry && Array.isArray(entry.items);
+
+const allowed = (permissions: string[], permission?: string): boolean =>
+    !permission || permissions.length === 0 || permissions.includes(permission);
 
 /** Screens that exist. Anything else in the tree is inert until built. */
 export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/settings/accounts", "/settings/roles", "/customers", "/purchase/suppliers", "/sales"]);
@@ -81,8 +107,38 @@ export const navItems: NavEntry[] = [
         label: "Settings",
         icon: Settings01,
         items: [
-            { label: "Accounts", href: "#/settings/accounts", icon: User01 },
-            { label: "Roles", href: "#/settings/roles", icon: Key01 },
+            { label: "Accounts", href: "#/settings/accounts", icon: User01, permission: "user-list" },
+            { label: "Roles", href: "#/settings/roles", icon: Key01, permission: "role-list" },
         ],
     },
 ];
+/**
+ * The nav tree with entries the operator cannot use removed. A group whose children are
+ * all hidden is dropped rather than left as a heading that goes nowhere.
+ *
+ * `permissions` empty means "unknown" — before the round trip, or if it failed — and
+ * then nothing is hidden. Showing a screen that will reject is better than hiding the
+ * app from a signed-in operator, and the backend guard is the boundary either way.
+ */
+export const visibleNavItems = (permissions: string[]): (NavItemType | NavItemDividerType)[] => {
+    // `permission` is ours, not the vendor's, so it is stripped on the way out.
+    const strip = ({ permission: _permission, ...rest }: NavEntryItem): NavItemType => rest;
+
+    return navItems
+        .map((entry) =>
+            isGroup(entry)
+                ? {
+                      ...entry,
+                      items: entry.items
+                          .filter((child) => allowed(permissions, child.permission))
+                          .map(strip),
+                  }
+                : isDivider(entry)
+                  ? entry
+                  : allowed(permissions, entry.permission)
+                    ? strip(entry)
+                    : null,
+        )
+        .filter((entry): entry is NavItemType | NavItemDividerType => entry !== null)
+        .filter((entry) => entry.items === undefined || entry.items.length > 0);
+};

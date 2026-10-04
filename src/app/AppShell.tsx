@@ -3,7 +3,7 @@ import { NavList } from "@/components/application/app-navigation/base-components
 import { AvatarLabelGroup } from "@/components/base/avatar/avatar-label-group";
 import { Button } from "@/components/base/buttons/button";
 import { LogOut01 } from "@untitledui/icons";
-import { navItems } from "./nav-config";
+import { visibleNavItems } from "./nav-config";
 import { useAuth } from "./auth";
 
 /** First letters of a name, for the avatar when no photo is set. */
@@ -21,7 +21,7 @@ const initialsOf = (name: string): string =>
  */
 export const AppShell = () => {
     const { pathname } = useLocation();
-    const { user, logout } = useAuth();
+    const { user, logout, permissions } = useAuth();
 
     return (
         <div className="flex h-dvh flex-col bg-primary lg:flex-row">
@@ -32,7 +32,7 @@ export const AppShell = () => {
 
                 <nav className="flex-1 overflow-y-auto pb-4">
                     {/* hrefs are hash-prefixed, so the active key must match that shape */}
-                    <NavList items={navItems} activeUrl={`#${pathname}`} />
+                    <NavList items={visibleNavItems(permissions)} activeUrl={`#${pathname}`} />
                 </nav>
 
                 {/* Only rendered once auth exists, and only ever from `currentUser` — see AGENTS.md. */}
