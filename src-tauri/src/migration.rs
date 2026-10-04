@@ -1195,7 +1195,7 @@ async fn installment_stock_link(manager: &SchemaManager<'_>) -> Result<(), DbErr
 /// *future* sales rather than getting cash back now.
 ///
 /// The balance math already counts `customer_receives`, so a note that can be
-/// spent must debit the same figure — it is recorded as a *negative receipt* in
+/// spent must post into the same figure — it is recorded as a receipt in
 /// the same table, with the note number as its reference. No new money table,
 /// no second source for what was paid.
 async fn credit_notes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
