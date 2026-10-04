@@ -25,7 +25,7 @@ use crate::entities::auth::users;
 use crate::entities::catalog::{brand, item, item_category, unit};
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
-use crate::entities::sales::{booking, combo_item, combo_sale, installment_sale, installment_sale_detail, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, stock_movement};
+use crate::entities::sales::{booking, combo_item, combo_sale, installment_sale, installment_sale_detail, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, servicing, stock_movement, warranty};
 use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
@@ -4869,6 +4869,478 @@ pub async fn get_installment_sale_in<C: ConnectionTrait>(
         .await?
         .ok_or_else(|| CmdError::NotFound("installment sale".into()))?;
     installment_view(conn, header).await
+}
+
+// ---------------------------------------------------------------------------
+// Warranty and servicing
+// ---------------------------------------------------------------------------
+
+/// Where a warranty ticket sits in the pipeline. Decoded from the reference:
+/// received from customer, sent to vendor, received from vendor, delivered.
+pub const WARRANTY_STATUSES: &[&str] = &["R_F_C", "S_T_V", "R_T_V", "D_T_C"];
+
+/// Where a paid repair job sits. Closed here; the reference leaves it free text,
+/// which splits one state across spellings in every report.
+pub const SERVICING_STATUSES: &[&str] = &["Received", "InRepair", "Ready", "Delivered"];
+
+/// Midnight at the start of `YYYY-MM-DD`. Repair dates are days, not moments.
+fn parse_service_day(raw: Option<&str>, field: &str) -> CmdResult<Option<NaiveDateTime>> {
+    match raw.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(None),
+        Some(text) => {
+            match chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+            {
+                Some(at) => Ok(Some(at)),
+                None => Err(CmdError::Validation(format!("{field} is not a date"))),
+            }
+        }
+    }
+}
+
+/// The receiving date is always present — a ticket without one never happened.
+fn require_service_day(raw: &str, field: &str) -> CmdResult<NaiveDateTime> {
+    parse_service_day(Some(raw), field)?.ok_or_else(|| CmdError::Validation(format!("{field} is required")))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarrantyInput {
+    pub customer_id: i32,
+    pub product_name: String,
+    #[serde(default)]
+    pub product_serial_no: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `YYYY-MM-DD`.
+    pub receiving_date: String,
+    /// `YYYY-MM-DD`, at or after the receiving date.
+    #[serde(default)]
+    pub delivery_date: Option<String>,
+    #[serde(default)]
+    pub technician_id: Option<i32>,
+    #[serde(default)]
+    pub present_location: Option<String>,
+    #[serde(default)]
+    pub sender_service_center: Option<String>,
+    #[serde(default)]
+    pub receiver_service_center: Option<String>,
+}
+
+fn resolve_warranty_status(raw: Option<&str>) -> CmdResult<String> {
+    match raw.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok("R_F_C".to_owned()),
+        Some(status) if WARRANTY_STATUSES.contains(&status) => Ok(status.to_owned()),
+        Some(status) => Err(CmdError::Validation(format!("{status} is not a warranty status"))),
+    }
+}
+
+async fn guard_ticket_party<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: i32,
+    technician_id: Option<i32>,
+) -> CmdResult<()> {
+    customer::Entity::find_by_id(customer_id)
+        .filter(customer::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("customer".into()))?;
+    if let Some(technician_id) = technician_id {
+        users::Entity::find_by_id(technician_id)
+            .one(conn)
+            .await?
+            .ok_or_else(|| CmdError::NotFound("technician".into()))?;
+    }
+    Ok(())
+}
+
+/// A warranty row with the customer named, so the list shows no ids.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarrantySummary {
+    pub id: i32,
+    pub customer_name: Option<String>,
+    pub product_name: String,
+    pub product_serial_no: Option<String>,
+    pub receiving_date: NaiveDateTime,
+    pub delivery_date: Option<NaiveDateTime>,
+    pub current_status: String,
+    pub created_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarrantyView {
+    pub warranty: warranty::Model,
+    pub customer_name: Option<String>,
+}
+
+fn warranty_summary(
+    row: warranty::Model,
+    names: &std::collections::HashMap<i32, String>,
+) -> WarrantySummary {
+    WarrantySummary {
+        id: row.id,
+        customer_name: names.get(&row.customer_id).cloned(),
+        product_name: row.product_name,
+        product_serial_no: row.product_serial_no,
+        receiving_date: row.receiving_date,
+        delivery_date: row.delivery_date,
+        current_status: row.current_status,
+        created_at: row.created_at,
+    }
+}
+
+async fn ticket_customer_names<C: ConnectionTrait>(
+    conn: &C,
+    ids: &[i32],
+) -> CmdResult<std::collections::HashMap<i32, String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    Ok(customer::Entity::find()
+        .filter(customer::Column::Id.is_in(ids.to_vec()))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|c| (c.id, c.name))
+        .collect())
+}
+
+#[tauri::command]
+pub async fn create_warranty(input: WarrantyInput) -> CmdResult<WarrantyView> {
+    crate::commands_auth::require_permission(db(), "warranty-create").await?;
+    let Some(user_id) = crate::auth::current_user_id() else {
+        return Err(CmdError::Forbidden("you are not signed in".into()));
+    };
+    create_warranty_in(db(), user_id, input).await
+}
+
+pub(crate) async fn create_warranty_in<C: ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+    input: WarrantyInput,
+) -> CmdResult<WarrantyView> {
+    let product_name = required(&input.product_name, "product name")?;
+    let receiving_date = require_service_day(&input.receiving_date, "receiving date")?;
+    let delivery_date = parse_service_day(input.delivery_date.as_deref(), "delivery date")?;
+    if delivery_date.is_some_and(|d| d < receiving_date) {
+        return Err(CmdError::Validation("delivery cannot be before receiving".into()));
+    }
+    guard_ticket_party(conn, input.customer_id, input.technician_id).await?;
+
+    let now = crate::migration::now();
+    let row = warranty::ActiveModel {
+        customer_id: Set(input.customer_id),
+        product_name: Set(product_name),
+        product_serial_no: Set(blank_to_none(input.product_serial_no)),
+        description: Set(blank_to_none(input.description)),
+        receiving_date: Set(receiving_date),
+        delivery_date: Set(delivery_date),
+        current_status: Set(resolve_warranty_status(None)?),
+        technician_id: Set(input.technician_id),
+        present_location: Set(blank_to_none(input.present_location)),
+        sender_service_center: Set(blank_to_none(input.sender_service_center)),
+        receiver_service_center: Set(blank_to_none(input.receiver_service_center)),
+        created_by: Set(Some(user_id)),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+    get_warranty_in(conn, row.id).await
+}
+
+/// Empty boxes arrive as `""`, and the column wants NULL, not a blank string.
+fn blank_to_none(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
+#[tauri::command]
+pub async fn set_warranty_status(id: i32, status: String) -> CmdResult<WarrantyView> {
+    crate::commands_auth::require_permission(db(), "warranty-status").await?;
+    set_warranty_status_in(db(), id, &status).await
+}
+
+pub(crate) async fn set_warranty_status_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+    status: &str,
+) -> CmdResult<WarrantyView> {
+    // Any of the four, in any order: a shop may hand a unit straight back without
+    // involving a vendor, so enforcing the pipeline order would refuse real work.
+    let status = resolve_warranty_status(Some(status))?;
+    let ticket = warranty::Entity::find_by_id(id)
+        .filter(warranty::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("warranty".into()))?;
+    let mut am: warranty::ActiveModel = ticket.into();
+    am.current_status = Set(status);
+    am.updated_at = Set(crate::migration::now());
+    am.update(conn).await?;
+    get_warranty_in(conn, id).await
+}
+
+#[tauri::command]
+pub async fn list_warranties(
+    customer_id: Option<i32>,
+    query: PageQuery,
+) -> CmdResult<Page<WarrantySummary>> {
+    crate::commands_auth::require_permission(db(), "warranty-list").await?;
+    list_warranties_in(db(), customer_id, &query).await
+}
+
+pub async fn list_warranties_in<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: Option<i32>,
+    query: &PageQuery,
+) -> CmdResult<Page<WarrantySummary>> {
+    let mut q = warranty::Entity::find().filter(warranty::Column::DelStatus.eq(LIVE));
+    if let Some(customer_id) = customer_id {
+        q = q.filter(warranty::Column::CustomerId.eq(customer_id));
+    }
+
+    let total = q.clone().count(conn).await?;
+    let rows = q
+        .order_by_desc(warranty::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+
+    let ids: Vec<i32> = rows.iter().map(|r| r.customer_id).collect();
+    let names = ticket_customer_names(conn, &ids).await?;
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        views.push(warranty_summary(row, &names));
+    }
+    Ok(Page::new(views, total, query))
+}
+
+#[tauri::command]
+pub async fn get_warranty(id: i32) -> CmdResult<WarrantyView> {
+    crate::commands_auth::require_permission(db(), "warranty-show").await?;
+    get_warranty_in(db(), id).await
+}
+
+pub async fn get_warranty_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResult<WarrantyView> {
+    let row = warranty::Entity::find_by_id(id)
+        .filter(warranty::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("warranty".into()))?;
+    let customer_name = customer::Entity::find_by_id(row.customer_id)
+        .one(conn)
+        .await?
+        .map(|c| c.name);
+    Ok(WarrantyView { warranty: row, customer_name })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServicingInput {
+    pub customer_id: i32,
+    pub product_name: String,
+    #[serde(default)]
+    pub product_model: Option<String>,
+    #[serde(default)]
+    pub problem_description: Option<String>,
+    /// `YYYY-MM-DD`.
+    pub receiving_date: String,
+    /// `YYYY-MM-DD`, at or after the receiving date.
+    #[serde(default)]
+    pub delivery_date: Option<String>,
+    pub servicing_charge: Decimal,
+    #[serde(default)]
+    pub technician_id: Option<i32>,
+}
+
+fn resolve_servicing_status(raw: Option<&str>) -> CmdResult<String> {
+    match raw.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok("Received".to_owned()),
+        Some(status) if SERVICING_STATUSES.contains(&status) => Ok(status.to_owned()),
+        Some(status) => Err(CmdError::Validation(format!("{status} is not a servicing status"))),
+    }
+}
+
+/// A servicing row with the customer named and the due derived.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServicingSummary {
+    pub id: i32,
+    pub customer_name: Option<String>,
+    pub product_name: String,
+    pub servicing_charge: Decimal,
+    pub paid_amount: Decimal,
+    /// `charge - paid`, floored at zero. Derived, never stored.
+    pub due_amount: Decimal,
+    pub current_status: String,
+    pub created_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServicingView {
+    pub servicing: servicing::Model,
+    pub customer_name: Option<String>,
+    pub due_amount: Decimal,
+}
+
+fn servicing_due(row: &servicing::Model) -> Decimal {
+    (row.servicing_charge - row.paid_amount).max(Decimal::ZERO)
+}
+
+#[tauri::command]
+pub async fn create_servicing(input: ServicingInput) -> CmdResult<ServicingView> {
+    crate::commands_auth::require_permission(db(), "servicing-create").await?;
+    let Some(user_id) = crate::auth::current_user_id() else {
+        return Err(CmdError::Forbidden("you are not signed in".into()));
+    };
+    create_servicing_in(db(), user_id, input).await
+}
+
+pub(crate) async fn create_servicing_in<C: ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+    input: ServicingInput,
+) -> CmdResult<ServicingView> {
+    let product_name = required(&input.product_name, "product name")?;
+    let receiving_date = require_service_day(&input.receiving_date, "receiving date")?;
+    let delivery_date = parse_service_day(input.delivery_date.as_deref(), "delivery date")?;
+    if delivery_date.is_some_and(|d| d < receiving_date) {
+        return Err(CmdError::Validation("delivery cannot be before receiving".into()));
+    }
+    if input.servicing_charge < Decimal::ZERO {
+        return Err(CmdError::Validation("charge cannot be negative".into()));
+    }
+    guard_ticket_party(conn, input.customer_id, input.technician_id).await?;
+
+    let now = crate::migration::now();
+    let row = servicing::ActiveModel {
+        customer_id: Set(input.customer_id),
+        product_name: Set(product_name),
+        product_model: Set(blank_to_none(input.product_model)),
+        problem_description: Set(blank_to_none(input.problem_description)),
+        receiving_date: Set(receiving_date),
+        delivery_date: Set(delivery_date),
+        servicing_charge: Set(input.servicing_charge),
+        paid_amount: Set(Decimal::ZERO),
+        current_status: Set(resolve_servicing_status(None)?),
+        technician_id: Set(input.technician_id),
+        created_by: Set(Some(user_id)),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+    get_servicing_in(conn, row.id).await
+}
+
+#[tauri::command]
+pub async fn collect_servicing_payment(id: i32, amount: Decimal) -> CmdResult<ServicingView> {
+    crate::commands_auth::require_permission(db(), "servicing-collect").await?;
+    collect_servicing_payment_in(db(), id, amount).await
+}
+
+pub(crate) async fn collect_servicing_payment_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+    amount: Decimal,
+) -> CmdResult<ServicingView> {
+    if amount <= Decimal::ZERO {
+        return Err(CmdError::Validation("payment must be greater than zero".into()));
+    }
+    let job = servicing::Entity::find_by_id(id)
+        .filter(servicing::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("servicing".into()))?;
+    let outstanding = servicing_due(&job);
+    if amount > outstanding {
+        return Err(CmdError::Validation(format!(
+            "that job has {outstanding} outstanding, not {amount}"
+        )));
+    }
+    let paid = job.paid_amount + amount;
+    let mut am: servicing::ActiveModel = job.into();
+    am.paid_amount = Set(paid);
+    am.updated_at = Set(crate::migration::now());
+    am.update(conn).await?;
+    get_servicing_in(conn, id).await
+}
+
+#[tauri::command]
+pub async fn list_servicings(
+    customer_id: Option<i32>,
+    query: PageQuery,
+) -> CmdResult<Page<ServicingSummary>> {
+    crate::commands_auth::require_permission(db(), "servicing-list").await?;
+    list_servicings_in(db(), customer_id, &query).await
+}
+
+pub async fn list_servicings_in<C: ConnectionTrait>(
+    conn: &C,
+    customer_id: Option<i32>,
+    query: &PageQuery,
+) -> CmdResult<Page<ServicingSummary>> {
+    let mut q = servicing::Entity::find().filter(servicing::Column::DelStatus.eq(LIVE));
+    if let Some(customer_id) = customer_id {
+        q = q.filter(servicing::Column::CustomerId.eq(customer_id));
+    }
+
+    let total = q.clone().count(conn).await?;
+    let rows = q
+        .order_by_desc(servicing::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+
+    let ids: Vec<i32> = rows.iter().map(|r| r.customer_id).collect();
+    let names = ticket_customer_names(conn, &ids).await?;
+    let views = rows
+        .into_iter()
+        .map(|row| {
+            let due_amount = servicing_due(&row);
+            ServicingSummary {
+                id: row.id,
+                customer_name: names.get(&row.customer_id).cloned(),
+                product_name: row.product_name,
+                servicing_charge: row.servicing_charge,
+                paid_amount: row.paid_amount,
+                due_amount,
+                current_status: row.current_status,
+                created_at: row.created_at,
+            }
+        })
+        .collect();
+    Ok(Page::new(views, total, query))
+}
+
+#[tauri::command]
+pub async fn get_servicing(id: i32) -> CmdResult<ServicingView> {
+    crate::commands_auth::require_permission(db(), "servicing-show").await?;
+    get_servicing_in(db(), id).await
+}
+
+pub async fn get_servicing_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResult<ServicingView> {
+    let row = servicing::Entity::find_by_id(id)
+        .filter(servicing::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("servicing".into()))?;
+    let due = servicing_due(&row);
+    let customer_name = customer::Entity::find_by_id(row.customer_id)
+        .one(conn)
+        .await?
+        .map(|c| c.name);
+    Ok(ServicingView { servicing: row, customer_name, due_amount: due })
 }
 
 // ---------------------------------------------------------------------------

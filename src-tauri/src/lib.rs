@@ -92,6 +92,14 @@ pub fn run() {
             commands::collect_installment_payment,
             commands::list_installments,
             commands::get_installment_sale,
+            commands::create_warranty,
+            commands::set_warranty_status,
+            commands::list_warranties,
+            commands::get_warranty,
+            commands::create_servicing,
+            commands::collect_servicing_payment,
+            commands::list_servicings,
+            commands::get_servicing,
             commands::list_customers,
             commands::create_customer,
             commands::update_customer,
@@ -1945,6 +1953,122 @@ mod tests {
         assert_eq!(view.status, "Completed");
         assert_eq!(view.due_total, Decimal::ZERO);
         assert_eq!(view.paid_total, view.sale.total);
+    }
+
+    fn warranty_input(customer_id: i32) -> commands::WarrantyInput {
+        commands::WarrantyInput {
+            customer_id,
+            product_name: "AC 1PK".into(),
+            product_serial_no: Some("SN-001".into()),
+            description: Some("not cooling".into()),
+            receiving_date: "2026-10-01".into(),
+            delivery_date: None,
+            technician_id: None,
+            present_location: None,
+            sender_service_center: None,
+            receiver_service_center: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_warranty_ticket_opens_at_receive_from_customer() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Fani", Decimal::ZERO).await;
+
+        let view = commands::create_warranty_in(&db, 1, warranty_input(customer))
+            .await
+            .expect("warranty opened");
+
+        assert_eq!(view.warranty.current_status, "R_F_C");
+        assert_eq!(view.customer_name.as_deref(), Some("Fani"));
+        assert_eq!(
+            view.warranty.receiving_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap().and_hms_opt(0, 0, 0).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_warranty_ticket_moves_through_the_pipeline() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Gilang", Decimal::ZERO).await;
+        let view = commands::create_warranty_in(&db, 1, warranty_input(customer))
+            .await
+            .expect("warranty opened");
+
+        for status in ["S_T_V", "R_T_V", "D_T_C"] {
+            let view = commands::set_warranty_status_in(&db, view.warranty.id, status)
+                .await
+                .expect("status advances");
+            assert_eq!(view.warranty.current_status, status);
+        }
+
+        let err = commands::set_warranty_status_in(&db, view.warranty.id, "Fixed")
+            .await
+            .expect_err("free text is not a status");
+        assert!(format!("{err}").contains("is not a warranty status"));
+    }
+
+    #[tokio::test]
+    async fn a_warranty_delivery_before_receiving_is_refused() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Hana", Decimal::ZERO).await;
+        let mut input = warranty_input(customer);
+        input.delivery_date = Some("2026-09-30".into());
+
+        let err = commands::create_warranty_in(&db, 1, input)
+            .await
+            .expect_err("delivery before receiving");
+        assert!(format!("{err}").contains("delivery cannot be before receiving"));
+    }
+
+    fn servicing_input(customer_id: i32) -> commands::ServicingInput {
+        commands::ServicingInput {
+            customer_id,
+            product_name: "TV 32in".into(),
+            product_model: Some("X32".into()),
+            problem_description: Some("no picture".into()),
+            receiving_date: "2026-10-01".into(),
+            delivery_date: None,
+            servicing_charge: Decimal::new(50_000_000, 3),
+            technician_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_servicing_job_derives_its_due() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Iwan", Decimal::ZERO).await;
+
+        let view = commands::create_servicing_in(&db, 1, servicing_input(customer))
+            .await
+            .expect("servicing opened");
+        assert_eq!(view.servicing.current_status, "Received");
+        assert_eq!(view.due_amount, Decimal::new(50_000_000, 3));
+
+        let view = commands::collect_servicing_payment_in(&db, view.servicing.id, Decimal::new(20_000_000, 3))
+            .await
+            .expect("partial collection");
+        assert_eq!(view.servicing.paid_amount, Decimal::new(20_000_000, 3));
+        assert_eq!(view.due_amount, Decimal::new(30_000_000, 3));
+
+        let view = commands::collect_servicing_payment_in(&db, view.servicing.id, Decimal::new(30_000_000, 3))
+            .await
+            .expect("rest collected");
+        assert_eq!(view.due_amount, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn collecting_more_than_a_servicing_job_holds_is_refused() {
+        let db = db::init_for_tests().await;
+        let customer = seed_customer(&db, "Joko", Decimal::ZERO).await;
+        let view = commands::create_servicing_in(&db, 1, servicing_input(customer))
+            .await
+            .expect("servicing opened");
+
+        let err = commands::collect_servicing_payment_in(&db, view.servicing.id, Decimal::new(60_000_000, 3))
+            .await
+            .expect_err("overpayment refused");
+        assert!(format!("{err}").contains("outstanding"));
     }
 
     #[tokio::test]
