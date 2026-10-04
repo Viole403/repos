@@ -985,6 +985,47 @@ export const reloadGiftCard = (cardNo: string, amount: Decimal, paymentMethod: s
 export const listGiftCards = (query: PageQuery = {}) => call<Page<GiftCardSummary>>("list_gift_cards", { query });
 export const getGiftCard = (cardNo: string) => call<GiftCardView>("get_gift_card", { cardNo });
 
+/** Store credit against a customer. Spending posts as a receipt, so the customer
+ *  balance moves with it — no second money table. */
+export interface CreditNoteSummary {
+    id: number;
+    creditNo: string;
+    customerId: number;
+    customerName: string | null;
+    amount: Decimal;
+    appliedTotal: Decimal;
+    remaining: Decimal;
+    createdAt: string;
+}
+
+export interface CreditNoteView {
+    note: {
+        id: number;
+        creditNo: string;
+        customerId: number;
+        saleReturnId: number | null;
+        amount: Decimal;
+        appliedTotal: Decimal;
+        note: string | null;
+        createdAt: string;
+    };
+    customerName: string | null;
+    remaining: Decimal;
+}
+
+export const issueCreditNote = (customerId: number, amount: Decimal, saleReturnId?: number | null, note?: string | null) =>
+    call<CreditNoteView>("issue_credit_note", {
+        customerId,
+        amount,
+        saleReturnId: saleReturnId ?? null,
+        note: note ?? null,
+    });
+export const applyCreditNote = (id: number, amount: Decimal) =>
+    call<CreditNoteView>("apply_credit_note", { id, amount });
+export const listCreditNotes = (customerId: number | null = null, query: PageQuery = {}) =>
+    call<Page<CreditNoteSummary>>("list_credit_notes", { customerId, query });
+export const getCreditNote = (id: number) => call<CreditNoteView>("get_credit_note", { id });
+
 export interface ServiceRating {
     id: number;
     saleId: number | null;
