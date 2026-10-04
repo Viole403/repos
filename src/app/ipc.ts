@@ -203,6 +203,8 @@ export interface SaleView {
     stockOnHand: ItemOnHand[];
     /** One per tender. Empty for a single-method sale recorded the pre-split way. */
     payments: SalePayment[];
+    /** Points this sale earned. Zero for walk-ins and drafts. */
+    loyaltyEarned: number;
 }
 
 export interface CheckoutLine {
@@ -982,6 +984,17 @@ export const reloadGiftCard = (cardNo: string, amount: Decimal, paymentMethod: s
     call<GiftCardView>("reload_gift_card", { cardNo, amount, paymentMethod });
 export const listGiftCards = (query: PageQuery = {}) => call<Page<GiftCardSummary>>("list_gift_cards", { query });
 export const getGiftCard = (cardNo: string) => call<GiftCardView>("get_gift_card", { cardNo });
+
+export interface ServiceRating {
+    id: number;
+    saleId: number | null;
+    rating: string;
+    createdAt: string;
+}
+
+export const submitRating = (saleId: number | null, rating: "Like" | "Dislike") =>
+    call<ServiceRating>("submit_rating", { saleId, rating });
+export const openCustomerDisplay = () => call<void>("open_customer_display", {});
 
 export const discardDraft = (saleId: number) => call<void>("discard_draft", { saleId });
 

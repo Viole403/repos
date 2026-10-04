@@ -26,6 +26,7 @@ import { Installments } from "./screens/Installments";
 import { Warranties } from "./screens/Warranties";
 import { Servicings } from "./screens/Servicings";
 import { GiftCards } from "./screens/GiftCards";
+import { Display } from "./screens/Display";
 import { Combos } from "./screens/Combos";
 import { Units } from "./screens/Units";
 import { enabledRoutes, navItems } from "./nav-config";
@@ -118,6 +119,12 @@ export const routes: RouteObject[] = [
     // Not in `navItems`: the login screen is full-screen by design, so a sidebar
     // entry for it would be a link that leaves the sidebar.
     { path: LOGIN_PATH, element: <OnlyAnonymous /> },
+    // The customer mirror: no sidebar, no nav entry — it is opened from the
+    // register onto a second monitor, never navigated to by the operator.
+    {
+        element: <RequireAuth />,
+        children: [{ path: "/display", element: <Display /> }],
+    },
     {
         element: <RequireAuth />,
         children: [

@@ -13,7 +13,12 @@ import type { CartLine } from "@/app/cart";
 import { decAdd, decCompare, decIsPositive, decStep, decSub } from "@/app/decimal";
 import { formatMoney, formatQuantity, toDecimal } from "@/app/format";
 import type { CheckoutInput, Decimal, PaymentLine, SaleView } from "@/app/ipc";
-import { checkout, listCustomers, listItems, stockOnHand } from "@/app/ipc";
+import { checkout, listCustomers, listItems, openCustomerDisplay, stockOnHand } from "@/app/ipc";
+import {
+    emitDisplay,
+    loadTouch,
+    saveTouch,
+} from "@/app/display-channel";
 
 interface Tender {
     method: string;
@@ -107,6 +112,10 @@ const RegisterScreen = () => {
     // "" is a walk-in, which is what most of a counter's sales are.
     const [customerKey, setCustomerKey] = useState("");
     const [customers, setCustomers] = useState<SelectItemType[]>([]);
+    // Whether the mirror offers rating taps. Per till, persisted locally until
+    // the settings table lands — a non-touch pole display must never show dead
+    // buttons, and not every lane has a touchscreen.
+    const [touch, setTouch] = useState(loadTouch);
 
     // Searched rather than listed: the till needs a handful of regulars, not every
     // customer in the database, and the list is fetched on focus.
@@ -262,6 +271,66 @@ const RegisterScreen = () => {
     const tenderSum = tenderLines().reduce((total, t) => decAdd(total, t.amount), "0");
     // Same rule the server applies, so the cashier sees it before the sale is refused.
     const splitOver = split && decCompare(tenderSum, grandTotal) > 0;
+
+    // Pushes till state to the customer mirror on every change. The mirror never
+    // pulls, so it cannot show a stale basket — and a closed or missing window
+    // costs nothing, because the emit is fire-and-forget.
+    useEffect(() => {
+        if (sale.kind === "done") {
+            const paid = sale.view.sale.paidTotal;
+            emitDisplay({
+                state: "done",
+                lines: [],
+                subtotal: sale.view.sale.subtotal,
+                discountTotal: sale.view.sale.discountTotal,
+                taxTotal: sale.view.sale.taxTotal,
+                grandTotal: sale.view.sale.grandTotal,
+                savedTotal: sale.view.sale.discountTotal,
+                paymentMethod: sale.view.sale.paymentMethod,
+                paidTotal: paid,
+                changeDue: decSub(paid, sale.view.sale.grandTotal),
+                saleId: sale.view.sale.id,
+                loyaltyEarned: sale.view.loyaltyEarned,
+                touch,
+            });
+        } else if (lines.length > 0) {
+            emitDisplay({
+                state: "cart",
+                lines: lines.map((line) => ({
+                    name: line.name,
+                    quantity: line.quantity,
+                    total: cartLineTotal(line),
+                })),
+                subtotal,
+                discountTotal,
+                taxTotal,
+                grandTotal,
+                savedTotal: discountTotal,
+                paymentMethod: null,
+                paidTotal: null,
+                changeDue: null,
+                saleId: null,
+                loyaltyEarned: 0,
+                touch,
+            });
+        } else {
+            emitDisplay({
+                state: "idle",
+                lines: [],
+                subtotal: "0",
+                discountTotal: "0",
+                taxTotal: "0",
+                grandTotal: "0",
+                savedTotal: "0",
+                paymentMethod: null,
+                paidTotal: null,
+                changeDue: null,
+                saleId: null,
+                loyaltyEarned: 0,
+                touch,
+            });
+        }
+    }, [lines, subtotal, discountTotal, taxTotal, grandTotal, sale, touch]);
 
     const submitSale = useCallback(async () => {
         if (!canCheckout || paidInvalid || splitOver || sale.kind === "saving") return;
@@ -741,6 +810,32 @@ const RegisterScreen = () => {
                     <Button color="secondary" size="sm" className="w-fit" onPress={() => setSplit(!split)}>
                         {split ? "Use one payment" : "Split across methods"}
                     </Button>
+
+                    <div className="flex items-center gap-2">
+                        <Button
+                            color="secondary"
+                            size="sm"
+                            className="w-fit"
+                            onPress={() => void openCustomerDisplay().catch(() => {})}
+                        >
+                            Customer display
+                        </Button>
+                        {/* Touch stays off unless the lane actually has a touchscreen:
+                            rating buttons on a non-touch pole display are dead UI. */}
+                        <Button
+                            color="secondary"
+                            size="sm"
+                            className="w-fit"
+                            aria-pressed={touch}
+                            onPress={() => {
+                                const next = !touch;
+                                setTouch(next);
+                                saveTouch(next);
+                            }}
+                        >
+                            {touch ? "Touch: on" : "Touch: off"}
+                        </Button>
+                    </div>
 
                     {!split && paidDigits !== "" && !paidInvalid && (
                         <p className="text-sm text-tertiary">
