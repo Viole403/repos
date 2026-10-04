@@ -22,6 +22,8 @@ use std::time::Duration;
 
 use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbErr};
+#[cfg(test)]
+use sea_orm::{DbBackend, Statement};
 use sea_orm_migration::MigratorTrait;
 use tokio::sync::OnceCell;
 
@@ -177,26 +179,147 @@ pub fn db() -> &'static DatabaseConnection {
     DB.get().expect("database not initialized; init() must run during setup")
 }
 
-/// In-memory database with migrations applied. Test-only helper.
+/// A fresh, isolated, migrated database for one test. Test-only helper.
 ///
-/// Each call gets a fresh isolated database, so tests don't share state or race
-/// on the migration table. This is the fast inner loop; use [`connect_to`] when a
-/// test must exercise a server-backed backend too.
+/// Every test calls this, and the backend is chosen by `REPOS_TEST_BACKEND`
+/// (`sqlite` by default, `postgres`, or `mysql`). That is the whole reason the
+/// suite can claim all three backends: the 180-odd call sites are unchanged, so
+/// running `REPOS_TEST_BACKEND=postgres cargo test` executes *the same business
+/// logic* against Postgres rather than a schema-only smoke test.
+///
+/// Isolation differs per backend because the cheap option differs:
+///
+/// - **SQLite** — `sqlite::memory:`, a private database per call for free.
+/// - **Postgres** — a uniquely named **schema** with `search_path` pointed at it.
+///   A schema is a namespace, so the 29 migrations land inside it and nothing
+///   leaks between tests without creating or dropping a database.
+/// - **MySQL** — a uniquely named **database**, because MySQL has no nested
+///   namespace; a "schema" there *is* a database.
+///
+/// Server-backed leftovers are swept at the start of each run, so an interrupted
+/// run cannot poison the next one. Tests run in parallel by default, which is why
+/// the name is unique rather than a single shared scratch schema.
 #[cfg(test)]
 pub async fn init_for_tests() -> DatabaseConnection {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("sqlx=info"))
         .with_test_writer()
         .try_init();
-    let mut o = connect_options("sqlite::memory:");
-    o.sqlx_logging(true);
-    o.sqlx_logging_level(log::LevelFilter::Info);
-    let conn = Database::connect(o)
+
+    match std::env::var("REPOS_TEST_BACKEND").as_deref() {
+        Ok("postgres") | Ok("postgresql") => isolated_postgres().await,
+        Ok("mysql") | Ok("mariadb") => isolated_mysql().await,
+        Ok("sqlite") | Err(_) => {
+            let mut o = connect_options("sqlite::memory:");
+            o.sqlx_logging(true);
+            o.sqlx_logging_level(log::LevelFilter::Info);
+            let conn = Database::connect(o).await.expect("connect in-memory sqlite");
+            Migrator::up(&conn, None).await.expect("apply migrations");
+            conn
+        }
+        Ok(other) => panic!("REPOS_TEST_BACKEND must be sqlite, postgres, or mysql — got {other:?}"),
+    }
+}
+
+/// A per-run counter making each test's schema or database name unique.
+#[cfg(test)]
+fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "t{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Drops scratch schemas left behind by an interrupted run.
+///
+/// Run **once per process**, before any test creates its own schema. Sweeping per
+/// test instead lets one thread drop a sibling's live schema, which surfaces as
+/// `no schema has been selected to create in` — the sibling's `search_path` still
+/// names a schema that no longer exists.
+#[cfg(test)]
+async fn sweep_postgres_schemas(admin: &DatabaseConnection) -> () {
+    let rows = admin
+        .query_all_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'repos\\_test\\_%'",
+        ))
         .await
-        .expect("connect in-memory sqlite");
-    Migrator::up(&conn, None)
+        .expect("list scratch schemas");
+    for row in rows {
+        let name: String = row.try_get("", "nspname").expect("schema name");
+        let _ = admin
+            .execute_unprepared(&format!("DROP SCHEMA IF EXISTS \"{name}\" CASCADE"))
+            .await;
+    }
+}
+
+/// Drops scratch databases left behind by an interrupted run. Once per process,
+/// for the same reason as the Postgres sweep above.
+#[cfg(test)]
+async fn sweep_mysql_databases(admin: &DatabaseConnection) -> () {
+    let rows = admin
+        .query_all_raw(Statement::from_string(
+            DbBackend::MySql,
+            "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'repos\\_test\\_%'",
+        ))
         .await
-        .expect("apply migrations");
+        .expect("list scratch databases");
+    for row in rows {
+        let name: String = row.try_get("", "schema_name").expect("database name");
+        let _ = admin
+            .execute_unprepared(&format!("DROP DATABASE IF EXISTS `{name}`"))
+            .await;
+    }
+}
+
+#[cfg(test)]
+async fn isolated_postgres() -> DatabaseConnection {
+    let base = std::env::var("REPOS_TEST_POSTGRES_URL")
+        .expect("REPOS_TEST_BACKEND=postgres needs REPOS_TEST_POSTGRES_URL");
+    let admin = Database::connect(connect_options(&base)).await.expect("postgres admin");
+
+    static SWEEP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    SWEEP
+        .get_or_init(|| sweep_postgres_schemas(&admin))
+        .await;
+
+    let schema = format!("repos_test_{}", unique_suffix());
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .expect("create scratch schema");
+
+    let mut o = connect_options(&base);
+    o.set_schema_search_path(schema);
+    let conn = Database::connect(o).await.expect("connect postgres scratch schema");
+    Migrator::up(&conn, None).await.expect("apply migrations on postgres");
+    conn
+}
+
+#[cfg(test)]
+async fn isolated_mysql() -> DatabaseConnection {
+    let base = std::env::var("REPOS_TEST_MYSQL_URL")
+        .expect("REPOS_TEST_BACKEND=mysql needs REPOS_TEST_MYSQL_URL");
+    let admin = Database::connect(connect_options(&base)).await.expect("mysql admin");
+
+    static SWEEP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    SWEEP
+        .get_or_init(|| sweep_mysql_databases(&admin))
+        .await;
+
+    let name = format!("repos_test_{}", unique_suffix());
+    admin
+        .execute_unprepared(&format!("CREATE DATABASE `{name}`"))
+        .await
+        .expect("create scratch database");
+
+    let conn = Database::connect(connect_options(&url_with_database(&base, &name)))
+        .await
+        .expect("connect mysql scratch database");
+    Migrator::up(&conn, None).await.expect("apply migrations on mysql");
     conn
 }
 
