@@ -1237,9 +1237,12 @@ async fn warranty_and_servicing(manager: &SchemaManager<'_>) -> Result<(), DbErr
         if exists.is_some() {
             continue;
         }
+        // The catalog test requires `group_name` to be the name's prefix, which
+        // is what the settings UI groups on.
+        let group = name.split_once('-').map(|(g, _)| g).unwrap_or("service");
         permissions::ActiveModel {
             name: Set((*name).to_owned()),
-            group_name: Set("service".to_owned()),
+            group_name: Set(group.to_owned()),
             guard_name: Set("web".to_owned()),
             del_status: Set(DEL_LIVE.to_owned()),
             created_at: Set(now),
