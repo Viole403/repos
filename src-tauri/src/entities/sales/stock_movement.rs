@@ -63,6 +63,8 @@ pub enum MovementType {
     OpeningBalance,
     /// Stock left because it was handed over on a credit sale.
     InstallmentSale,
+    /// Stock left because it was damaged, spoiled, or written off.
+    Damage,
 }
 
 impl MovementType {
@@ -79,6 +81,7 @@ impl MovementType {
             MovementType::TransferIn => "TransferIn",
             MovementType::OpeningBalance => "OpeningBalance",
             MovementType::InstallmentSale => "InstallmentSale",
+            MovementType::Damage => "Damage",
         }
     }
 }
