@@ -744,6 +744,91 @@ export const listDraftSales = () => call<DraftSale[]>("list_draft_sales");
 export const promoteDraft = (saleId: number, paidTotal?: Decimal, paymentMethod?: string) =>
     call<SaleView>("promote_draft", { saleId, paidTotal: paidTotal ?? null, paymentMethod: paymentMethod ?? null });
 
+/** A credit sale: one item handed over now, the balance split into dated dues. */
+export interface CreateInstallmentInput {
+    customerId: number;
+    itemId: number;
+    quantity: Decimal;
+    unitPrice: Decimal;
+    /** Fixed amount off. Omit for none. */
+    discountAmount?: Decimal | null;
+    /** Percent on the discounted price. Omit for none. */
+    interestPercent?: Decimal | null;
+    otherCharges?: Decimal | null;
+    downPayment?: Decimal | null;
+    downPaymentMethod?: string | null;
+    numberOfInstallments: number;
+    /** Days between dues. Omit for 30. */
+    intervalDays?: number | null;
+    note?: string | null;
+}
+
+export interface InstallmentDetailView {
+    id: number;
+    dueDate: string;
+    amount: Decimal;
+    paidAmount: Decimal;
+    remainingAmount: Decimal;
+    /** `Unpaid` | `Partial` | `Paid`, derived server-side. */
+    paidStatus: string;
+    paidDate: string | null;
+    paymentMethod: string | null;
+}
+
+export interface InstallmentSaleView {
+    sale: {
+        id: number;
+        referenceNo: string;
+        customerId: number;
+        itemId: number;
+        quantity: Decimal;
+        unitPrice: Decimal;
+        discountAmount: Decimal;
+        interestPercent: Decimal;
+        interestAmount: Decimal;
+        otherCharges: Decimal;
+        total: Decimal;
+        downPayment: Decimal;
+        downPaymentMethod: string | null;
+        numberOfInstallments: number;
+        intervalDays: number;
+        note: string | null;
+        createdAt: string;
+    };
+    details: InstallmentDetailView[];
+    customerName: string | null;
+    itemName: string;
+    /** `downPayment + SUM(paidAmount)`. Derived, never stored. */
+    paidTotal: Decimal;
+    dueTotal: Decimal;
+    status: string;
+}
+
+export interface InstallmentSummary {
+    id: number;
+    referenceNo: string;
+    customerId: number;
+    customerName: string | null;
+    itemName: string;
+    total: Decimal;
+    paidTotal: Decimal;
+    dueTotal: Decimal;
+    status: string;
+    createdAt: string;
+}
+
+export const createInstallmentSale = (input: CreateInstallmentInput) =>
+    call<InstallmentSaleView>("create_installment_sale", { input });
+export const collectInstallmentPayment = (detailId: number, amount: Decimal, paymentMethod?: string) =>
+    call<InstallmentSaleView>("collect_installment_payment", {
+        detailId,
+        amount,
+        paymentMethod: paymentMethod ?? null,
+    });
+export const listInstallments = (customerId: number | null = null, query: PageQuery = {}) =>
+    call<Page<InstallmentSummary>>("list_installments", { customerId, query });
+export const getInstallmentSale = (id: number) => call<InstallmentSaleView>("get_installment_sale", { id });
+
 export const discardDraft = (saleId: number) => call<void>("discard_draft", { saleId });
 
 export interface MethodTotal {
