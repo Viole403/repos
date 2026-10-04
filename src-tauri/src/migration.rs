@@ -34,6 +34,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::TradeCredit),
             Box::new(Migrations::SalePayments),
             Box::new(Migrations::SaleReturns),
+            Box::new(Migrations::Registers),
         ]
     }
 }
@@ -49,6 +50,7 @@ pub enum Migrations {
     TradeCredit,
     SalePayments,
     SaleReturns,
+    Registers,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -94,6 +96,7 @@ impl MigrationName for Migrations {
             Migrations::TradeCredit => "trade_credit",
             Migrations::SalePayments => "sale_payments",
             Migrations::SaleReturns => "sale_returns",
+        Migrations::Registers => "registers",
         }
     }
 }
@@ -111,6 +114,7 @@ impl MigrationTrait for Migrations {
             Migrations::TradeCredit => trade_credit(manager).await?,
             Migrations::SalePayments => sale_payments(manager).await?,
             Migrations::SaleReturns => sale_returns(manager).await?,
+            Migrations::Registers => registers(manager).await?,
         }
         Ok(())
     }
@@ -118,6 +122,18 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::Registers => {
+                manager.drop_table(Table::drop().table(Registers::Table).if_exists().to_owned()).await?;
+                // Same ownership rule as the catalog arm below: only the rows this
+                // migration seeded.
+                let conn = manager.get_connection();
+                for name in REGISTER_PERMISSIONS {
+                    permissions::Entity::delete_many()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .exec(conn)
+                        .await?;
+                }
+            }
             Migrations::SaleReturns => {
                 for t in [
                     SaleReturnDetails::Table.into_iden(),
@@ -676,6 +692,84 @@ async fn customers_and_suppliers(manager: &SchemaManager<'_>) -> Result<(), DbEr
 /// A return is its own document rather than an edit of the sale: the sale is financial
 /// history and stays as it was, and the return is what reverses it. Nothing here
 /// subtracts from `sales` — the money comes off the customer through a receipt.
+/// One cashier shift. Scoped to the user only: outlets and counters arrive in
+/// Stage 9, and columns pointing at tables that do not exist yet would fork the
+/// schema for existing databases.
+///
+/// No `del_status`: a closed shift is immutable history, and an open one is closed
+/// rather than deleted — the same reason `sales` carries none.
+async fn registers(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(Registers::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Registers::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(Registers::UserId).integer().not_null())
+                // 'Open' or 'Closed'. Strings, like every other status here.
+                .col(ColumnDef::new(Registers::Status).string().not_null())
+                .col(ColumnDef::new(Registers::OpenedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Registers::ClosedAt).custom(TIMESTAMP).null())
+                .col(ColumnDef::new(Registers::OpeningBalance).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                // Per-method opening float as JSON, mirroring the reference's
+                // `opening_details`: `[{"method":"Cash","amount":"50000.000"}]`.
+                .col(ColumnDef::new(Registers::OpeningDetails).text().null())
+                // What the cashier counted at close; expected is the snapshot below.
+                .col(ColumnDef::new(Registers::ClosingBalance).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
+                .col(ColumnDef::new(Registers::ExpectedBalance).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
+                .col(ColumnDef::new(Registers::Note).string().null())
+                .col(ColumnDef::new(Registers::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_registers_user")
+                        .from(Registers::Table, Registers::UserId)
+                        .to(Users::Table, Users::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_registers_user_id")
+                .table(Registers::Table)
+                .col(Registers::UserId)
+                .to_owned(),
+        )
+        .await?;
+
+    // Same insert-if-absent shape as the catalog seeder, so re-running leaves an
+    // operator's own setup alone.
+    let conn = manager.get_connection();
+    let now = now();
+    for name in REGISTER_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set("register".to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+
+    Ok(())
+}
+
 async fn sale_returns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     manager
         .create_table(
@@ -928,6 +1022,30 @@ async fn permission_catalog(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
     Ok(())
 }
+
+#[derive(Iden)]
+enum Registers {
+    Table,
+    Id,
+    UserId,
+    Status,
+    OpenedAt,
+    ClosedAt,
+    OpeningBalance,
+    OpeningDetails,
+    ClosingBalance,
+    ExpectedBalance,
+    Note,
+    CreatedAt,
+}
+
+/// Permissions this migration owns, for the down arm above.
+const REGISTER_PERMISSIONS: &[&str] = &[
+    "register-open",
+    "register-close",
+    "register-summary",
+    "register-list",
+];
 
 #[derive(Iden)]
 enum SaleReturns {
