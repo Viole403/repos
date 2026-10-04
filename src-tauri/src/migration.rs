@@ -50,6 +50,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::SaleRounding),
             Box::new(Migrations::CreditNotes),
             Box::new(Migrations::ManagerApprovals),
+            Box::new(Migrations::ItemSubCategories),
         ]
     }
 }
@@ -81,6 +82,7 @@ pub enum Migrations {
     SaleRounding,
     CreditNotes,
     ManagerApprovals,
+    ItemSubCategories,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -142,6 +144,7 @@ impl MigrationName for Migrations {
         Migrations::SaleRounding => "sale_rounding",
         Migrations::CreditNotes => "credit_notes",
         Migrations::ManagerApprovals => "manager_approvals",
+        Migrations::ItemSubCategories => "item_sub_categories",
         }
     }
 }
@@ -175,6 +178,7 @@ impl MigrationTrait for Migrations {
             Migrations::SaleRounding => sale_rounding(manager).await?,
             Migrations::CreditNotes => credit_notes(manager).await?,
             Migrations::ManagerApprovals => manager_approvals(manager).await?,
+            Migrations::ItemSubCategories => item_sub_categories(manager).await?,
         }
         Ok(())
     }
@@ -182,6 +186,19 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::ItemSubCategories => {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(Items::Table)
+                            .drop_column(Items::SubCategoryId)
+                            .to_owned(),
+                    )
+                    .await?;
+                manager
+                    .drop_table(Table::drop().table(ItemSubCategories::Table).if_exists().to_owned())
+                    .await?;
+            }
             Migrations::ManagerApprovals => {
                 manager
                     .alter_table(
@@ -1510,6 +1527,71 @@ async fn manager_approvals(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .insert(conn)
         .await?;
     }
+    Ok(())
+}
+
+/// Second-level catalog grouping: a category's children. The reference's
+/// `ItemSubCategory` belongs to one `ItemCategory` and owns items through
+/// `sub_category_id`; deleting a category cascades in the reference, but here
+/// both links are `SetNull` like every other catalog FK — deleting a grouping
+/// must not delete the items in it.
+async fn item_sub_categories(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(ItemSubCategories::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(ItemSubCategories::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(ItemSubCategories::CategoryId).integer().not_null())
+                .col(ColumnDef::new(ItemSubCategories::Name).string().not_null())
+                .col(ColumnDef::new(ItemSubCategories::Description).string().null())
+                .col(ColumnDef::new(ItemSubCategories::SortId).integer().not_null().default(0))
+                .col(ColumnDef::new(ItemSubCategories::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(ItemSubCategories::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(ItemSubCategories::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(&mut ForeignKey::create().name("fk_item_sub_categories_category").from(ItemSubCategories::Table, ItemSubCategories::CategoryId).to(ItemCategories::Table, ItemCategories::Id).on_delete(ForeignKeyAction::Cascade).to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    // Items point at their sub-category; the column lands here rather than in the
+    // original `items` migration so existing databases get it too.
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Items::Table)
+                .add_column(ColumnDef::new(Items::SubCategoryId).integer().null().to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    // Foreign keys cannot be added to an existing table on SQLite — sea-query
+    // panics — so only Postgres gets the constraint. The application always
+    // writes a valid id or NULL either way.
+    if manager.get_database_backend() != sea_orm::DbBackend::Sqlite {
+        manager
+            .create_foreign_key(
+                ForeignKey::create()
+                    .name("fk_items_sub_category")
+                    .from(Items::Table, Items::SubCategoryId)
+                    .to(ItemSubCategories::Table, ItemSubCategories::Id)
+                    .on_delete(ForeignKeyAction::SetNull)
+                    .to_owned(),
+            )
+            .await?;
+    }
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_item_sub_categories_sort")
+                .table(ItemSubCategories::Table)
+                .col(ItemSubCategories::SortId)
+                .to_owned(),
+        )
+        .await?;
+
     Ok(())
 }
 
@@ -2864,6 +2946,19 @@ enum ItemCategories {
 }
 
 #[derive(Iden)]
+enum ItemSubCategories {
+    Table,
+    Id,
+    CategoryId,
+    Name,
+    Description,
+    SortId,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
 enum Items {
     Table,
     Id,
@@ -2873,6 +2968,7 @@ enum Items {
     GenericName,
     Description,
     CategoryId,
+    SubCategoryId,
     BrandId,
     PurchaseUnitId,
     SaleUnitId,
