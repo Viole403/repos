@@ -26,6 +26,8 @@ pub struct Model {
     pub item_id: i32,
     /// Null once the causing sale is hard-deleted; the movement outlives it.
     pub sale_id: Option<i32>,
+    /// Same, for a credit sale written as installments.
+    pub installment_sale_id: Option<i32>,
     /// [`MovementType`] serialized as its string form, so the ledger stays
     /// readable in raw SQL.
     pub movement_type: String,
