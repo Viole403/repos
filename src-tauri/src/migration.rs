@@ -37,6 +37,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::Registers),
             Box::new(Migrations::Quotations),
             Box::new(Migrations::Bookings),
+            Box::new(Migrations::Promotions),
         ]
     }
 }
@@ -55,6 +56,7 @@ pub enum Migrations {
     Registers,
     Quotations,
     Bookings,
+    Promotions,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -103,6 +105,7 @@ impl MigrationName for Migrations {
         Migrations::Registers => "registers",
         Migrations::Quotations => "quotations",
         Migrations::Bookings => "bookings",
+        Migrations::Promotions => "promotions",
         }
     }
 }
@@ -123,6 +126,7 @@ impl MigrationTrait for Migrations {
             Migrations::Registers => registers(manager).await?,
             Migrations::Quotations => quotations(manager).await?,
             Migrations::Bookings => bookings(manager).await?,
+            Migrations::Promotions => promotions(manager).await?,
         }
         Ok(())
     }
@@ -130,6 +134,16 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::Promotions => {
+                manager.drop_table(Table::drop().table(Promotions::Table).if_exists().to_owned()).await?;
+                let conn = manager.get_connection();
+                for name in PROMOTION_PERMISSIONS {
+                    permissions::Entity::delete_many()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .exec(conn)
+                        .await?;
+                }
+            }
             Migrations::Bookings => {
                 manager.drop_table(Table::drop().table(Bookings::Table).if_exists().to_owned()).await?;
                 let conn = manager.get_connection();
@@ -950,6 +964,88 @@ async fn bookings(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// Discount rules the till applies by itself. Four kinds, one table: the columns a
+/// kind does not use stay null, and the commands refuse a row whose kind and
+/// columns disagree — a second table would only move that check, not remove it.
+async fn promotions(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(Promotions::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Promotions::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(Promotions::Title).string().not_null())
+                // ItemPercent, ItemFixed, OrderPercent, OrderFixed, BuyGet.
+                .col(ColumnDef::new(Promotions::Kind).string().not_null())
+                .col(ColumnDef::new(Promotions::TargetItemId).integer().null())
+                .col(ColumnDef::new(Promotions::RewardItemId).integer().null())
+                .col(ColumnDef::new(Promotions::Percent).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
+                .col(ColumnDef::new(Promotions::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
+                .col(ColumnDef::new(Promotions::MinTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
+                .col(ColumnDef::new(Promotions::BuyQty).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
+                .col(ColumnDef::new(Promotions::GetQty).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).null())
+                .col(ColumnDef::new(Promotions::StartAt).custom(TIMESTAMP).not_null())
+                .col(ColumnDef::new(Promotions::EndAt).custom(TIMESTAMP).not_null())
+                .col(ColumnDef::new(Promotions::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(Promotions::CreatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Promotions::UpdatedAt).custom(TIMESTAMP).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_promotions_target_item")
+                        .from(Promotions::Table, Promotions::TargetItemId)
+                        .to(Items::Table, Items::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_promotions_reward_item")
+                        .from(Promotions::Table, Promotions::RewardItemId)
+                        .to(Items::Table, Items::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_promotions_target_item_id")
+                .table(Promotions::Table)
+                .col(Promotions::TargetItemId)
+                .to_owned(),
+        )
+        .await?;
+
+    let conn = manager.get_connection();
+    let now = now();
+    for name in PROMOTION_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set("promotion".to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// A price offer to a customer. Moves no stock and takes no payment — that is
 /// what separates it from a draft, which is a sale waiting to happen. Totals are
 /// derived from the lines by the commands, never trusted from the client.
@@ -1229,6 +1325,34 @@ async fn permission_catalog(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
     Ok(())
 }
+
+#[derive(Iden)]
+enum Promotions {
+    Table,
+    Id,
+    Title,
+    Kind,
+    TargetItemId,
+    RewardItemId,
+    Percent,
+    Amount,
+    MinTotal,
+    BuyQty,
+    GetQty,
+    StartAt,
+    EndAt,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+const PROMOTION_PERMISSIONS: &[&str] = &[
+    "promotion-list",
+    "promotion-create",
+    "promotion-edit",
+    "promotion-show",
+    "promotion-destroy",
+];
 
 #[derive(Iden)]
 enum Bookings {
