@@ -742,6 +742,41 @@ pub struct SaleFilter {
     pub to: Option<String>,
 }
 
+#[tauri::command]
+pub async fn get_sale(id: i32) -> CmdResult<SaleView> {
+    crate::commands_auth::require_permission(db(), "sale-show").await?;
+    get_sale_in(db(), id).await
+}
+
+/// One sale with its lines, for the sale detail screen and the receipt.
+pub async fn get_sale_in<C: ConnectionTrait>(conn: &C, id: i32) -> CmdResult<SaleView> {
+    let sale = sale::Entity::find_by_id(id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("sale".into()))?;
+
+    let lines = sale_detail::Entity::find()
+        .filter(sale_detail::Column::SaleId.eq(id))
+        .order_by_asc(sale_detail::Column::Id)
+        .all(conn)
+        .await?;
+
+    // Distinct items, not one row per line: a cart listing the same item twice should
+    // report one balance, which is the figure the sale left behind.
+    let mut seen = Vec::new();
+    for line in &lines {
+        if !seen.contains(&line.item_id) {
+            seen.push(line.item_id);
+        }
+    }
+    let mut stock_on_hand = Vec::with_capacity(seen.len());
+    for item_id in seen {
+        stock_on_hand.push(ItemOnHand { item_id, quantity: on_hand_in(conn, item_id).await? });
+    }
+
+    Ok(SaleView { sale, lines, stock_on_hand })
+}
+
 /// A sale row with the customer named, so the list does not show ids.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -61,6 +61,7 @@ pub fn run() {
             commands_auth::set_role_permissions,
             commands_auth::delete_role,
             commands::list_sales,
+            commands::get_sale,
             commands::list_customers,
             commands::create_customer,
             commands::update_customer,
@@ -1567,5 +1568,79 @@ mod tests {
 
         let rows = commands::list_sales_in(&db, &no_filter(), &page_one()).await.unwrap().rows;
         assert_eq!(rows.first().unwrap().id, later, "the newest sale is not first");
+    }
+
+    #[tokio::test]
+    async fn a_sale_reports_one_stock_balance_per_distinct_item() {
+        let db = db::init_for_tests().await;
+        let first = seed_item(&db, "Widget").await;
+        let second = seed_item(&db, "Gadget").await;
+        seed_stock(&db, first, Decimal::new(10_000, 3)).await;
+        seed_stock(&db, second, Decimal::new(5_000, 3)).await;
+
+        // The same item twice, the way a cashier merging two scans produces.
+        let view = commands::checkout_in(
+            &db,
+            commands::CheckoutInput {
+                lines: vec![
+                    commands::CheckoutLine {
+                        item_id: first,
+                        quantity: Decimal::new(1_000, 3),
+                        unit_price: Decimal::new(2_000, 3),
+                        discount: None,
+                    },
+                    commands::CheckoutLine {
+                        item_id: first,
+                        quantity: Decimal::new(2_000, 3),
+                        unit_price: Decimal::new(2_000, 3),
+                        discount: None,
+                    },
+                    commands::CheckoutLine {
+                        item_id: second,
+                        quantity: Decimal::new(1_000, 3),
+                        unit_price: Decimal::new(3_000, 3),
+                        discount: None,
+                    },
+                ],
+                discount_total: Some(Decimal::ZERO),
+                tax_total: Some(Decimal::ZERO),
+                paid_total: None,
+                payment_method: Some("Cash".into()),
+                note: None,
+                promote: Some(true),
+                customer_id: None,
+            },
+        )
+        .await
+        .expect("checkout");
+
+        assert_eq!(view.lines.len(), 3, "both lines of the repeated item are kept");
+        assert_eq!(
+            view.stock_on_hand.len(),
+            2,
+            "the repeated item reports one balance, not one per line"
+        );
+
+        let reloaded = commands::get_sale_in(&db, view.sale.id).await.expect("reload the sale");
+        assert_eq!(reloaded.sale.invoice_no, view.sale.invoice_no);
+        assert_eq!(reloaded.lines.len(), 3);
+        assert_eq!(
+            reloaded
+                .stock_on_hand
+                .iter()
+                .find(|o| o.item_id == first)
+                .map(|o| o.quantity),
+            Some(Decimal::new(7_000, 3)),
+            "reloading a sale reports a different shelf than the sale left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_sale_is_not_found() {
+        let db = db::init_for_tests().await;
+        assert!(matches!(
+            commands::get_sale_in(&db, 9999).await,
+            Err(commands::CmdError::NotFound(_))
+        ));
     }
 }
