@@ -9,10 +9,16 @@ import type { SelectItemType } from "@/components/base/select/select-shared";
 import { Table, TableCard } from "@/components/application/table/table";
 import { CartProvider, cartLineFromItem, cartLineTotal, useCart } from "@/app/cart";
 import type { CartLine } from "@/app/cart";
-import { decCompare, decIsPositive, decStep, decSub } from "@/app/decimal";
+import { decAdd, decCompare, decIsPositive, decStep, decSub } from "@/app/decimal";
 import { formatMoney, formatQuantity, toDecimal } from "@/app/format";
-import type { CheckoutInput, Decimal, SaleView } from "@/app/ipc";
+import type { CheckoutInput, Decimal, PaymentLine, SaleView } from "@/app/ipc";
 import { checkout, listCustomers, listItems, stockOnHand } from "@/app/ipc";
+
+interface Tender {
+    method: string;
+    /** Kept as typed text so the exact digits reach the wire, not a parsed float. */
+    amount: string;
+}
 
 const PAYMENT_METHODS: SelectItemType[] = [
     { id: "Cash", label: "Cash" },
@@ -70,6 +76,13 @@ const RegisterScreen = () => {
     const [lookup, setLookup] = useState<Lookup>({ kind: "idle" });
     const [sale, setSale] = useState<SaleState>({ kind: "idle" });
     const [paymentMethod, setPaymentMethod] = useState("Cash");
+    // Split is opt-in. The single-tender path is one field and one keypress, and
+    // should not become two rows to fill in for the common case.
+    const [split, setSplit] = useState(false);
+    const [tenders, setTenders] = useState<Tender[]>([
+        { method: "Cash", amount: "" },
+        { method: "Card", amount: "" },
+    ]);
     // "" is a walk-in, which is what most of a counter's sales are.
     const [customerKey, setCustomerKey] = useState("");
     const [customers, setCustomers] = useState<SelectItemType[]>([]);
@@ -214,8 +227,17 @@ const RegisterScreen = () => {
     const paidDigits = paid.trim() === "" ? "" : normalizeMoney(paid.trim());
     const paidInvalid = paidDigits !== "" && (!Number.isFinite(Number(paidDigits)) || Number(paidDigits) < 0);
 
+    const tenderLines = (): PaymentLine[] =>
+        tenders
+            .filter((t) => t.amount.trim() !== "")
+            .map((t) => ({ method: t.method, amount: toDecimal(t.amount), reference: null }));
+
+    const tenderSum = tenderLines().reduce((total, t) => decAdd(total, t.amount), "0");
+    // Same rule the server applies, so the cashier sees it before the sale is refused.
+    const splitOver = split && decCompare(tenderSum, grandTotal) > 0;
+
     const submitSale = useCallback(async () => {
-        if (!canCheckout || paidInvalid || sale.kind === "saving") return;
+        if (!canCheckout || paidInvalid || splitOver || sale.kind === "saving") return;
 
         const input: CheckoutInput = {
             lines: lines.map((line) => ({
@@ -257,7 +279,7 @@ const RegisterScreen = () => {
             setSale({ kind: "failed", message: messageOf(error) });
             focusCode();
         }
-    }, [canCheckout, paidInvalid, paidDigits, sale.kind, lines, taxTotal, paymentMethod, note, clearCart, focusCode]);
+    }, [canCheckout, paidInvalid, paidDigits, sale.kind, lines, taxTotal, paymentMethod, customerKey, split, tenderSum, grandTotal, note, clearCart, focusCode]);
 
     useEffect(() => {
         const onKeyDown = (event: KeyboardEvent) => {
@@ -511,29 +533,84 @@ const RegisterScreen = () => {
                         </div>
                     </div>
 
-                    <Select
-                        label="Payment method"
-                        items={PAYMENT_METHODS}
-                        selectedKey={paymentMethod}
-                        onSelectionChange={(key) => setPaymentMethod(String(key ?? "Cash"))}
-                    >
-                        {(row) => (
-                            <Select.Item id={row.id} textValue={row.label}>
-                                {row.label}
-                            </Select.Item>
-                        )}
-                    </Select>
+                    {split ? (
+                        <div className="flex flex-col gap-2">
+                            <span className="text-sm font-medium text-primary">Split payment</span>
+                            {tenders.map((tender, index) => (
+                                <div key={index} className="flex items-end gap-2">
+                                    <Select
+                                        label="Method"
+                                        aria-label={`Method for tender ${index + 1}`}
+                                        items={PAYMENT_METHODS}
+                                        selectedKey={tender.method}
+                                        onSelectionChange={(key) =>
+                                            setTenders((current) =>
+                                                current.map((t, i) =>
+                                                    i === index ? { ...t, method: String(key ?? "Cash") } : t,
+                                                ),
+                                            )
+                                        }
+                                        className="w-32"
+                                    >
+                                        {(row) => (
+                                            <Select.Item id={row.id} textValue={row.label}>
+                                                {row.label}
+                                            </Select.Item>
+                                        )}
+                                    </Select>
+                                    <Input
+                                        label="Amount"
+                                        aria-label={`Amount for tender ${index + 1}`}
+                                        value={tender.amount}
+                                        onChange={(value) =>
+                                            setTenders((current) =>
+                                                current.map((t, i) =>
+                                                    i === index ? { ...t, amount: String(value) } : t,
+                                                ),
+                                            )
+                                        }
+                                    />
+                                </div>
+                            ))}
+                            {splitOver && (
+                                <p className="text-sm text-error-primary">
+                                    The tenders add up to more than the total — the difference is change, not
+                                    a payment.
+                                </p>
+                            )}
+                            <p className="text-sm text-tertiary">Tendered {formatMoney(tenderSum)}</p>
+                        </div>
+                    ) : (
+                        <>
+                            <Select
+                                label="Payment method"
+                                items={PAYMENT_METHODS}
+                                selectedKey={paymentMethod}
+                                onSelectionChange={(key) => setPaymentMethod(String(key ?? "Cash"))}
+                            >
+                                {(row) => (
+                                    <Select.Item id={row.id} textValue={row.label}>
+                                        {row.label}
+                                    </Select.Item>
+                                )}
+                            </Select>
 
-                    <Input
-                        label="Paid"
-                        placeholder={formatMoney(grandTotal)}
-                        hint={paidInvalid ? "Paid must be a positive number" : "Blank means paid in full"}
-                        isInvalid={paidInvalid}
-                        value={paid}
-                        onChange={setPaid}
-                    />
+                            <Input
+                                label="Paid"
+                                placeholder={formatMoney(grandTotal)}
+                                hint={paidInvalid ? "Paid must be a positive number" : "Blank means paid in full"}
+                                isInvalid={paidInvalid}
+                                value={paid}
+                                onChange={setPaid}
+                            />
+                        </>
+                    )}
 
-                    {paidDigits !== "" && !paidInvalid && (
+                    <Button color="secondary" size="sm" className="w-fit" onPress={() => setSplit(!split)}>
+                        {split ? "Use one payment" : "Split across methods"}
+                    </Button>
+
+                    {!split && paidDigits !== "" && !paidInvalid && (
                         <p className="text-sm text-tertiary">
                             {decCompare(change, "0") >= 0
                                 ? `Change ${formatMoney(change)}`
@@ -561,7 +638,7 @@ const RegisterScreen = () => {
                         size="lg"
                         iconLeading={CheckCircle}
                         isLoading={sale.kind === "saving"}
-                        isDisabled={!canCheckout || paidInvalid}
+                        isDisabled={!canCheckout || paidInvalid || splitOver}
                         onPress={() => void submitSale()}
                     >
                         Complete sale
