@@ -58,6 +58,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::FixedAssets),
             Box::new(Migrations::LoyaltyPointsWidth),
             Box::new(Migrations::Purchases),
+            Box::new(Migrations::Employees),
             Box::new(Migrations::Accounting),
             Box::new(Migrations::TenderReferences),
             Box::new(Migrations::RecurringExpenses),
@@ -98,6 +99,7 @@ pub enum Migrations {
     FixedAssets,
     LoyaltyPointsWidth,
     Purchases,
+    Employees,
     Accounting,
     TenderReferences,
     RecurringExpenses,
@@ -189,8 +191,9 @@ impl MigrationName for Migrations {
         Migrations::ItemBatches => "item_batches",
         Migrations::FixedAssets => "fixed_assets",
         Migrations::LoyaltyPointsWidth => "loyalty_points_width",
-        Migrations::Purchases => "purchases",
-        Migrations::Accounting => "accounting",
+Migrations::Purchases => "purchases",
+            Migrations::Employees => "employees",
+            Migrations::Accounting => "accounting",
         Migrations::TenderReferences => "tender_references",
         Migrations::RecurringExpenses => "recurring_expenses",
         }
@@ -232,6 +235,7 @@ impl MigrationTrait for Migrations {
             Migrations::FixedAssets => fixed_assets(manager).await?,
             Migrations::LoyaltyPointsWidth => loyalty_points_width(manager).await?,
             Migrations::Purchases => purchases(manager).await?,
+            Migrations::Employees => employees(manager).await?,
             Migrations::Accounting => accounting(manager).await?,
             Migrations::TenderReferences => tender_references(manager).await?,
             Migrations::RecurringExpenses => recurring_expenses(manager).await?,
@@ -267,6 +271,14 @@ impl MigrationTrait for Migrations {
                         permissions::Entity::delete_by_id(row.id).exec(conn).await?;
                     }
                 }
+            }
+            Migrations::Employees => {
+                // The accounting tables referenced `users` here; see the note on
+                // `employees` about why the forward reference cannot be fixed after
+                // the fact.
+                manager
+                    .drop_table(Table::drop().table(Employees::Table).if_exists().to_owned())
+                    .await?;
             }
             Migrations::TenderReferences => {
                 // One statement per change: SQLite cannot apply several alter
@@ -2503,6 +2515,82 @@ async fn purchases(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// Stage 8 — the people who work here.
+///
+/// An employee is not an account. A counter hand, a part-timer, a family member: they are
+/// on the roster, they are in the salary run, they answer for their attendance, and they
+/// have no login, no password and no permissions. Putting them in `users` means either a
+/// password they never use or a payroll entry for an account that was never a person.
+///
+/// `user_id` links the two where they overlap — a manager who is both — and is null
+/// otherwise, which is the common case and not an incomplete record.
+///
+/// `base_salary` lives here rather than on the salary run, because a salary run that
+/// makes the operator re-key everyone's monthly rate every month is not a salary module.
+///
+/// This runs *before* `accounting` on purpose: `incomes.employee_id` and
+/// `expenses.employee_id` were written against `users` as placeholders, and both were
+/// named "Stage 8's employee records supersede it". A foreign key cannot be re-pointed
+/// afterwards — SQLite cannot alter a constraint at all, and sea-query panics rather than
+/// emitting broken DDL — so the table has to exist first. Neither accounting migration has
+/// run anywhere, which is what makes correcting them in place the honest move instead of a
+/// repair migration for an install that does not exist.
+async fn employees(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
+    manager
+        .create_table(
+            Table::create()
+                .table(Employees::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Employees::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(Employees::Name).string().not_null())
+                .col(ColumnDef::new(Employees::Phone).string().null())
+                .col(ColumnDef::new(Employees::Email).string().null())
+                .col(ColumnDef::new(Employees::Address).string().null())
+                .col(ColumnDef::new(Employees::UserId).integer().null())
+                .col(ColumnDef::new(Employees::BaseSalary).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Employees::HireDate).date().null())
+                .col(ColumnDef::new(Employees::TerminatedOn).date().null())
+                .col(ColumnDef::new(Employees::Note).string().null())
+                .col(ColumnDef::new(Employees::CreatedBy).integer().null())
+                .col(ColumnDef::new(Employees::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(Employees::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Employees::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_employees_user")
+                        .from(Employees::Table, Employees::UserId)
+                        .to(Users::Table, Users::Id)
+                        // SetNull, matching every other soft-deletable link: an account
+                        // going away must not delete the person, because their salary
+                        // history still has to balance.
+                        .on_delete(ForeignKeyAction::SetNull)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    // A non-unique index cannot be inlined into CREATE TABLE — it renders as
+    // `CONSTRAINT "..." ("col")`, which is invalid on both Postgres and SQLite. Only
+    // `unique_key()` is legal inline.
+    for (name, col) in [("idx_employees_name", Employees::Name)] {
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name(name)
+                    .table(Employees::Table)
+                    .col(col)
+                    .to_owned(),
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
 /// Stage 7 — the cash book: income, expense, and the owner's deposits and withdrawals.
 ///
 /// Three tables rather than one with a `direction` column, because the three answer
@@ -2595,7 +2683,7 @@ async fn accounting(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                     &mut ForeignKey::create()
                         .name("fk_incomes_employee")
                         .from(Incomes::Table, Incomes::EmployeeId)
-                        .to(Users::Table, Users::Id)
+                        .to(Employees::Table, Employees::Id)
                         .on_delete(ForeignKeyAction::SetNull)
                         .to_owned(),
                 )
@@ -2664,7 +2752,7 @@ async fn accounting(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                     &mut ForeignKey::create()
                         .name("fk_expenses_employee")
                         .from(Expenses::Table, Expenses::EmployeeId)
-                        .to(Users::Table, Users::Id)
+                        .to(Employees::Table, Employees::Id)
                         .on_delete(ForeignKeyAction::SetNull)
                         .to_owned(),
                 )
@@ -2975,7 +3063,11 @@ async fn recurring_expenses(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         }
         permissions::ActiveModel {
             name: Set((*name).to_owned()),
-            group_name: Set("recurring-expense".to_owned()),
+            // Derived from the name like every other group, rather than written out.
+            // Hardcoding `"recurring-expense"` here made this the one seeder whose
+            // `group_name` disagreed with its own prefix, which is the second source
+            // the catalog exists to prevent.
+            group_name: Set(name.split_once('-').map(|(g, _)| g).unwrap_or("recurring").to_owned()),
             guard_name: Set("web".to_owned()),
             del_status: Set(DEL_LIVE.to_owned()),
             created_at: Set(now),
@@ -4660,6 +4752,25 @@ enum ItemSubCategories {
     Name,
     Description,
     SortId,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum Employees {
+    Table,
+    Id,
+    Name,
+    Phone,
+    Email,
+    Address,
+    UserId,
+    BaseSalary,
+    HireDate,
+    TerminatedOn,
+    Note,
+    CreatedBy,
     DelStatus,
     CreatedAt,
     UpdatedAt,
