@@ -14,6 +14,7 @@ import {
     ArrowDownRight,
     ArrowUpLeft,
     CoinsSwap01,
+    Repeat01,
     Tag01,
     Truck01,
     User01,
@@ -49,7 +50,7 @@ const allowed = (permissions: string[], permission?: string): boolean =>
     !permission || permissions.length === 0 || permissions.includes(permission);
 
 /** Screens that exist. Anything else in the tree is inert until built. */
-export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/sales/registers", "/sales/quotations", "/sales/bookings", "/sales/promotions", "/sales/installments", "/sales/warranties", "/sales/servicings", "/sales/gift-cards", "/sales/credit-notes", "/stock", "/stock/operations", "/stock/assets", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/catalog/sub-categories", "/catalog/combos", "/settings/accounts", "/settings/roles", "/customers", "/purchase", "/purchase/suppliers", "/accounting/accounts", "/accounting/incomes", "/accounting/expenses", "/accounting/deposits", "/accounting/income-categories", "/accounting/expense-categories", "/sales"]);
+export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/sales/registers", "/sales/quotations", "/sales/bookings", "/sales/promotions", "/sales/installments", "/sales/warranties", "/sales/servicings", "/sales/gift-cards", "/sales/credit-notes", "/stock", "/stock/operations", "/stock/assets", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/catalog/sub-categories", "/catalog/combos", "/settings/accounts", "/settings/roles", "/customers", "/purchase", "/purchase/suppliers", "/accounting/accounts", "/accounting/incomes", "/accounting/expenses", "/accounting/deposits", "/accounting/income-categories", "/accounting/expense-categories", "/accounting/recurring", "/accounting/reports", "/sales"]);
 
 export const navItems: NavEntry[] = [
     { label: "Dashboard", href: "#/", icon: Home01 },
@@ -116,6 +117,8 @@ export const navItems: NavEntry[] = [
             { label: "Deposits & Withdrawals", href: "#/accounting/deposits", icon: CoinsSwap01 },
             { label: "Income Categories", href: "#/accounting/income-categories", icon: Tag01 },
             { label: "Expense Categories", href: "#/accounting/expense-categories", icon: Tag01 },
+            { label: "Recurring Expenses", href: "#/accounting/recurring", icon: Repeat01 },
+            { label: "Trial Balance", href: "#/accounting/reports", icon: BarChart01 },
         ],
     },
     { label: "Payments", href: "#/payments", icon: CreditCard01, disabled: true },

@@ -1643,3 +1643,99 @@ export const accountStatement = (
 ) => call<CashBookLine[]>("account_statement", { paymentMethodId, from: from ?? null, to: to ?? null });
 export const cashBookHistory = (from?: string | null, to?: string | null) =>
     call<CashBookLine[]>("cash_book_history", { from: from ?? null, to: to ?? null });
+
+// ---------------------------------------------------------------------------
+// Recurring expenses, and the reports over the cash book
+// ---------------------------------------------------------------------------
+
+export type Rotation = "Daily" | "Weekly" | "BiWeekly" | "Monthly" | "Quarterly" | "Yearly";
+
+export interface RecurringExpense {
+    id: number;
+    expenseCategoryId: number;
+    expenseCategoryName: string;
+    name: string;
+    amount: Decimal;
+    paymentMethodId: number;
+    paymentMethodName: string;
+    rotation: Rotation;
+    startsOn: string;
+    /** `YYYY-MM-DD`. Null means nothing is scheduled — a stopped schedule. */
+    nextDueOn: string | null;
+    /** Null is open-ended: rent has no last month. */
+    endsOn: string | null;
+    note: string | null;
+    /** How many times it has actually posted. */
+    postedCount: number;
+    createdAt: string;
+}
+
+export interface RecurringExpenseInput {
+    expenseCategoryId: number;
+    name: string;
+    amount: Decimal;
+    /** The account the money will leave. A reference, not a name. */
+    paymentMethodId: number;
+    rotation: Rotation;
+    startsOn: string;
+    endsOn?: string | null;
+    note?: string | null;
+    postNow?: boolean;
+}
+
+/** What one posting run wrote. `failed` names schedules that were due and did not post. */
+export interface PostingRun {
+    posted: number;
+    failed: string[];
+}
+
+export const listRecurringExpenses = (query: PageQuery = {}) =>
+    call<Page<RecurringExpense>>("list_recurring_expenses", { query });
+export const createRecurringExpense = (input: RecurringExpenseInput) =>
+    call<RecurringExpense>("create_recurring_expense", { input });
+export const updateRecurringExpense = (id: number, input: RecurringExpenseInput) =>
+    call<RecurringExpense>("update_recurring_expense", { id, input });
+export const deleteRecurringExpense = (id: number) => call<void>("delete_recurring_expense", { id });
+/** Posts every live schedule due on or before `asOf`, defaulting to today. */
+export const postDueRecurringExpenses = (asOf?: string) =>
+    call<PostingRun>("post_due_recurring_expenses", { asOf: asOf ?? null });
+
+export type LedgerGroup =
+    | "Cash"
+    | "Receivables"
+    | "Payables"
+    | "OwnerEquity"
+    | "Revenue"
+    | "Expenses";
+
+export interface TrialLine {
+    group: LedgerGroup;
+    debit: Decimal;
+    credit: Decimal;
+    /** `debit - credit`. Negative on a liability, which is the ordinary case. */
+    net: Decimal;
+}
+
+export interface TrialBalance {
+    lines: TrialLine[];
+    totalDebit: Decimal;
+    totalCredit: Decimal;
+    /** Zero is the only correct answer, and it is returned rather than assumed. */
+    difference: Decimal;
+}
+
+export interface BalanceSheet {
+    assets: TrialLine[];
+    liabilities: TrialLine[];
+    equity: TrialLine[];
+    totalAssets: Decimal;
+    totalLiabilities: Decimal;
+    totalEquity: Decimal;
+    /** `assets - liabilities - equity`. Zero when the books are whole. */
+    difference: Decimal;
+}
+
+export const trialBalance = (from?: string | null, to?: string | null) =>
+    call<TrialBalance>("trial_balance", { from: from ?? null, to: to ?? null });
+export const balanceSheet = (from?: string | null, to?: string | null) =>
+    call<BalanceSheet>("balance_sheet", { from: from ?? null, to: to ?? null });

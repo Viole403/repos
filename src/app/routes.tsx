@@ -24,6 +24,8 @@ import { Deposits } from "./screens/Deposits";
 import { CashAccounts } from "./screens/CashAccounts";
 import { IncomeCategories } from "./screens/IncomeCategories";
 import { ExpenseCategories } from "./screens/ExpenseCategories";
+import { RecurringExpenses } from "./screens/RecurringExpenses";
+import { Reports } from "./screens/Reports";
 import { Purchases } from "./screens/Purchases";
 import { Register } from "./screens/Register";
 import { Drafts } from "./screens/Drafts";
@@ -82,6 +84,8 @@ const screens: Record<string, ReactNode> = {
     "/accounting/accounts": <CashAccounts />,
     "/accounting/income-categories": <IncomeCategories />,
     "/accounting/expense-categories": <ExpenseCategories />,
+    "/accounting/recurring": <RecurringExpenses />,
+    "/accounting/reports": <Reports />,
     "/settings/accounts": <Accounts />,
     "/settings/roles": <Roles />,
 };
