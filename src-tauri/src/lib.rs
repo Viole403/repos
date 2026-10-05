@@ -185,6 +185,8 @@ pub fn run() {
             commands_accounting::update_recurring_expense,
             commands_accounting::delete_recurring_expense,
             commands_accounting::post_due_recurring_expenses,
+            commands_accounting::trial_balance,
+            commands_accounting::balance_sheet,
             commands_auth::has_permission,
             commands_auth::my_permissions,
             commands_auth::set_user_pin,
@@ -211,7 +213,10 @@ mod tests {
     use crate::entities::sales::{booking, combo_sale, quotation, quotation_detail, sale, sale_detail, stock_movement};
     use crate::entities::accounting::deposit_withdraw::DepositKind;
     use crate::entities::accounting::expense_recurring::Rotation;
-    use crate::entities::trade::{customer, payment_method, supplier, supplier_payment};
+    use crate::commands_accounting::LedgerGroup;
+    use crate::entities::trade::{
+        customer, payment_method, purchase, supplier, supplier_payment,
+    };
 
     fn days_ago(n: i64) -> chrono::NaiveDateTime {
         crate::migration::now() - chrono::Duration::days(n)
@@ -3435,6 +3440,122 @@ mod tests {
             Decimal::new(-1_000_000, 3),
             "stopping a schedule removed the expense it had posted"
         );
+    }
+
+    #[tokio::test]
+    async fn a_trial_balance_has_equal_debits_and_credits() {
+        let db = db::init_for_tests().await;
+        let cash = tender_id(&db, "Cash").await;
+        let rent = expense_category(&db, "Rent").await;
+        let grant = income_category(&db, "Grant").await;
+
+        create_income(&db, grant, cash, Decimal::new(500_000, 3)).await;
+        create_expense(&db, rent, cash, Decimal::new(120_000, 3)).await;
+
+        let trial = commands_accounting::trial_balance_in(&db, None, None).await.expect("trial balance");
+        assert_eq!(
+            trial.difference,
+            Decimal::ZERO,
+            "the two sides do not agree: {:?}",
+            trial.lines
+        );
+    }
+
+    #[tokio::test]
+    async fn a_balance_sheet_balances_after_a_sale_and_a_purchase() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let cash = tender_id(&db, "Cash").await;
+
+        sell_one_item(&db, item, Decimal::new(40_000, 3), None, None)
+            .await
+            .expect("counter sale");
+
+        let now = crate::migration::now();
+        let supplier_id = supplier::ActiveModel {
+            name: Set("Acme".into()),
+            opening_balance: Set(Decimal::new(150_000, 3)),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("supplier")
+        .id;
+        purchase::ActiveModel {
+            reference_no: Set("PUR-000001".into()),
+            supplier_id: Set(supplier_id),
+            supplier_invoice_no: Set(None),
+            purchased_at: Set(now.date()),
+            subtotal: Set(Decimal::new(150_000, 3)),
+            discount: Set(Decimal::ZERO),
+            grand_total: Set(Decimal::new(150_000, 3)),
+            note: Set(None),
+            created_by: Set(None),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("purchase");
+        supplier_payment::ActiveModel {
+            supplier_id: Set(supplier_id),
+            amount: Set(Decimal::new(150_000, 3)),
+            payment_method_id: Set(Some(cash)),
+            paid_at: Set(now),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("pay the supplier");
+
+        let sheet = commands_accounting::balance_sheet_in(&db, None, None).await.expect("balance sheet");
+        assert_eq!(
+            sheet.difference,
+            Decimal::ZERO,
+            "the sheet does not balance: assets {:?}, liabilities {:?}, equity {:?}",
+            sheet.assets, sheet.liabilities, sheet.equity
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paid_purchase_leaves_nothing_outstanding_and_no_cash() {
+        let db = db::init_for_tests().await;
+        let cash = tender_id(&db, "Cash").await;
+        let now = crate::migration::now();
+        let supplier_id = supplier::ActiveModel {
+            name: Set("Settled".into()),
+            opening_balance: Set(Decimal::new(90_000, 3)),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("supplier")
+        .id;
+        supplier_payment::ActiveModel {
+            supplier_id: Set(supplier_id),
+            amount: Set(Decimal::new(90_000, 3)),
+            payment_method_id: Set(Some(cash)),
+            paid_at: Set(now),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("pay");
+
+        let trial = commands_accounting::trial_balance_in(&db, None, None).await.expect("trial balance");
+        let cash_line = trial.lines.iter().find(|l| l.group == LedgerGroup::Cash).expect("a cash line");
+        assert_eq!(cash_line.net, Decimal::new(-90_000, 3), "the drawer does not show what left it");
+        let payables = trial.lines.iter().find(|l| l.group == LedgerGroup::Payables).expect("a payables line");
+        assert_eq!(payables.net, Decimal::ZERO, "a settled supplier is still owed on the balance sheet");
     }
 
     #[tokio::test]

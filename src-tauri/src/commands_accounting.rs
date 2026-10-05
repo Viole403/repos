@@ -35,7 +35,9 @@ use crate::entities::accounting::{
 };
 use crate::entities::auth::users;
 use crate::entities::sales::{sale, sale_payment};
-use crate::entities::trade::{customer_receive, payment_method, supplier_payment};
+use crate::entities::trade::{
+    customer_receive, payment_method, purchase, purchase_return, supplier, supplier_payment,
+};
 
 const SALE_STATUS_COMPLETED: &str = "Completed";
 const DELETED: &str = "Deleted";
@@ -1529,4 +1531,291 @@ pub(crate) async fn post_due_recurring_expenses_in<C: ConnectionTrait + Transact
     }
 
     Ok(PostingRun { posted, failed })
+}
+
+// ---------------------------------------------------------------------------
+// Trial balance and balance sheet
+// ---------------------------------------------------------------------------
+
+/// One side of the trial balance. A group rather than an account, because that is the
+/// level at which a shop reads one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum LedgerGroup {
+    /// Tenders: money the shop holds.
+    Cash,
+    /// What customers owe the shop.
+    Receivables,
+    /// What the shop owes suppliers.
+    Payables,
+    /// Money the owner moved in or out.
+    OwnerEquity,
+    /// What the shop took.
+    Revenue,
+    /// What the shop spent, other than stock.
+    Expenses,
+}
+
+/// One line: a group, and how much sits on each side of it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrialLine {
+    pub group: LedgerGroup,
+    pub debit: Decimal,
+    pub credit: Decimal,
+    /// `debit - credit`. Negative on a liability group, which is the ordinary case.
+    pub net: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrialBalance {
+    pub lines: Vec<TrialLine>,
+    pub total_debit: Decimal,
+    pub total_credit: Decimal,
+    /// `total_debit - total_credit`, rounded. **Zero is the only correct answer**, and
+    /// this is here so a figure that should not balance says so rather than looking
+    /// like a number.
+    pub difference: Decimal,
+}
+
+/// Every movement lands on exactly one debit line and one credit line, so the two
+/// sides must agree. Nothing is derived from a stored balance: each side is a sum over
+/// the same rows the cash book reads.
+///
+/// Inventory and cost of goods sold are **not** here. Valuing stock needs a cost per
+/// unit sold, which lives on `purchase_details` behind a batch join, and a trial balance
+/// that quietly valued stock at zero would be worse than one that admits it is not in
+/// the figure. That is Stage 10's profit and loss, where it belongs.
+pub(crate) async fn trial_balance_in<C: ConnectionTrait>(
+    conn: &C,
+    from: Option<chrono::NaiveDate>,
+    to: Option<chrono::NaiveDate>,
+) -> CmdResult<TrialBalance> {
+    let lines = lines_in(conn, None, from, to).await?;
+
+    // A sale is money taken (debit cash, credit revenue); a customer receipt is money
+    // arriving against a debt already charged (debit cash, credit receivables); a
+    // supplier payment settles a debt (debit payables, credit cash). The pair is what
+    // makes the two sides agree, and it is why the customer and supplier ledgers have
+    // to be counted rather than assumed.
+    let mut cash = Decimal::ZERO;
+    let mut revenue = Decimal::ZERO;
+    let mut receivables = Decimal::ZERO;
+    let mut payables = Decimal::ZERO;
+    let mut owner = Decimal::ZERO;
+    let mut expenses = Decimal::ZERO;
+
+    let customer_net = net_customer_balances_in(conn).await?;
+    let supplier_net = net_supplier_balances_in(conn).await?;
+
+    for line in &lines {
+        match line.kind.as_str() {
+            // Cash came in: the counterpart is what earned it.
+            "Income" => {
+                cash += line.signed;
+                revenue += line.signed;
+            }
+            "Receipt" => {
+                cash += line.signed;
+                // A receipt lowers what the customer owes.
+                receivables -= line.signed;
+            }
+            k if k.starts_with("Sale (") => {
+                cash += line.signed;
+                revenue += line.signed;
+            }
+            "Deposit" => {
+                cash += line.signed;
+                owner += line.signed;
+            }
+            // Cash went out: the counterpart is what it was spent on.
+            "Expense" => {
+                cash += line.signed;
+                expenses += -line.signed;
+            }
+            "Supplier payment" => {
+                cash += line.signed;
+                payables += -line.signed;
+            }
+            "Withdraw" => {
+                cash += line.signed;
+                owner += line.signed;
+            }
+            other => {
+                // A row the vocabulary does not name would be silently dropped, which is
+                // how a balance goes quietly wrong. Say so instead.
+                return Err(CmdError::Validation(format!(
+                    "{other:?} is a movement the trial balance does not place"
+                )));
+            }
+        }
+    }
+
+    let mut lines_out = vec![
+        TrialLine { group: LedgerGroup::Cash, debit: Decimal::ZERO, credit: Decimal::ZERO, net: cash },
+        TrialLine { group: LedgerGroup::Receivables, debit: Decimal::ZERO, credit: Decimal::ZERO, net: customer_net },
+        TrialLine { group: LedgerGroup::Payables, debit: Decimal::ZERO, credit: Decimal::ZERO, net: supplier_net },
+        TrialLine { group: LedgerGroup::OwnerEquity, debit: Decimal::ZERO, credit: Decimal::ZERO, net: owner },
+        TrialLine { group: LedgerGroup::Revenue, debit: Decimal::ZERO, credit: Decimal::ZERO, net: revenue },
+        TrialLine { group: LedgerGroup::Expenses, debit: Decimal::ZERO, credit: Decimal::ZERO, net: -expenses },
+    ];
+
+    // A positive net is a debit balance, a negative one a credit balance. Splitting here
+    // rather than at the reader is what lets the two columns be added up at all.
+    for line in &mut lines_out {
+        if line.net >= Decimal::ZERO {
+            line.debit = line.net;
+        } else {
+            line.credit = -line.net;
+        }
+        line.net = line.net.round_dp(MONEY_SCALE);
+        line.debit = line.debit.round_dp(MONEY_SCALE);
+        line.credit = line.credit.round_dp(MONEY_SCALE);
+    }
+
+    let total_debit = lines_out.iter().map(|l| l.debit).sum::<Decimal>().round_dp(MONEY_SCALE);
+    let total_credit = lines_out.iter().map(|l| l.credit).sum::<Decimal>().round_dp(MONEY_SCALE);
+    Ok(TrialBalance {
+        difference: (total_debit - total_credit).round_dp(MONEY_SCALE),
+        lines: lines_out,
+        total_debit,
+        total_credit,
+    })
+}
+
+#[tauri::command]
+pub async fn trial_balance(
+    from: Option<chrono::NaiveDate>,
+    to: Option<chrono::NaiveDate>,
+) -> CmdResult<TrialBalance> {
+    require_permission(db(), "accounting-report").await?;
+    trial_balance_in(db(), from, to).await
+}
+
+/// Net owed across every customer: sales charged less receipts taken. One grouped sum
+/// rather than a balance call per customer.
+async fn net_customer_balances_in<C: ConnectionTrait>(conn: &C) -> CmdResult<Decimal> {
+    let charged = sale::Entity::find()
+        .select_only()
+        .column_as(sale::Column::GrandTotal.sum(), "total")
+        .filter(sale::Column::Status.eq(SALE_STATUS_COMPLETED))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
+    let paid = customer_receive::Entity::find()
+        .select_only()
+        .column_as(customer_receive::Column::Amount.sum(), "total")
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
+    Ok((charged - paid).round_dp(MONEY_SCALE))
+}
+
+/// Net owed across every supplier, matching `supplier_balance_in`'s four terms:
+/// opening + purchases − returns − payments.
+async fn net_supplier_balances_in<C: ConnectionTrait>(conn: &C) -> CmdResult<Decimal> {
+    let opening: Option<Decimal> = supplier::Entity::find()
+        .select_only()
+        .column_as(supplier::Column::OpeningBalance.sum(), "total")
+        .filter(supplier::Column::DelStatus.eq(LIVE))
+        .into_tuple()
+        .one(conn)
+        .await?;
+    let purchased = purchase::Entity::find()
+        .select_only()
+        .column_as(purchase::Column::GrandTotal.sum(), "total")
+        .filter(purchase::Column::DelStatus.eq(LIVE))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
+    let returned = purchase_return::Entity::find()
+        .select_only()
+        .column_as(purchase_return::Column::TotalAmount.sum(), "total")
+        .filter(purchase_return::Column::DelStatus.eq(LIVE))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
+    let paid = supplier_payment::Entity::find()
+        .select_only()
+        .column_as(supplier_payment::Column::Amount.sum(), "total")
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
+
+    Ok((opening.unwrap_or(Decimal::ZERO) + purchased - returned - paid).round_dp(MONEY_SCALE))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceSheet {
+    pub assets: Vec<TrialLine>,
+    pub liabilities: Vec<TrialLine>,
+    pub equity: Vec<TrialLine>,
+    pub total_assets: Decimal,
+    pub total_liabilities: Decimal,
+    pub total_equity: Decimal,
+    /// `assets − liabilities − equity`. Zero when the books are whole.
+    pub difference: Decimal,
+}
+
+/// The same figures grouped the way a balance sheet groups them. Derived from the trial
+/// balance rather than computed twice, so the two can never disagree.
+#[tauri::command]
+pub async fn balance_sheet(
+    from: Option<chrono::NaiveDate>,
+    to: Option<chrono::NaiveDate>,
+) -> CmdResult<BalanceSheet> {
+    require_permission(db(), "accounting-report").await?;
+    balance_sheet_in(db(), from, to).await
+}
+
+pub(crate) async fn balance_sheet_in<C: ConnectionTrait>(
+    conn: &C,
+    from: Option<chrono::NaiveDate>,
+    to: Option<chrono::NaiveDate>,
+) -> CmdResult<BalanceSheet> {
+    let trial = trial_balance_in(conn, from, to).await?;
+    let find = |group: LedgerGroup| -> TrialLine {
+        trial.lines.iter().find(|l| l.group == group).cloned().unwrap_or(TrialLine {
+            group,
+            debit: Decimal::ZERO,
+            credit: Decimal::ZERO,
+            net: Decimal::ZERO,
+        })
+    };
+
+    // What the shop holds, and what customers owe it.
+    let mut assets = vec![find(LedgerGroup::Cash), find(LedgerGroup::Receivables)];
+    assets.retain(|l| l.net != Decimal::ZERO);
+    // What it owes, and the owner's own position: retained earnings plus anything they
+    // have moved in or out.
+    let mut liabilities = vec![find(LedgerGroup::Payables)];
+    liabilities.retain(|l| l.net != Decimal::ZERO);
+    let equity = vec![find(LedgerGroup::Revenue), find(LedgerGroup::Expenses), find(LedgerGroup::OwnerEquity)];
+
+    let total = |rows: &[TrialLine]| -> Decimal { rows.iter().map(|l| l.net).sum::<Decimal>().round_dp(MONEY_SCALE) };
+    let total_assets = total(&assets);
+    let total_liabilities = total(&liabilities);
+    let total_equity = total(&equity);
+
+    Ok(BalanceSheet {
+        difference: (total_assets - total_liabilities - total_equity).round_dp(MONEY_SCALE),
+        assets,
+        liabilities,
+        equity,
+        total_assets,
+        total_liabilities,
+        total_equity,
+    })
 }
