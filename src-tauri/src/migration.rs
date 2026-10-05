@@ -3927,6 +3927,8 @@ const ACCOUNTING_PERMISSIONS: &[&str] = &[
     "expense-show",
     "deposit-withdraw-list",
     "deposit-withdraw-create",
+    "accounting-balance",
+    "accounting-report",
 ];
 
 const CREDIT_NOTE_PERMISSIONS: &[&str] = &[

@@ -1,6 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod auth;
 mod commands;
+mod commands_accounting;
 mod commands_auth;
 mod commands_db;
 
@@ -164,6 +165,21 @@ pub fn run() {
             commands::supplier_balance,
             commands::record_supplier_payment,
             commands::list_supplier_payments,
+            commands_accounting::list_income_categories,
+            commands_accounting::create_income_category,
+            commands_accounting::delete_income_category,
+            commands_accounting::list_expense_categories,
+            commands_accounting::create_expense_category,
+            commands_accounting::delete_expense_category,
+            commands_accounting::list_incomes,
+            commands_accounting::create_income,
+            commands_accounting::list_expenses,
+            commands_accounting::create_expense,
+            commands_accounting::list_deposit_withdraws,
+            commands_accounting::create_deposit_withdraw,
+            commands_accounting::account_balances,
+            commands_accounting::account_statement,
+            commands_accounting::cash_book_history,
             commands_auth::has_permission,
             commands_auth::my_permissions,
             commands_auth::set_user_pin,
@@ -188,6 +204,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
     use crate::entities::sales::stock_movement::MovementType;
     use crate::entities::sales::{booking, combo_sale, quotation, quotation_detail, sale, sale_detail, stock_movement};
+    use crate::entities::accounting::deposit_withdraw::DepositKind;
     use crate::entities::trade::{customer, payment_method, supplier, supplier_payment};
 
     fn days_ago(n: i64) -> chrono::NaiveDateTime {
@@ -3029,6 +3046,233 @@ mod tests {
             reloaded.payments[0].payment_method_id,
             Some(qris),
             "the tender does not name the account it moved through"
+        );
+    }
+
+    /// A fresh income category, so a test does not depend on another's rows.
+    async fn income_category(db: &DatabaseConnection, name: &str) -> i32 {
+        commands_accounting::create_income_category_in(
+            db,
+            commands_accounting::CategoryInput { name: name.into(), description: None },
+        )
+        .await
+        .expect("income category")
+        .id
+    }
+
+    async fn expense_category(db: &DatabaseConnection, name: &str) -> i32 {
+        commands_accounting::create_expense_category_in(
+            db,
+            commands_accounting::CategoryInput { name: name.into(), description: None },
+        )
+        .await
+        .expect("expense category")
+        .id
+    }
+
+    async fn create_income(
+        db: &DatabaseConnection,
+        category: i32,
+        account: i32,
+        amount: Decimal,
+    ) -> i32 {
+        commands_accounting::create_income_in(
+            db,
+            commands_accounting::EntryInput {
+                category_id: category,
+                payment_method_id: account,
+                amount,
+                occurred_at: crate::migration::now().date(),
+                employee_id: None,
+                note: None,
+            },
+        )
+        .await
+        .expect("record an income")
+        .id
+    }
+
+    async fn create_expense(
+        db: &DatabaseConnection,
+        category: i32,
+        account: i32,
+        amount: Decimal,
+    ) -> i32 {
+        commands_accounting::create_expense_in(
+            db,
+            commands_accounting::EntryInput {
+                category_id: category,
+                payment_method_id: account,
+                amount,
+                occurred_at: crate::migration::now().date(),
+                employee_id: None,
+                note: None,
+            },
+        )
+        .await
+        .expect("record an expense")
+        .id
+    }
+
+    async fn balance_of(db: &DatabaseConnection, name: &str) -> Decimal {
+        commands_accounting::account_balances_in(db)
+            .await
+            .expect("balances")
+            .into_iter()
+            .find(|b| b.payment_method_name == name)
+            .unwrap_or_else(|| panic!("{name:?} is a seeded account"))
+            .balance
+    }
+
+    #[tokio::test]
+    async fn an_account_balance_is_the_signed_sum_over_what_moved_it() {
+        let db = db::init_for_tests().await;
+        let cash = tender_id(&db, "Cash").await;
+        let rent = expense_category(&db, "Rent").await;
+        let loan = income_category(&db, "Loan").await;
+
+        create_income(&db, loan, cash, Decimal::new(500_000, 3)).await;
+        create_expense(&db, rent, cash, Decimal::new(120_000, 3)).await;
+
+        assert_eq!(
+            balance_of(&db, "Cash").await,
+            Decimal::new(380_000, 3),
+            "the balance is not the signed sum of what moved the account"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_balance_counts_the_day_sales_twice_when_it_reads_both_sale_paths() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let cash = tender_id(&db, "Cash").await;
+        let rent = expense_category(&db, "Rent").await;
+
+        // A split sale: the tenders are rows, and the header names no single account.
+        sell_one_item(
+            &db,
+            item,
+            Decimal::new(30_000, 3),
+            None,
+            Some(vec![commands::PaymentLine { method: None, payment_method_id: Some(cash), amount: Decimal::new(30_000, 3), reference: None, gift_card_no: None, gift_card_pin: None }]),
+        )
+        .await
+        .expect("split sale");
+
+        create_expense(&db, rent, cash, Decimal::new(5_000, 3)).await;
+
+        assert_eq!(
+            balance_of(&db, "Cash").await,
+            Decimal::new(25_000, 3),
+            "a split sale is counted through its tender rows and again through its header"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_tender_sale_is_counted_from_its_header_and_its_promoted_draft_too() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let cash = tender_id(&db, "Cash").await;
+
+        sell_one_item(&db, item, Decimal::new(7_000, 3), None, None)
+            .await
+            .expect("counter sale");
+
+        let view = sell_one_item(&db, item, Decimal::new(11_000, 3), None, None)
+            .await
+            .expect("draft is parked");
+        commands::promote_draft_in(&db, view.sale.id, Some(Decimal::new(11_000, 3)), None, Some(cash))
+            .await
+            .expect("promotion succeeds");
+
+        assert_eq!(
+            balance_of(&db, "Cash").await,
+            Decimal::new(18_000, 3),
+            "a parked-then-completed sale is missing from the account it was paid into"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deposit_and_a_withdrawal_move_the_account_opposite_ways() {
+        let db = db::init_for_tests().await;
+        let cash = tender_id(&db, "Cash").await;
+
+        for (kind, amount) in [
+            (DepositKind::Deposit, Decimal::new(50_000, 3)),
+            (DepositKind::Withdraw, Decimal::new(20_000, 3)),
+        ] {
+            commands_accounting::create_deposit_withdraw_in(
+                &db,
+                commands_accounting::DepositWithdrawInput {
+                    kind,
+                    payment_method_id: cash,
+                    amount,
+                    occurred_at: crate::migration::now().date(),
+                    note: None,
+                },
+            )
+            .await
+            .expect("move money");
+        }
+
+        assert_eq!(
+            balance_of(&db, "Cash").await,
+            Decimal::new(30_000, 3),
+            "a deposit and a withdrawal did not leave the difference"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_supplier_payment_leaves_the_account_it_was_paid_from() {
+        let db = db::init_for_tests().await;
+        let cash = tender_id(&db, "Cash").await;
+        let now = crate::migration::now();
+        let supplier_id = supplier::ActiveModel {
+            name: Set("Acme".into()),
+            opening_balance: Set(Decimal::new(75_000, 3)),
+            del_status: Set("Live".into()),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("supplier")
+        .id;
+
+        supplier_payment::ActiveModel {
+            supplier_id: Set(supplier_id),
+            amount: Set(Decimal::new(75_000, 3)),
+            payment_method_id: Set(Some(cash)),
+            paid_at: Set(now),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("pay the supplier");
+
+        assert_eq!(
+            balance_of(&db, "Cash").await,
+            Decimal::new(-75_000, 3),
+            "money leaving the shop is not reflected in the account it left"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_income_category_in_use_cannot_be_removed() {
+        let db = db::init_for_tests().await;
+        let cash = tender_id(&db, "Cash").await;
+        let category = income_category(&db, "Grant").await;
+        create_income(&db, category, cash, Decimal::new(1_000, 3)).await;
+
+        assert!(
+            matches!(
+                commands_accounting::delete_income_category_in(&db, category).await,
+                Err(commands::CmdError::Conflict(_))
+            ),
+            "a category a posted income names was removed, breaking the audit trail"
         );
     }
 
