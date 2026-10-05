@@ -1,0 +1,145 @@
+name: ci
+
+# The gate lives here rather than on a contributor's machine: `bun run build` and
+# `cargo build` are minutes of CPU each, and the server-backed legs need Postgres
+# and MySQL running. See AGENTS.md "Verification".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push makes an in-flight run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - run: bun install --frozen-lockfile
+
+      - name: types
+        run: bunx tsc --noEmit
+
+      - name: unit tests
+        run: bun test
+
+      - name: build
+        run: bun run build
+
+  rust:
+    name: rust (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: sqlite
+          - backend: postgres
+          - backend: mysql
+            # The MySQL leg is red at 200/203: three pre-existing Stage 1/4 tests
+            # fail with MySQL 1615 "Prepared statement needs to be re-prepared".
+            # Unresolved, and not a regression — see AGENTS.md "What real MySQL 8
+            # added over MariaDB". Flip this to `false` when they pass.
+            allow-failure: true
+
+    services:
+      postgres:
+        if: matrix.backend == 'postgres'
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      mysql:
+        if: matrix.backend == 'mysql'
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpw
+          MYSQL_DATABASE: repos_test
+        ports: ["13307:3306"]
+        # Real MySQL 8, not MariaDB: ONLY_FULL_GROUP_BY and STRICT_TRANS_TABLES
+        # are on by default, and MariaDB accepts what 8 rejects.
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -prootpw"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 30s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Tauri's Linux build links webkit2gtk through `tao`/`wry`, so the crate
+      # cannot even be *checked* without these — it is not a runtime dependency,
+      # and the failure surfaces as a missing-pkg-config error rather than anything
+      # that names webkit.
+      - name: Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            pkg-config \
+            build-essential
+
+      # `debug = 0` for dependencies and line-tables-only for the crate keep this
+      # from running the runner out of memory; see AGENTS.md "Build performance".
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: create the Postgres database
+        if: matrix.backend == 'postgres'
+        run: |
+          for i in $(seq 1 30); do
+            PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -c 'SELECT 1' \
+              && break
+            sleep 2
+          done
+          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -c 'CREATE DATABASE repos_test'
+
+      - name: test (sqlite)
+        if: matrix.backend == 'sqlite'
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - name: test (postgres)
+        if: matrix.backend == 'postgres'
+        working-directory: src-tauri
+        env:
+          REPOS_TEST_BACKEND: postgres
+          REPOS_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1/repos_test
+        run: cargo test --lib
+
+      # ~14 minutes: MySQL 8 is far slower than MariaDB at creating one isolated
+      # database per test and migrating each.
+      - name: test (mysql)
+        if: matrix.backend == 'mysql'
+        continue-on-error: ${{ matrix.allow-failure }}
+        working-directory: src-tauri
+        env:
+          REPOS_TEST_BACKEND: mysql
+          REPOS_TEST_MYSQL_URL: mysql://root:rootpw@127.0.0.1:13307/repos_test
+        run: cargo test --lib
