@@ -59,8 +59,22 @@ impl From<Model> for UserView {
 pub enum Relation {
     #[sea_orm(has_many = "super::user_roles::Entity")]
     UserRoles,
+    #[sea_orm(has_many = "crate::entities::accounting::income::Entity")]
+    Income,
+    #[sea_orm(has_many = "crate::entities::accounting::expense::Entity")]
+    Expense,
 }
 
+impl Related<crate::entities::accounting::income::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Income.def()
+    }
+}
 
+impl Related<crate::entities::accounting::expense::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Expense.def()
+    }
+}
 
 impl ActiveModelBehavior for ActiveModel {}

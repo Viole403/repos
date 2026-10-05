@@ -56,6 +56,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::FixedAssets),
             Box::new(Migrations::LoyaltyPointsWidth),
             Box::new(Migrations::Purchases),
+            Box::new(Migrations::Accounting),
         ]
     }
 }
@@ -93,6 +94,7 @@ pub enum Migrations {
     FixedAssets,
     LoyaltyPointsWidth,
     Purchases,
+    Accounting,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -182,6 +184,7 @@ impl MigrationName for Migrations {
         Migrations::FixedAssets => "fixed_assets",
         Migrations::LoyaltyPointsWidth => "loyalty_points_width",
         Migrations::Purchases => "purchases",
+        Migrations::Accounting => "accounting",
         }
     }
 }
@@ -221,6 +224,7 @@ impl MigrationTrait for Migrations {
             Migrations::FixedAssets => fixed_assets(manager).await?,
             Migrations::LoyaltyPointsWidth => loyalty_points_width(manager).await?,
             Migrations::Purchases => purchases(manager).await?,
+            Migrations::Accounting => accounting(manager).await?,
         }
         Ok(())
     }
@@ -228,6 +232,30 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::Accounting => {
+                let tables: [DynIden; 5] = [
+                    DepositWithdraws::Table.into_iden(),
+                    Expenses::Table.into_iden(),
+                    Incomes::Table.into_iden(),
+                    ExpenseCategories::Table.into_iden(),
+                    IncomeCategories::Table.into_iden(),
+                ];
+                for table in tables {
+                    manager
+                        .drop_table(Table::drop().table(table).if_exists().to_owned())
+                        .await?;
+                }
+                let conn = manager.get_connection();
+                for name in ACCOUNTING_PERMISSIONS {
+                    let row = permissions::Entity::find()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .one(conn)
+                        .await?;
+                    if let Some(row) = row {
+                        permissions::Entity::delete_by_id(row.id).exec(conn).await?;
+                    }
+                }
+            }
             Migrations::Purchases => {
                 let tables: [DynIden; 5] = [
                     PurchaseReturnDetails::Table.into_iden(),
@@ -2411,6 +2439,265 @@ async fn purchases(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// Stage 7 — the cash book: income, expense, and the owner's deposits and withdrawals.
+///
+/// Three tables rather than one with a `direction` column, because the three answer
+/// different questions. **Income** is the shop earning outside trading, **expense** is
+/// it spending outside purchases, and a **deposit/withdrawal** is the owner moving
+/// money into or out of a tender — which changes what the drawer holds without
+/// changing what the shop earned. One table with a sign would make a float top-up read
+/// as revenue and every profit figure built on it wrong.
+///
+/// `payment_methods` is not created here: Stage 6 made it, and a tender is the same
+/// vocabulary whichever of these is posted against it.
+///
+/// **Nothing here stores a balance.** What a tender holds is the signed sum over these
+/// rows, derived — a stored balance is a read-modify-write, the same reason stock is a
+/// ledger and customer balances are derived.
+async fn accounting(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
+    // `name` is not unique, matching units, brands and categories: "Rent" and "rent"
+    // are the same expense and a case-sensitive constraint would refuse one of them.
+    manager
+        .create_table(
+            Table::create()
+                .table(IncomeCategories::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(IncomeCategories::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(IncomeCategories::Name).string().not_null())
+                .col(ColumnDef::new(IncomeCategories::Description).string().null())
+                .col(ColumnDef::new(IncomeCategories::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(IncomeCategories::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(ExpenseCategories::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(ExpenseCategories::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(ExpenseCategories::Name).string().not_null())
+                .col(ColumnDef::new(ExpenseCategories::Description).string().null())
+                .col(ColumnDef::new(ExpenseCategories::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(ExpenseCategories::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(Incomes::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Incomes::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(Incomes::ReferenceNo).string().not_null())
+                .col(ColumnDef::new(Incomes::IncomeCategoryId).integer().not_null())
+                .col(ColumnDef::new(Incomes::PaymentMethodId).integer().not_null())
+                // Who the money belongs to when that is not the account posting it.
+                .col(ColumnDef::new(Incomes::EmployeeId).integer().null())
+                .col(ColumnDef::new(Incomes::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(Incomes::OccurredAt).date().not_null())
+                .col(ColumnDef::new(Incomes::Note).string().null())
+                .col(ColumnDef::new(Incomes::CreatedBy).integer().null())
+                .col(ColumnDef::new(Incomes::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(Incomes::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Incomes::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                // Restrict on both targets: a category that has been posted against is
+                // part of a posted cash-book line, and a tender is the thing the
+                // balance is grouped by.
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_incomes_category")
+                        .from(Incomes::Table, Incomes::IncomeCategoryId)
+                        .to(IncomeCategories::Table, IncomeCategories::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_incomes_payment_method")
+                        .from(Incomes::Table, Incomes::PaymentMethodId)
+                        .to(PaymentMethods::Table, PaymentMethods::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                // SetNull rather than Cascade: a posted line does not stop being true
+                // because the person it named left. Deleting an account is a
+                // soft-delete, so this only fires on a hard delete.
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_incomes_employee")
+                        .from(Incomes::Table, Incomes::EmployeeId)
+                        .to(Users::Table, Users::Id)
+                        .on_delete(ForeignKeyAction::SetNull)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_incomes_category_id")
+                .table(Incomes::Table)
+                .col(Incomes::IncomeCategoryId)
+                .to_owned(),
+        )
+        .await?;
+
+    // The cash book is read per tender, so that is the index an account statement
+    // actually uses.
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_incomes_payment_method_id")
+                .table(Incomes::Table)
+                .col(Incomes::PaymentMethodId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(Expenses::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Expenses::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(Expenses::ReferenceNo).string().not_null())
+                .col(ColumnDef::new(Expenses::ExpenseCategoryId).integer().not_null())
+                .col(ColumnDef::new(Expenses::PaymentMethodId).integer().not_null())
+                .col(ColumnDef::new(Expenses::EmployeeId).integer().null())
+                .col(ColumnDef::new(Expenses::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(Expenses::OccurredAt).date().not_null())
+                .col(ColumnDef::new(Expenses::Note).string().null())
+                .col(ColumnDef::new(Expenses::CreatedBy).integer().null())
+                .col(ColumnDef::new(Expenses::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(Expenses::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Expenses::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_expenses_category")
+                        .from(Expenses::Table, Expenses::ExpenseCategoryId)
+                        .to(ExpenseCategories::Table, ExpenseCategories::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_expenses_payment_method")
+                        .from(Expenses::Table, Expenses::PaymentMethodId)
+                        .to(PaymentMethods::Table, PaymentMethods::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_expenses_employee")
+                        .from(Expenses::Table, Expenses::EmployeeId)
+                        .to(Users::Table, Users::Id)
+                        .on_delete(ForeignKeyAction::SetNull)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_expenses_category_id")
+                .table(Expenses::Table)
+                .col(Expenses::ExpenseCategoryId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_expenses_payment_method_id")
+                .table(Expenses::Table)
+                .col(Expenses::PaymentMethodId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(DepositWithdraws::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(DepositWithdraws::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(DepositWithdraws::ReferenceNo).string().not_null())
+                // Not optional: the whole point of the row is that *this* tender moved.
+                .col(ColumnDef::new(DepositWithdraws::PaymentMethodId).integer().not_null())
+                // `Deposit` or `Withdraw`, so a report groups without matching strings.
+                .col(ColumnDef::new(DepositWithdraws::Kind).string().not_null())
+                .col(ColumnDef::new(DepositWithdraws::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(DepositWithdraws::OccurredAt).date().not_null())
+                .col(ColumnDef::new(DepositWithdraws::Note).string().null())
+                .col(ColumnDef::new(DepositWithdraws::CreatedBy).integer().null())
+                .col(ColumnDef::new(DepositWithdraws::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(DepositWithdraws::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(DepositWithdraws::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_deposit_withdraws_payment_method")
+                        .from(DepositWithdraws::Table, DepositWithdraws::PaymentMethodId)
+                        .to(PaymentMethods::Table, PaymentMethods::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_deposit_withdraws_payment_method_id")
+                .table(DepositWithdraws::Table)
+                .col(DepositWithdraws::PaymentMethodId)
+                .to_owned(),
+        )
+        .await?;
+
+    let conn = manager.get_connection();
+    let now = now();
+    for name in ACCOUNTING_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        let group = name.split_once('-').map(|(g, _)| g).unwrap_or("accounting");
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set(group.to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+
+    Ok(())
+}
+
 async fn fixed_assets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let ts = timestamp_type(manager.get_database_backend());
 
@@ -3494,11 +3781,92 @@ const PURCHASE_PERMISSIONS: &[&str] = &[
 ];
 
 /// Permissions this migration owns, for the down arm above.
+const ACCOUNTING_PERMISSIONS: &[&str] = &[
+    "income-list",
+    "income-create",
+    "income-show",
+    "expense-list",
+    "expense-create",
+    "expense-show",
+    "deposit-withdraw-list",
+    "deposit-withdraw-create",
+];
+
 const CREDIT_NOTE_PERMISSIONS: &[&str] = &[
     "creditnote-list",
     "creditnote-issue",
     "creditnote-show",
 ];
+
+#[derive(Iden)]
+enum IncomeCategories {
+    Table,
+    Id,
+    Name,
+    Description,
+    DelStatus,
+    CreatedAt,
+}
+
+#[derive(Iden)]
+enum Incomes {
+    Table,
+    Id,
+    ReferenceNo,
+    IncomeCategoryId,
+    PaymentMethodId,
+    EmployeeId,
+    Amount,
+    OccurredAt,
+    Note,
+    CreatedBy,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum ExpenseCategories {
+    Table,
+    Id,
+    Name,
+    Description,
+    DelStatus,
+    CreatedAt,
+}
+
+#[derive(Iden)]
+enum Expenses {
+    Table,
+    Id,
+    ReferenceNo,
+    ExpenseCategoryId,
+    PaymentMethodId,
+    EmployeeId,
+    Amount,
+    OccurredAt,
+    Note,
+    CreatedBy,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum DepositWithdraws {
+    Table,
+    Id,
+    ReferenceNo,
+    PaymentMethodId,
+    Kind,
+    Amount,
+    OccurredAt,
+    Note,
+    CreatedBy,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
 
 #[derive(Iden)]
 enum LoyaltyEntries {

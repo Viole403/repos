@@ -54,11 +54,35 @@ pub enum Relation {
         to = "crate::entities::trade::supplier_payment::Column::PaymentMethodId"
     )]
     SupplierPayment,
+    #[sea_orm(has_many = "crate::entities::accounting::income::Entity")]
+    Income,
+    #[sea_orm(has_many = "crate::entities::accounting::expense::Entity")]
+    Expense,
+    #[sea_orm(has_many = "crate::entities::accounting::deposit_withdraw::Entity")]
+    DepositWithdraw,
 }
 
 impl Related<crate::entities::trade::supplier_payment::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SupplierPayment.def()
+    }
+}
+
+impl Related<crate::entities::accounting::income::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Income.def()
+    }
+}
+
+impl Related<crate::entities::accounting::expense::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Expense.def()
+    }
+}
+
+impl Related<crate::entities::accounting::deposit_withdraw::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::DepositWithdraw.def()
     }
 }
 
