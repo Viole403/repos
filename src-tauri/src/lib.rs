@@ -180,6 +180,11 @@ pub fn run() {
             commands_accounting::account_balances,
             commands_accounting::account_statement,
             commands_accounting::cash_book_history,
+            commands_accounting::list_recurring_expenses,
+            commands_accounting::create_recurring_expense,
+            commands_accounting::update_recurring_expense,
+            commands_accounting::delete_recurring_expense,
+            commands_accounting::post_due_recurring_expenses,
             commands_auth::has_permission,
             commands_auth::my_permissions,
             commands_auth::set_user_pin,
@@ -205,6 +210,7 @@ mod tests {
     use crate::entities::sales::stock_movement::MovementType;
     use crate::entities::sales::{booking, combo_sale, quotation, quotation_detail, sale, sale_detail, stock_movement};
     use crate::entities::accounting::deposit_withdraw::DepositKind;
+    use crate::entities::accounting::expense_recurring::Rotation;
     use crate::entities::trade::{customer, payment_method, supplier, supplier_payment};
 
     fn days_ago(n: i64) -> chrono::NaiveDateTime {
@@ -3257,6 +3263,177 @@ mod tests {
             balance_of(&db, "Cash").await,
             Decimal::new(-75_000, 3),
             "money leaving the shop is not reflected in the account it left"
+        );
+    }
+
+    fn date(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).expect("a real date")
+    }
+
+    #[test]
+    fn a_monthly_rotation_keeps_its_day_of_month_and_clamps_a_short_one() {
+        let monthly = Rotation::Monthly;
+        assert_eq!(monthly.advance(date(2026, 1, 31)), Some(date(2026, 2, 28)));
+        assert_eq!(monthly.advance(date(2026, 1, 15)), Some(date(2026, 2, 15)));
+        // From the 28th of a short February it goes to the 31st of March, not the 28th
+        // for ever — the clamp must not become a permanent shortening.
+        assert_eq!(monthly.advance(date(2026, 2, 28)), Some(date(2026, 3, 28)));
+        assert_eq!(monthly.advance(date(2024, 2, 29)), Some(date(2024, 3, 29)));
+        assert_eq!(monthly.advance(date(2026, 12, 15)), Some(date(2027, 1, 15)));
+    }
+
+    #[test]
+    fn a_yearly_rotation_on_a_leap_day_lands_on_the_28th() {
+        assert_eq!(Rotation::Yearly.advance(date(2024, 2, 29)), Some(date(2025, 2, 28)));
+    }
+
+    #[test]
+    fn a_weekly_and_bi_weekly_rotation_count_days_not_months() {
+        assert_eq!(Rotation::Weekly.advance(date(2026, 1, 28)), Some(date(2026, 2, 4)));
+        assert_eq!(Rotation::BiWeekly.advance(date(2026, 12, 30)), Some(date(2027, 1, 13)));
+    }
+
+    async fn schedule(
+        db: &DatabaseConnection,
+        name: &str,
+        rotation: &str,
+        amount: Decimal,
+        post_now: Option<bool>,
+    ) -> commands_accounting::RecurringView {
+        let cash = tender_id(db, "Cash").await;
+        let rent = expense_category(db, &format!("{name} category")).await;
+        commands_accounting::create_recurring_expense_in(
+            db,
+            commands_accounting::RecurringInput {
+                expense_category_id: rent,
+                name: name.into(),
+                amount,
+                payment_method_id: cash,
+                rotation: rotation.into(),
+                starts_on: crate::migration::now().date(),
+                ends_on: None,
+                note: None,
+                post_now,
+            },
+        )
+        .await
+        .expect("create the schedule")
+    }
+
+    #[tokio::test]
+    async fn posting_a_schedule_writes_a_real_expense_the_cash_book_can_see() {
+        let db = db::init_for_tests().await;
+        let created = schedule(&db, "Rent", "Monthly", Decimal::new(1_000_000, 3), None).await;
+        assert_eq!(created.posted_count, 0, "a schedule posts when it is run, not when it is created");
+
+        let run = commands_accounting::post_due_recurring_expenses_in(&db, None)
+            .await
+            .expect("run the schedules");
+        assert_eq!(run.posted, 1, "the due schedule did not post");
+        assert!(run.failed.is_empty(), "nothing should have failed: {:?}", run.failed);
+
+        assert_eq!(
+            balance_of(&db, "Cash").await,
+            Decimal::new(-1_000_000, 3),
+            "a posted schedule is not visible in the account it was posted against"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schedule_that_already_posted_is_not_posted_again_by_the_next_run() {
+        let db = db::init_for_tests().await;
+        schedule(&db, "Rent", "Monthly", Decimal::new(1_000_000, 3), None).await;
+
+        commands_accounting::post_due_recurring_expenses_in(&db, None).await.expect("first run");
+        let second = commands_accounting::post_due_recurring_expenses_in(&db, None)
+            .await
+            .expect("second run");
+
+        assert_eq!(second.posted, 0, "a monthly schedule posted twice on one day");
+        assert_eq!(
+            balance_of(&db, "Cash").await,
+            Decimal::new(-1_000_000, 3),
+            "the second run wrote another expense"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schedule_missed_three_months_catches_up_one_entry_per_month() {
+        let db = db::init_for_tests().await;
+        let cash = tender_id(&db, "Cash").await;
+        let rent = expense_category(&db, "Backdated Rent").await;
+        let created = commands_accounting::create_recurring_expense_in(
+            &db,
+            commands_accounting::RecurringInput {
+                expense_category_id: rent,
+                name: "Rent".into(),
+                amount: Decimal::new(100_000, 3),
+                payment_method_id: cash,
+                rotation: "Monthly".into(),
+                // A start date in the past, clamped so creation does not retro-post.
+                starts_on: date(2020, 1, 1),
+                ends_on: None,
+                note: None,
+                post_now: None,
+            },
+        )
+        .await
+        .expect("create");
+        assert_eq!(created.posted_count, 0, "creating a schedule posted history it had missed");
+
+        // Three months after its own start, not after today.
+        let run = commands_accounting::post_due_recurring_expenses_in(&db, Some(date(2020, 3, 31)))
+            .await
+            .expect("run");
+        assert_eq!(run.posted, 3, "expected January, February and March, got {}", run.posted);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_that_ends_does_not_post_past_its_end() {
+        let db = db::init_for_tests().await;
+        let cash = tender_id(&db, "Cash").await;
+        let rent = expense_category(&db, "Trial subscription").await;
+        commands_accounting::create_recurring_expense_in(
+            &db,
+            commands_accounting::RecurringInput {
+                expense_category_id: rent,
+                name: "Trial".into(),
+                amount: Decimal::new(50_000, 3),
+                payment_method_id: cash,
+                rotation: "Monthly".into(),
+                starts_on: date(2026, 1, 1),
+                ends_on: Some(date(2026, 2, 28)),
+                note: None,
+                post_now: None,
+            },
+        )
+        .await
+        .expect("create");
+
+        let run = commands_accounting::post_due_recurring_expenses_in(&db, Some(date(2026, 6, 30)))
+            .await
+            .expect("run");
+        assert_eq!(run.posted, 2, "a schedule posted past its own end date");
+    }
+
+    #[tokio::test]
+    async fn stopping_a_schedule_keeps_the_expenses_it_already_posted() {
+        let db = db::init_for_tests().await;
+        let created = schedule(&db, "Rent", "Monthly", Decimal::new(1_000_000, 3), None).await;
+        commands_accounting::post_due_recurring_expenses_in(&db, None).await.expect("run");
+        commands_accounting::delete_recurring_expense_in(&db, created.id)
+            .await
+            .expect("stop the schedule");
+
+        let after = commands_accounting::post_due_recurring_expenses_in(&db, None)
+            .await
+            .expect("run after stopping");
+        assert_eq!(after.posted, 0, "a stopped schedule kept posting");
+
+        assert_eq!(
+            balance_of(&db, "Cash").await,
+            Decimal::new(-1_000_000, 3),
+            "stopping a schedule removed the expense it had posted"
         );
     }
 

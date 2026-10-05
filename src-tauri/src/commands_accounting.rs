@@ -29,8 +29,9 @@ use crate::commands::{
 use crate::commands_auth::require_permission;
 use crate::db::db;
 use crate::entities::accounting::deposit_withdraw::DepositKind;
+use crate::entities::accounting::expense_recurring::Rotation;
 use crate::entities::accounting::{
-    deposit_withdraw, expense, expense_category, income, income_category,
+    deposit_withdraw, expense, expense_category, expense_recurring, income, income_category,
 };
 use crate::entities::auth::users;
 use crate::entities::sales::{sale, sale_payment};
@@ -1060,4 +1061,472 @@ pub(crate) async fn cash_book_history_in<C: ConnectionTrait>(
     to: Option<chrono::NaiveDate>,
 ) -> CmdResult<Vec<CashBookLine>> {
     lines_in(conn, None, from, to).await
+}
+
+// ---------------------------------------------------------------------------
+// Recurring expenses — a schedule proposes, the expense posts
+// ---------------------------------------------------------------------------
+
+/// Dates a rotation arithmetic gets wrong, in the order they bite.
+fn rotation_of(raw: &str) -> CmdResult<Rotation> {
+    match raw {
+        "Daily" => Ok(Rotation::Daily),
+        "Weekly" => Ok(Rotation::Weekly),
+        "BiWeekly" => Ok(Rotation::BiWeekly),
+        "Monthly" => Ok(Rotation::Monthly),
+        "Quarterly" => Ok(Rotation::Quarterly),
+        "Yearly" => Ok(Rotation::Yearly),
+        other => Err(CmdError::Validation(format!(
+            "{other:?} is not a rotation — daily, weekly, bi-weekly, monthly, quarterly or yearly"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecurringInput {
+    pub expense_category_id: i32,
+    pub name: String,
+    pub amount: Decimal,
+    pub payment_method_id: i32,
+    pub rotation: String,
+    pub starts_on: chrono::NaiveDate,
+    #[serde(default)]
+    pub ends_on: Option<chrono::NaiveDate>,
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Post the first entry now rather than waiting for the due date.
+    #[serde(default)]
+    pub post_now: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecurringView {
+    pub id: i32,
+    pub expense_category_id: i32,
+    pub expense_category_name: String,
+    pub name: String,
+    pub amount: Decimal,
+    pub payment_method_id: i32,
+    pub payment_method_name: String,
+    pub rotation: String,
+    pub starts_on: chrono::NaiveDate,
+    pub next_due_on: Option<chrono::NaiveDate>,
+    pub ends_on: Option<chrono::NaiveDate>,
+    pub note: Option<String>,
+    /// How many times it has actually posted, so a screen can show a schedule at work.
+    pub posted_count: u64,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+/// What one posting run did, so an operator can see what was written rather than
+/// guessing from a date.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostingRun {
+    pub posted: u64,
+    /// Schedule names that were due and could not be written. A partial run is not a
+    /// silent one — an expense that failed must be visible, not rolled back into a
+    /// count that looks smaller.
+    pub failed: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn list_recurring_expenses(query: PageQuery) -> CmdResult<Page<RecurringView>> {
+    require_permission(db(), "recurring-expense-list").await?;
+    list_recurring_expenses_in(db(), query).await
+}
+
+pub(crate) async fn list_recurring_expenses_in<C: ConnectionTrait>(
+    conn: &C,
+    query: PageQuery,
+) -> CmdResult<Page<RecurringView>> {
+    let mut q = expense_recurring::Entity::find()
+        .filter(expense_recurring::Column::DelStatus.eq(LIVE));
+    if let Some(term) = query.term() {
+        let like = like_term(&term);
+        q = q.filter(
+            sea_orm::sea_query::Condition::any()
+                .add(contains_ci(expense_recurring::Column::Name, &like))
+                .add(contains_ci(expense_recurring::Column::Rotation, &like)),
+        );
+    }
+    let total = q.clone().count(conn).await?;
+    let rows = q
+        .order_by_asc(expense_recurring::Column::Name)
+        .order_by_asc(expense_recurring::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+
+    let accounts = account_names(conn, &rows.iter().map(|r| r.payment_method_id).collect::<Vec<_>>()).await?;
+    let category_ids: Vec<i32> = rows.iter().map(|r| r.expense_category_id).collect();
+    let categories: HashMap<i32, String> = expense_category::Entity::find()
+        .filter(expense_category::Column::Id.is_in(category_ids))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|c| (c.id, c.name))
+        .collect();
+
+    // One grouped count rather than one query per row.
+    let schedule_ids: Vec<i32> = rows.iter().map(|r| r.id).collect();
+    let mut posted: HashMap<i32, i64> = HashMap::new();
+    if !schedule_ids.is_empty() {
+        let counts: Vec<(Option<i32>, i64)> = expense::Entity::find()
+            .select_only()
+            .column(expense::Column::RecurringExpenseId)
+            .column_as(expense::Column::Id.count(), "total")
+            .filter(expense::Column::RecurringExpenseId.is_in(schedule_ids))
+            .group_by(expense::Column::RecurringExpenseId)
+            .into_tuple()
+            .all(conn)
+            .await?;
+        for (id, total) in counts {
+            if let Some(id) = id {
+                posted.insert(id, total);
+            }
+        }
+    }
+
+    let views = rows
+        .into_iter()
+        .map(|r| RecurringView {
+            expense_category_name: categories.get(&r.expense_category_id).cloned().unwrap_or_default(),
+            payment_method_name: account_name(&accounts, r.payment_method_id),
+            posted_count: posted.get(&r.id).copied().unwrap_or(0) as u64,
+            id: r.id,
+            expense_category_id: r.expense_category_id,
+            name: r.name,
+            amount: r.amount,
+            payment_method_id: r.payment_method_id,
+            rotation: r.rotation,
+            starts_on: r.starts_on,
+            next_due_on: r.next_due_on,
+            ends_on: r.ends_on,
+            note: r.note,
+            created_at: r.created_at,
+        })
+        .collect();
+    Ok(Page::new(views, total, &query))
+}
+
+/// Writes the expense rows a run is owed, without moving any schedule's clock. Kept
+/// separate from the advance so a test can post a schedule without a date dependency.
+async fn post_schedule_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    schedule: &expense_recurring::Model,
+    dates: &[chrono::NaiveDate],
+) -> CmdResult<Vec<expense::Model>> {
+    let now = crate::migration::now();
+    let mut written = Vec::with_capacity(dates.len());
+    for occurred_at in dates {
+        let inserted = expense::ActiveModel {
+            reference_no: Set(String::new()),
+            expense_category_id: Set(schedule.expense_category_id),
+            payment_method_id: Set(schedule.payment_method_id),
+            amount: Set(schedule.amount),
+            occurred_at: Set(*occurred_at),
+            note: Set(text(schedule.note.clone())),
+            recurring_expense_id: Set(Some(schedule.id)),
+            created_by: Set(crate::auth::current_user_id()),
+            del_status: Set(LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+
+        let reference_no = format!("EXP-{:06}", inserted.id);
+        let mut header: expense::ActiveModel = inserted.into();
+        header.reference_no = Set(reference_no);
+        written.push(header.update(conn).await?);
+    }
+    Ok(written)
+}
+
+#[tauri::command]
+pub async fn create_recurring_expense(input: RecurringInput) -> CmdResult<RecurringView> {
+    require_permission(db(), "recurring-expense-create").await?;
+    create_recurring_expense_in(db(), input).await
+}
+
+pub(crate) async fn create_recurring_expense_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    input: RecurringInput,
+) -> CmdResult<RecurringView> {
+    let amount = positive(input.amount, "amount")?;
+    let rotation = rotation_of(input.rotation.trim())?;
+    if let Some(ends_on) = input.ends_on {
+        if ends_on < input.starts_on {
+            return Err(CmdError::Validation(
+                "a schedule cannot end before it starts".into(),
+            ));
+        }
+    }
+
+    let txn = conn.begin().await?;
+    expense_category::Entity::find_by_id(input.expense_category_id)
+        .filter(expense_category::Column::DelStatus.eq(LIVE))
+        .one(&txn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("expense category".into()))?;
+    account_is_live(&txn, input.payment_method_id).await?;
+
+
+    let now = crate::migration::now();
+    let inserted = expense_recurring::ActiveModel {
+        expense_category_id: Set(input.expense_category_id),
+        name: Set(required_name(&input.name)?),
+        amount: Set(amount),
+        payment_method_id: Set(input.payment_method_id),
+        rotation: Set(rotation.as_str().to_owned()),
+        starts_on: Set(input.starts_on),
+        // Clamped to today. A schedule created with a start date in the past must not
+        // post a year of rent on its first run — a run catches up a schedule that was
+        // *missed*, which is different from one that was created late.
+        next_due_on: Set(Some(crate::migration::now().date().max(input.starts_on))),
+        ends_on: Set(input.ends_on),
+        note: Set(text(input.note)),
+        created_by: Set(crate::auth::current_user_id()),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
+
+    let today = crate::migration::now().date();
+    let posted_count = if input.post_now.unwrap_or(false) {
+        post_schedule_in(&txn, &inserted, &[today]).await?.len()
+    } else {
+        0
+    };
+    let mut row: expense_recurring::ActiveModel = inserted.into();
+    if posted_count > 0 {
+        // Advance past what was just posted, so a daily schedule created today does not
+        // post again on the next run.
+        row.next_due_on = Set(rotation.advance(today));
+    }
+    let saved = row.update(&txn).await?;
+    txn.commit().await?;
+
+    Ok(recurring_view(saved, String::new(), String::new(), posted_count as u64))
+}
+
+fn recurring_view(
+    r: expense_recurring::Model,
+    category_name: String,
+    account: String,
+    posted_count: u64,
+) -> RecurringView {
+    RecurringView {
+        id: r.id,
+        expense_category_id: r.expense_category_id,
+        expense_category_name: category_name,
+        name: r.name,
+        amount: r.amount,
+        payment_method_id: r.payment_method_id,
+        payment_method_name: account,
+        rotation: r.rotation,
+        starts_on: r.starts_on,
+        next_due_on: r.next_due_on,
+        ends_on: r.ends_on,
+        note: r.note,
+        posted_count,
+        created_at: r.created_at,
+    }
+}
+
+#[tauri::command]
+pub async fn update_recurring_expense(id: i32, input: RecurringInput) -> CmdResult<RecurringView> {
+    require_permission(db(), "recurring-expense-edit").await?;
+    update_recurring_expense_in(db(), id, input).await
+}
+
+pub(crate) async fn update_recurring_expense_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+    input: RecurringInput,
+) -> CmdResult<RecurringView> {
+    let amount = positive(input.amount, "amount")?;
+    let rotation = rotation_of(input.rotation.trim())?;
+    if let Some(ends_on) = input.ends_on {
+        if ends_on < input.starts_on {
+            return Err(CmdError::Validation("a schedule cannot end before it starts".into()));
+        }
+    }
+
+    let existing = expense_recurring::Entity::find_by_id(id)
+        .filter(expense_recurring::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("recurring expense".into()))?;
+
+    expense_category::Entity::find_by_id(input.expense_category_id)
+        .filter(expense_category::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("expense category".into()))?;
+    account_is_live(conn, input.payment_method_id).await?;
+
+    // An already-stopped schedule stays stopped: null means "nothing is scheduled", and
+    // an edit is not a request to start it again.
+    let still_due = match existing.next_due_on {
+        Some(due) => Some(due.max(input.starts_on)),
+        None => None,
+    };
+
+    let now = crate::migration::now();
+    let mut row: expense_recurring::ActiveModel = existing.into();
+    row.expense_category_id = Set(input.expense_category_id);
+    row.name = Set(required_name(&input.name)?);
+    row.amount = Set(amount);
+    row.payment_method_id = Set(input.payment_method_id);
+    row.rotation = Set(rotation.as_str().to_owned());
+    row.starts_on = Set(input.starts_on);
+    row.ends_on = Set(input.ends_on);
+    row.note = Set(text(input.note));
+    row.next_due_on = Set(still_due);
+    row.updated_at = Set(now);
+    let saved = row.update(conn).await?;
+
+    let categories = expense_category::Entity::find_by_id(saved.expense_category_id)
+        .one(conn)
+        .await?
+        .map(|c| c.name)
+        .unwrap_or_default();
+    let accounts = account_names(conn, &[saved.payment_method_id]).await?;
+    let account = account_name(&accounts, saved.payment_method_id);
+    let posted = expense::Entity::find()
+        .filter(expense::Column::RecurringExpenseId.eq(saved.id))
+        .count(conn)
+        .await?;
+    Ok(recurring_view(saved, categories, account, posted))
+}
+
+#[tauri::command]
+pub async fn delete_recurring_expense(id: i32) -> CmdResult<()> {
+    require_permission(db(), "recurring-expense-delete").await?;
+    delete_recurring_expense_in(db(), id).await
+}
+
+pub(crate) async fn delete_recurring_expense_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+) -> CmdResult<()> {
+    let mut row: expense_recurring::ActiveModel = expense_recurring::Entity::find_by_id(id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("recurring expense".into()))?
+        .into();
+    // A soft delete, not a hard one: the expenses it posted keep naming it, and
+    // `SetNull` only helps on a delete that removes the row outright.
+    row.del_status = Set(DELETED.to_owned());
+    row.updated_at = Set(crate::migration::now());
+    row.update(conn).await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn post_due_recurring_expenses(as_of: Option<chrono::NaiveDate>) -> CmdResult<PostingRun> {
+    require_permission(db(), "recurring-expense-post").await?;
+    post_due_recurring_expenses_in(db(), as_of).await
+}
+
+/// Posts every live schedule that is due on or before `as_of`.
+///
+/// One transaction per schedule, not one for the run: a schedule that cannot post — a
+/// category deleted out from under it — must not roll back the twelve that already did.
+/// The failures are returned by name rather than swallowed.
+pub(crate) async fn post_due_recurring_expenses_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    as_of: Option<chrono::NaiveDate>,
+) -> CmdResult<PostingRun> {
+    let today = as_of.unwrap_or_else(|| crate::migration::now().date());
+
+    let due: Vec<expense_recurring::Model> = expense_recurring::Entity::find()
+        .filter(expense_recurring::Column::DelStatus.eq(LIVE))
+        .filter(expense_recurring::Column::NextDueOn.lte(today))
+        .order_by_asc(expense_recurring::Column::NextDueOn)
+        .all(conn)
+        .await?;
+
+    let mut posted = 0u64;
+    let mut failed = Vec::new();
+
+    for schedule in due {
+        let Ok(rotation) = rotation_of(&schedule.rotation) else {
+            failed.push(schedule.name.clone());
+            continue;
+        };
+        // Every date from the current due date up to the run date, so a schedule left
+        // unposted for three months catches up rather than collapsing to one entry.
+        let mut dates = Vec::new();
+        let mut cursor = schedule.next_due_on;
+        while let Some(day) = cursor {
+            if day > today {
+                break;
+            }
+            if schedule.ends_on.is_some_and(|last| day > last) {
+                break;
+            }
+            dates.push(day);
+            match rotation.advance(day) {
+                Some(next) if next > day => cursor = Some(next),
+                // A rotation that cannot advance has run past the end of the calendar;
+                // stop it rather than spin.
+                _ => {
+                    cursor = None;
+                    break;
+                }
+            }
+            if dates.len() > 1000 {
+                break;
+            }
+        }
+
+        let txn = match conn.begin().await {
+            Ok(txn) => txn,
+            Err(_) => {
+                failed.push(schedule.name.clone());
+                continue;
+            }
+        };
+        match post_schedule_in(&txn, &schedule, &dates).await {
+            Ok(rows) => {
+                let count = rows.len();
+                // Advance to the first date still due, or past the run date when the
+                // schedule is caught up.
+                let next_due = cursor.filter(|d| *d <= today).or(if dates.is_empty() {
+                    Some(today)
+                } else {
+                    None
+                });
+                let mut row: expense_recurring::ActiveModel = schedule.clone().into();
+                row.next_due_on = Set(next_due);
+                row.updated_at = Set(crate::migration::now());
+                if row.update(&txn).await.is_err() {
+                    let _ = txn.rollback().await;
+                    failed.push(schedule.name.clone());
+                    continue;
+                }
+                if txn.commit().await.is_err() {
+                    failed.push(schedule.name.clone());
+                    continue;
+                }
+                posted += count as u64;
+            }
+            Err(_) => {
+                let _ = txn.rollback().await;
+                failed.push(schedule.name.clone());
+            }
+        }
+    }
+
+    Ok(PostingRun { posted, failed })
 }
