@@ -11,7 +11,7 @@ use chrono::NaiveDateTime;
 use sea_orm_migration::prelude::*;
 
 // Schema builder types re-exported by sea-orm-migration's prelude.
-use sea_orm::sea_query::{ColumnDef, ForeignKey, ForeignKeyAction, Index, Table};
+use sea_orm::sea_query::{ColumnDef, ForeignKey, ForeignKeyAction, Index, Table, TableForeignKey};
 
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbBackend, EntityTrait, QueryFilter};
 
@@ -55,6 +55,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::ItemBatches),
             Box::new(Migrations::FixedAssets),
             Box::new(Migrations::LoyaltyPointsWidth),
+            Box::new(Migrations::Purchases),
         ]
     }
 }
@@ -91,6 +92,7 @@ pub enum Migrations {
     ItemBatches,
     FixedAssets,
     LoyaltyPointsWidth,
+    Purchases,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -179,6 +181,7 @@ impl MigrationName for Migrations {
         Migrations::ItemBatches => "item_batches",
         Migrations::FixedAssets => "fixed_assets",
         Migrations::LoyaltyPointsWidth => "loyalty_points_width",
+        Migrations::Purchases => "purchases",
         }
     }
 }
@@ -217,6 +220,7 @@ impl MigrationTrait for Migrations {
             Migrations::ItemBatches => item_batches(manager).await?,
             Migrations::FixedAssets => fixed_assets(manager).await?,
             Migrations::LoyaltyPointsWidth => loyalty_points_width(manager).await?,
+            Migrations::Purchases => purchases(manager).await?,
         }
         Ok(())
     }
@@ -224,6 +228,38 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::Purchases => {
+                let tables: [DynIden; 5] = [
+                    PurchaseReturnDetails::Table.into_iden(),
+                    PurchaseReturns::Table.into_iden(),
+                    PurchaseDetails::Table.into_iden(),
+                    Purchases::Table.into_iden(),
+                    PaymentMethods::Table.into_iden(),
+                ];
+                for table in tables {
+                    manager
+                        .drop_table(Table::drop().table(table).if_exists().to_owned())
+                        .await?;
+                }
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(SupplierPayments::Table)
+                            .drop_column(SupplierPayments::PurchaseId)
+                            .to_owned(),
+                    )
+                    .await?;
+                let conn = manager.get_connection();
+                for name in PURCHASE_PERMISSIONS {
+                    let row = permissions::Entity::find()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .one(conn)
+                        .await?;
+                    if let Some(row) = row {
+                        permissions::Entity::delete_by_id(row.id).exec(conn).await?;
+                    }
+                }
+            }
             Migrations::LoyaltyPointsWidth => {
                 manager
                     .alter_table(
@@ -1967,6 +2003,414 @@ async fn loyalty_points_width(manager: &SchemaManager<'_>) -> Result<(), DbErr> 
     Ok(())
 }
 
+/// Goods received from a supplier.
+///
+/// Three decisions here are departures from the reference, each because the
+/// reference keeps a second source for a figure that is derivable:
+///
+/// - **No `paid` / `due_amount` column.** The reference stores both *and* has a
+///   `purchase_payments` table *and* has `supplier_payments`, so three records of
+///   what was paid can disagree. Here a payment is a `supplier_payments` row that
+///   optionally names the purchase it settles, and what a purchase owes is
+///   `grand_total - SUM` over those rows.
+/// - **The reference writes no stock movement when a purchase is recorded.** It
+///   has no ledger at all, so goods received through a purchase never reach its
+///   stock views. Each line here writes a `GoodsReceipt` row, because on-hand is
+///   `SUM(quantity)` over `stock_movements` and a purchase that moves nothing is a
+///   purchase that never reaches the shelf.
+/// - **The reference stores `discount` as a string** to preserve a trailing `%`,
+///   which makes one column mean either a percentage or an amount depending on
+///   what was typed. The input still accepts both, but the column holds the
+///   resolved amount and `grand_total = subtotal - discount`.
+///
+/// `reference_no` is derived from the primary key at write time rather than
+/// `MAX(reference_no) + 1`: two concurrent purchases read the same MAX.
+async fn purchases(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
+    manager
+        .create_table(
+            Table::create()
+                .table(PaymentMethods::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(PaymentMethods::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                // Not unique: "Cash" and "cash" are the same tender, and a
+                // duplicate guard on the name would need to be case-insensitive
+                // to be worth anything.
+                .col(ColumnDef::new(PaymentMethods::Name).string().not_null())
+                // `Cash` moves through the drawer; `Card`, `Qris`, `Transfer` do not.
+                // Register close needs the split to count what is in the till.
+                .col(ColumnDef::new(PaymentMethods::Kind).string().not_null())
+                .col(ColumnDef::new(PaymentMethods::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(PaymentMethods::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(Purchases::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(Purchases::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(Purchases::ReferenceNo).string().not_null())
+                .col(ColumnDef::new(Purchases::SupplierId).integer().not_null())
+                // The supplier's own invoice number, which is what an operator
+                // reconciles against. Null is normal: not every supplier sends one.
+                .col(ColumnDef::new(Purchases::SupplierInvoiceNo).string().null())
+                .col(ColumnDef::new(Purchases::PurchasedAt).date().not_null())
+                .col(ColumnDef::new(Purchases::Subtotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Purchases::Discount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Purchases::GrandTotal).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(Purchases::Note).string().null())
+                .col(ColumnDef::new(Purchases::CreatedBy).integer().null())
+                .col(ColumnDef::new(Purchases::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(Purchases::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(Purchases::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                // Restrict, not Cascade: a supplier that has been paid cannot be
+                // deleted out from under the purchase that created the debt.
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_purchases_supplier")
+                        .from(Purchases::Table, Purchases::SupplierId)
+                        .to(Suppliers::Table, Suppliers::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_purchases_supplier_id")
+                .table(Purchases::Table)
+                .col(Purchases::SupplierId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(PurchaseDetails::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(PurchaseDetails::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(PurchaseDetails::PurchaseId).integer().not_null())
+                .col(ColumnDef::new(PurchaseDetails::ItemId).integer().not_null())
+                // Null for goods with no expiry, which is most of a shop.
+                .col(ColumnDef::new(PurchaseDetails::BatchId).integer().null())
+                .col(ColumnDef::new(PurchaseDetails::Quantity).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(PurchaseDetails::UnitPrice).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(PurchaseDetails::Total).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_purchase_details_purchase")
+                        .from(PurchaseDetails::Table, PurchaseDetails::PurchaseId)
+                        .to(Purchases::Table, Purchases::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_purchase_details_item")
+                        .from(PurchaseDetails::Table, PurchaseDetails::ItemId)
+                        .to(Items::Table, Items::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_purchase_details_batch")
+                        .from(PurchaseDetails::Table, PurchaseDetails::BatchId)
+                        .to(ItemBatches::Table, ItemBatches::Id)
+                        .on_delete(ForeignKeyAction::SetNull)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_purchase_details_purchase_id")
+                .table(PurchaseDetails::Table)
+                .col(PurchaseDetails::PurchaseId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(PurchaseReturns::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(PurchaseReturns::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(PurchaseReturns::ReferenceNo).string().not_null())
+                // Which purchase is being corrected. A return without one is not
+                // supported: a supplier sends goods back against an invoice.
+                .col(ColumnDef::new(PurchaseReturns::PurchaseId).integer().not_null())
+                // Denormalized from the purchase so a returns list does not need a
+                // join to name the supplier, and so the supplier still reads
+                // correctly if the purchase is ever corrected.
+                .col(ColumnDef::new(PurchaseReturns::SupplierId).integer().not_null())
+                .col(ColumnDef::new(PurchaseReturns::ReturnedAt).date().not_null())
+                .col(ColumnDef::new(PurchaseReturns::TotalAmount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null().default(0))
+                .col(ColumnDef::new(PurchaseReturns::Note).string().null())
+                .col(ColumnDef::new(PurchaseReturns::CreatedBy).integer().null())
+                .col(ColumnDef::new(PurchaseReturns::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(PurchaseReturns::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(PurchaseReturns::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_purchase_returns_purchase")
+                        .from(PurchaseReturns::Table, PurchaseReturns::PurchaseId)
+                        .to(Purchases::Table, Purchases::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_purchase_returns_supplier")
+                        .from(PurchaseReturns::Table, PurchaseReturns::SupplierId)
+                        .to(Suppliers::Table, Suppliers::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_purchase_returns_purchase_id")
+                .table(PurchaseReturns::Table)
+                .col(PurchaseReturns::PurchaseId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_table(
+            Table::create()
+                .table(PurchaseReturnDetails::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(PurchaseReturnDetails::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(PurchaseReturnDetails::PurchaseReturnId).integer().not_null())
+                // Which purchase line is being corrected, rather than just the item.
+                // A shop that buys the same item twice has two lots of it on the
+                // shelf, and a return naming only the item could draw down the
+                // wrong one.
+                .col(ColumnDef::new(PurchaseReturnDetails::PurchaseDetailId).integer().not_null())
+                .col(ColumnDef::new(PurchaseReturnDetails::ItemId).integer().not_null())
+                .col(ColumnDef::new(PurchaseReturnDetails::Quantity).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(PurchaseReturnDetails::UnitPrice).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(PurchaseReturnDetails::Total).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_purchase_return_details_return")
+                        .from(PurchaseReturnDetails::Table, PurchaseReturnDetails::PurchaseReturnId)
+                        .to(PurchaseReturns::Table, PurchaseReturns::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_purchase_return_details_item")
+                        .from(PurchaseReturnDetails::Table, PurchaseReturnDetails::ItemId)
+                        .to(Items::Table, Items::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_purchase_return_details_line")
+                        .from(PurchaseReturnDetails::Table, PurchaseReturnDetails::PurchaseDetailId)
+                        .to(PurchaseDetails::Table, PurchaseDetails::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_purchase_return_details_return_id")
+                .table(PurchaseReturnDetails::Table)
+                .col(PurchaseReturnDetails::PurchaseReturnId)
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_purchase_return_details_line_id")
+                .table(PurchaseReturnDetails::Table)
+                .col(PurchaseReturnDetails::PurchaseDetailId)
+                .to_owned(),
+        )
+        .await?;
+
+    // One payment table, not two. The reference has `purchase_payments` and
+    // `supplier_payments` covering the same money; Stage 3 already built
+    // `supplier_payments`, so a purchase is settled by pointing a payment at it.
+    // SetNull rather than Cascade: a payment is money that left, and losing it
+    // would quietly change a supplier's balance.
+    // One statement per change. SQLite cannot apply several alter options in a
+    // single `ALTER` — sea-query panics with `Sqlite doesn't support multiple
+    // alter options` — so a combined add-column-and-constraint statement fails
+    // every test in the suite rather than one.
+    manager
+        .alter_table(
+            Table::alter()
+                .table(SupplierPayments::Table)
+                .add_column(
+                    ColumnDef::new(SupplierPayments::PurchaseId)
+                        .integer()
+                        .null()
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .alter_table(
+            Table::alter()
+                .table(SupplierPayments::Table)
+                .add_column(
+                    ColumnDef::new(SupplierPayments::PaymentMethodId)
+                        .integer()
+                        .null()
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    // SQLite cannot add a constraint to a table that already exists, so the two
+    // links are declared on the backends that can. Neither is load-bearing where
+    // it is missing: a purchase is immutable and undeletable by command, and a
+    // payment method is soft-deleted rather than removed — so neither target can
+    // disappear out from under a payment.
+    if manager.get_database_backend() != DbBackend::Sqlite {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(SupplierPayments::Table)
+                    .add_foreign_key(
+                        &mut TableForeignKey::new()
+                            .name("fk_supplier_payments_purchase")
+                            .from_tbl(SupplierPayments::Table)
+                            .from_col(SupplierPayments::PurchaseId)
+                            .to_tbl(Purchases::Table)
+                            .to_col(Purchases::Id)
+                            .on_delete(ForeignKeyAction::SetNull)
+                            .to_owned(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(SupplierPayments::Table)
+                    .add_foreign_key(
+                        &mut TableForeignKey::new()
+                            .name("fk_supplier_payments_method")
+                            .from_tbl(SupplierPayments::Table)
+                            .from_col(SupplierPayments::PaymentMethodId)
+                            .to_tbl(PaymentMethods::Table)
+                            .to_col(PaymentMethods::Id)
+                            .on_delete(ForeignKeyAction::SetNull)
+                            .to_owned(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+    }
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_supplier_payments_purchase_id")
+                .table(SupplierPayments::Table)
+                .col(SupplierPayments::PurchaseId)
+                .to_owned(),
+        )
+        .await?;
+
+    // The tenders a shop actually uses, seeded because a fresh install cannot
+    // record a payment until one exists, and the reference seeds them too. An
+    // operator adds more from Settings.
+    let conn = manager.get_connection();
+    let now = now();
+    for (name, kind) in [
+        ("Cash", "Cash"),
+        ("Bank Transfer", "Transfer"),
+        ("Debit/Credit Card", "Card"),
+        ("QRIS", "Qris"),
+        ("E-Wallet", "EWallet"),
+        ("Credit", "Credit"),
+    ] {
+        use sea_orm::entity::prelude::EntityTrait;
+
+        let exists = crate::entities::trade::payment_method::Entity::find()
+            .filter(crate::entities::trade::payment_method::Column::Name.eq(name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        crate::entities::trade::payment_method::ActiveModel {
+            name: Set(name.to_owned()),
+            kind: Set(kind.to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+
+    for name in PURCHASE_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        let group = name.split_once('-').map(|(g, _)| g).unwrap_or("purchase");
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set(group.to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+
+    Ok(())
+}
+
 async fn fixed_assets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let ts = timestamp_type(manager.get_database_backend());
 
@@ -3039,6 +3483,17 @@ enum CreditNotes {
 }
 
 /// Permissions this migration owns, for the down arm above.
+const PURCHASE_PERMISSIONS: &[&str] = &[
+    "purchase-list",
+    "purchase-create",
+    "purchase-show",
+    "purchase-payment",
+    "purchase-return-list",
+    "purchase-return-create",
+    "purchase-return-show",
+];
+
+/// Permissions this migration owns, for the down arm above.
 const CREDIT_NOTE_PERMISSIONS: &[&str] = &[
     "creditnote-list",
     "creditnote-issue",
@@ -3292,6 +3747,8 @@ enum SupplierPayments {
     Table,
     Id,
     SupplierId,
+    PurchaseId,
+    PaymentMethodId,
     Amount,
     Reference,
     PaidAt,
@@ -3339,6 +3796,80 @@ enum Suppliers {
     DelStatus,
     CreatedAt,
     UpdatedAt,
+}
+
+/// How money is tendered. A closed master table rather than free text on each
+/// payment row, so a report can group payments and Stage 7's income, expense and
+/// deposit/withdraw rows point at the same vocabulary.
+#[derive(Iden)]
+enum PaymentMethods {
+    Table,
+    Id,
+    Name,
+    Kind,
+    DelStatus,
+    CreatedAt,
+}
+
+/// A purchase order received from a supplier. Goods arrive here; what was paid
+/// is `supplier_payments`, so there is no `paid` or `due` column that can
+/// disagree with them.
+#[derive(Iden)]
+enum Purchases {
+    Table,
+    Id,
+    ReferenceNo,
+    SupplierId,
+    SupplierInvoiceNo,
+    PurchasedAt,
+    Subtotal,
+    Discount,
+    GrandTotal,
+    Note,
+    CreatedBy,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum PurchaseDetails {
+    Table,
+    Id,
+    PurchaseId,
+    ItemId,
+    BatchId,
+    Quantity,
+    UnitPrice,
+    Total,
+}
+
+#[derive(Iden)]
+enum PurchaseReturns {
+    Table,
+    Id,
+    ReferenceNo,
+    PurchaseId,
+    SupplierId,
+    ReturnedAt,
+    TotalAmount,
+    Note,
+    CreatedBy,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum PurchaseReturnDetails {
+    Table,
+    Id,
+    PurchaseReturnId,
+    PurchaseDetailId,
+    ItemId,
+    Quantity,
+    UnitPrice,
+    Total,
 }
 
 #[derive(Iden)]

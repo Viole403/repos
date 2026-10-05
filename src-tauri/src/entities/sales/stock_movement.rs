@@ -68,6 +68,8 @@ pub enum MovementType {
     InstallmentSale,
     /// Stock left because it was damaged, spoiled, or written off.
     Damage,
+    /// Stock left because it went back to a supplier on a purchase return.
+    PurchaseReturn,
 }
 
 impl MovementType {
@@ -85,6 +87,7 @@ impl MovementType {
             MovementType::OpeningBalance => "OpeningBalance",
             MovementType::InstallmentSale => "InstallmentSale",
             MovementType::Damage => "Damage",
+            MovementType::PurchaseReturn => "PurchaseReturn",
         }
     }
 }

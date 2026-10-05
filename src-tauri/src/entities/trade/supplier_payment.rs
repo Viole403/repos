@@ -10,6 +10,11 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub supplier_id: i32,
+    /// Which purchase this settles, when the payment is against one. Null for a
+    /// payment on account, which reduces the balance without settling a document.
+    pub purchase_id: Option<i32>,
+    /// How it was paid. Null on payments recorded before tenders were tracked.
+    pub payment_method_id: Option<i32>,
     pub amount: Decimal,
     pub reference: Option<String>,
     pub paid_at: chrono::NaiveDateTime,
@@ -24,6 +29,30 @@ pub enum Relation {
         to = "super::supplier::Column::Id"
     )]
     Supplier,
+    #[sea_orm(
+        belongs_to = "super::purchase::Entity",
+        from = "Column::PurchaseId",
+        to = "super::purchase::Column::Id"
+    )]
+    Purchase,
+    #[sea_orm(
+        belongs_to = "super::payment_method::Entity",
+        from = "Column::PaymentMethodId",
+        to = "super::payment_method::Column::Id"
+    )]
+    PaymentMethod,
+}
+
+impl Related<super::purchase::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Purchase.def()
+    }
+}
+
+impl Related<super::payment_method::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::PaymentMethod.def()
+    }
 }
 
 impl Related<super::supplier::Entity> for Entity {
