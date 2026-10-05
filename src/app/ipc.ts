@@ -1533,3 +1533,113 @@ export const deleteFixedAsset = (id: number) => call<void>("delete_fixed_asset",
  * quantity, so this is the authority — client totals are for display only.
  */
 export const checkout = (input: CheckoutInput) => call<SaleView>("checkout", { input });
+// ---------------------------------------------------------------------------
+// Accounting — the cash book
+// ---------------------------------------------------------------------------
+
+export interface AccountingCategory {
+    id: number;
+    name: string;
+    description: string | null;
+    createdAt: string;
+}
+
+export interface AccountingEntry {
+    id: number;
+    /** `INC-{id:06}` or `EXP-{id:06}`, derived server-side. */
+    referenceNo: string;
+    categoryId: number;
+    categoryName: string;
+    paymentMethodId: number;
+    paymentMethodName: string;
+    employeeId?: number | null;
+    /** Always positive; the row says which way it moved. */
+    amount: Decimal;
+    occurredAt: string;
+    note: string | null;
+    createdAt: string;
+}
+
+export interface AccountingEntryInput {
+    categoryId: number;
+    /** The account the money arrived in, or left. */
+    paymentMethodId: number;
+    amount: Decimal;
+    /** `YYYY-MM-DD`. */
+    occurredAt: string;
+    employeeId?: number | null;
+    note?: string | null;
+}
+
+/** `Deposit` or `Withdraw`, closed so a report groups without matching strings. */
+export type DepositKind = "Deposit" | "Withdraw";
+
+export interface DepositWithdraw {
+    id: number;
+    /** `DW-{id:06}`. */
+    referenceNo: string;
+    kind: DepositKind;
+    paymentMethodId: number;
+    paymentMethodName: string;
+    amount: Decimal;
+    occurredAt: string;
+    note: string | null;
+    createdAt: string;
+}
+
+/** One movement, oldest first, with `signed` already signed. */
+export interface CashBookLine {
+    referenceNo: string;
+    kind: string;
+    category: string | null;
+    paymentMethodId: number;
+    paymentMethodName: string;
+    amount: Decimal;
+    /** Positive for what arrived, negative for what left. */
+    signed: Decimal;
+    occurredAt: string;
+    note: string | null;
+}
+
+/** One account's position, derived as the sum over its lines. */
+export interface AccountBalance {
+    paymentMethodId: number;
+    paymentMethodName: string;
+    /** `Cash` is the one that moves through the drawer. */
+    kind: string;
+    balance: Decimal;
+}
+
+export const listIncomeCategories = (query: PageQuery = {}) =>
+    call<Page<AccountingCategory>>("list_income_categories", { query });
+export const createIncomeCategory = (input: { name: string; description?: string | null }) =>
+    call<AccountingCategory>("create_income_category", { input });
+export const deleteIncomeCategory = (id: number) => call<void>("delete_income_category", { id });
+
+export const listExpenseCategories = (query: PageQuery = {}) =>
+    call<Page<AccountingCategory>>("list_expense_categories", { query });
+export const createExpenseCategory = (input: { name: string; description?: string | null }) =>
+    call<AccountingCategory>("create_expense_category", { input });
+export const deleteExpenseCategory = (id: number) => call<void>("delete_expense_category", { id });
+
+export const listIncomes = (query: PageQuery = {}) => call<Page<AccountingEntry>>("list_incomes", { query });
+export const createIncome = (input: AccountingEntryInput) => call<AccountingEntry>("create_income", { input });
+export const listExpenses = (query: PageQuery = {}) => call<Page<AccountingEntry>>("list_expenses", { query });
+export const createExpense = (input: AccountingEntryInput) => call<AccountingEntry>("create_expense", { input });
+
+export const listDepositWithdraws = (query: PageQuery = {}) =>
+    call<Page<DepositWithdraw>>("list_deposit_withdraws", { query });
+export const createDepositWithdraw = (input: Omit<DepositWithdraw, "id" | "referenceNo" | "paymentMethodName" | "createdAt"> & { note?: string | null }) =>
+    call<DepositWithdraw>("create_deposit_withdraw", {
+        input: { ...input, note: input.note ?? null },
+    });
+
+/** Every live account with its position, including one that has never moved. */
+export const accountBalances = () => call<AccountBalance[]>("account_balances");
+export const accountStatement = (
+    paymentMethodId: number,
+    from?: string | null,
+    to?: string | null,
+) => call<CashBookLine[]>("account_statement", { paymentMethodId, from: from ?? null, to: to ?? null });
+export const cashBookHistory = (from?: string | null, to?: string | null) =>
+    call<CashBookLine[]>("cash_book_history", { from: from ?? null, to: to ?? null });

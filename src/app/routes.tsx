@@ -18,6 +18,12 @@ import { SaleDetail } from "./screens/SaleDetail";
 import { Returns } from "./screens/Returns";
 import { Customers } from "./screens/Customers";
 import { Suppliers } from "./screens/Suppliers";
+import { Incomes } from "./screens/Incomes";
+import { Expenses } from "./screens/Expenses";
+import { Deposits } from "./screens/Deposits";
+import { CashAccounts } from "./screens/CashAccounts";
+import { IncomeCategories } from "./screens/IncomeCategories";
+import { ExpenseCategories } from "./screens/ExpenseCategories";
 import { Purchases } from "./screens/Purchases";
 import { Register } from "./screens/Register";
 import { Drafts } from "./screens/Drafts";
@@ -70,6 +76,12 @@ const screens: Record<string, ReactNode> = {
     "/customers": <Customers />,
     "/purchase": <Purchases />,
     "/purchase/suppliers": <Suppliers />,
+    "/accounting/incomes": <Incomes />,
+    "/accounting/expenses": <Expenses />,
+    "/accounting/deposits": <Deposits />,
+    "/accounting/accounts": <CashAccounts />,
+    "/accounting/income-categories": <IncomeCategories />,
+    "/accounting/expense-categories": <ExpenseCategories />,
     "/settings/accounts": <Accounts />,
     "/settings/roles": <Roles />,
 };

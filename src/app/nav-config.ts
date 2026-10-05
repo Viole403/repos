@@ -11,6 +11,9 @@ import {
     Receipt,
     Settings01,
     ShoppingCart01,
+    ArrowDownRight,
+    ArrowUpLeft,
+    CoinsSwap01,
     Tag01,
     Truck01,
     User01,
@@ -46,7 +49,7 @@ const allowed = (permissions: string[], permission?: string): boolean =>
     !permission || permissions.length === 0 || permissions.includes(permission);
 
 /** Screens that exist. Anything else in the tree is inert until built. */
-export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/sales/registers", "/sales/quotations", "/sales/bookings", "/sales/promotions", "/sales/installments", "/sales/warranties", "/sales/servicings", "/sales/gift-cards", "/sales/credit-notes", "/stock", "/stock/operations", "/stock/assets", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/catalog/sub-categories", "/catalog/combos", "/settings/accounts", "/settings/roles", "/customers", "/purchase", "/purchase/suppliers", "/sales"]);
+export const enabledRoutes = new Set(["/", "/pos", "/sales/holds", "/sales/registers", "/sales/quotations", "/sales/bookings", "/sales/promotions", "/sales/installments", "/sales/warranties", "/sales/servicings", "/sales/gift-cards", "/sales/credit-notes", "/stock", "/stock/operations", "/stock/assets", "/catalog/items", "/catalog/units", "/catalog/brands", "/catalog/categories", "/catalog/sub-categories", "/catalog/combos", "/settings/accounts", "/settings/roles", "/customers", "/purchase", "/purchase/suppliers", "/accounting/accounts", "/accounting/incomes", "/accounting/expenses", "/accounting/deposits", "/accounting/income-categories", "/accounting/expense-categories", "/sales"]);
 
 export const navItems: NavEntry[] = [
     { label: "Dashboard", href: "#/", icon: Home01 },
@@ -107,8 +110,12 @@ export const navItems: NavEntry[] = [
         label: "Accounting",
         icon: BankNote01,
         items: [
-            { label: "Incomes", href: "#/accounting/incomes", disabled: true },
-            { label: "Expenses", href: "#/accounting/expenses", disabled: true },
+            { label: "Accounts", href: "#/accounting/accounts", icon: BankNote01 },
+            { label: "Incomes", href: "#/accounting/incomes", icon: ArrowUpLeft },
+            { label: "Expenses", href: "#/accounting/expenses", icon: ArrowDownRight },
+            { label: "Deposits & Withdrawals", href: "#/accounting/deposits", icon: CoinsSwap01 },
+            { label: "Income Categories", href: "#/accounting/income-categories", icon: Tag01 },
+            { label: "Expense Categories", href: "#/accounting/expense-categories", icon: Tag01 },
         ],
     },
     { label: "Payments", href: "#/payments", icon: CreditCard01, disabled: true },
