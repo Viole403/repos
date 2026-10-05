@@ -183,7 +183,7 @@ mod tests {
     use crate::entities::auth::permissions;
     use crate::entities::auth::users;
     use crate::entities::auth::{role_permissions, roles, user_roles};
-    use crate::entities::catalog::{item, unit};
+    use crate::entities::catalog::{brand, item, unit};
     use crate::migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use crate::entities::sales::stock_movement::MovementType;
@@ -3262,6 +3262,33 @@ mod tests {
         let refunded: Decimal = listed.iter().map(|r| r.refunded_total).sum();
         assert_eq!(refunded, Decimal::new(15_000, 3));
     }
+
+        #[tokio::test]
+        async fn a_search_matches_whatever_case_it_was_typed_in() {
+            let db = db::init_for_tests().await;
+            let now = migration::now();
+            brand::ActiveModel {
+                name: Set("Indomie".into()),
+                del_status: Set("Live".into()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .expect("seed brand");
+
+            let mut query = PageQuery::default();
+            // `LIKE` is case-insensitive on SQLite and case-sensitive on Postgres,
+            // so a capitalised search found the row on one backend and silently
+            // found nothing on the other.
+            query.search = Some("INDOMIE".into());
+            assert_eq!(
+                commands::list_brands_in(&db, query).await.unwrap().total,
+                1,
+                "search is case-insensitive on every backend"
+            );
+        }
 
     // -----------------------------------------------------------------------
     // Registers

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::NaiveDateTime;
 use sea_orm::prelude::Decimal;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, Func, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DbBackend, DbErr,
     EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionSession,
@@ -179,10 +179,10 @@ pub async fn list_customers(query: PageQuery) -> CmdResult<Page<CustomerView>> {
         let like = like_term(&term);
         q = q.filter(
             Condition::any()
-                .add(customer::Column::Name.contains(like.clone()))
-                .add(customer::Column::Code.contains(like.clone()))
-                .add(customer::Column::Phone.contains(like.clone()))
-                .add(customer::Column::Email.contains(like)),
+                .add(contains_ci(customer::Column::Name, &like))
+                .add(contains_ci(customer::Column::Code, &like))
+                .add(contains_ci(customer::Column::Phone, &like))
+                .add(contains_ci(customer::Column::Email, &like)),
         );
     }
 
@@ -497,10 +497,10 @@ pub async fn list_suppliers(query: PageQuery) -> CmdResult<Page<SupplierView>> {
         let like = like_term(&term);
         q = q.filter(
             Condition::any()
-                .add(supplier::Column::Name.contains(like.clone()))
-                .add(supplier::Column::Code.contains(like.clone()))
-                .add(supplier::Column::Phone.contains(like.clone()))
-                .add(supplier::Column::Email.contains(like)),
+                .add(contains_ci(supplier::Column::Name, &like))
+                .add(contains_ci(supplier::Column::Code, &like))
+                .add(contains_ci(supplier::Column::Phone, &like))
+                .add(contains_ci(supplier::Column::Email, &like)),
         );
     }
 
@@ -1291,7 +1291,7 @@ pub async fn list_units(query: PageQuery) -> CmdResult<Page<unit::Model>> {
     let mut q = unit::Entity::find().filter(unit::Column::DelStatus.eq(LIVE));
 
     if let Some(term) = query.term() {
-        q = q.filter(unit::Column::UnitName.contains(like_term(&term)));
+        q = q.filter(contains_ci(unit::Column::UnitName, &like_term(&term)));
     }
 
     let total = q.clone().count(db).await?;
@@ -1370,19 +1370,25 @@ pub async fn list_brands(query: PageQuery) -> CmdResult<Page<brand::Model>> {
     // session before anything else, so an unauthorised caller cannot use
     // validation messages to probe the command.
     crate::commands_auth::require_permission(db(), "brand-list").await?;
-    let db = db();
+    list_brands_in(db(), query).await
+}
+
+pub(crate) async fn list_brands_in<C: ConnectionTrait>(
+    conn: &C,
+    query: PageQuery,
+) -> CmdResult<Page<brand::Model>> {
     let mut q = brand::Entity::find().filter(brand::Column::DelStatus.eq(LIVE));
 
     if let Some(term) = query.term() {
-        q = q.filter(brand::Column::Name.contains(like_term(&term)));
+        q = q.filter(contains_ci(brand::Column::Name, &like_term(&term)));
     }
 
-    let total = q.clone().count(db).await?;
+    let total = q.clone().count(conn).await?;
     let rows = q
         .order_by_asc(brand::Column::Name)
         .offset(query.offset())
         .limit(query.per_page())
-        .all(db)
+        .all(conn)
         .await?;
 
     Ok(Page::new(rows, total, &query))
@@ -1459,7 +1465,7 @@ pub async fn list_item_categories(query: PageQuery) -> CmdResult<Page<item_categ
     let mut q = item_category::Entity::find().filter(item_category::Column::DelStatus.eq(LIVE));
 
     if let Some(term) = query.term() {
-        q = q.filter(item_category::Column::Name.contains(like_term(&term)));
+        q = q.filter(contains_ci(item_category::Column::Name, &like_term(&term)));
     }
 
     let total = q.clone().count(db).await?;
@@ -1616,7 +1622,7 @@ pub(crate) async fn list_fixed_assets_in<C: ConnectionTrait>(
     let mut q =
         fixed_asset_item::Entity::find().filter(fixed_asset_item::Column::DelStatus.eq(LIVE));
     if let Some(term) = query.term() {
-        q = q.filter(fixed_asset_item::Column::Name.contains(like_term(&term)));
+        q = q.filter(contains_ci(fixed_asset_item::Column::Name, &like_term(&term)));
     }
     let rows = q.order_by_asc(fixed_asset_item::Column::Name).all(conn).await?;
 
@@ -1833,7 +1839,7 @@ pub(crate) async fn list_item_sub_categories_in<C: ConnectionTrait>(
         q = q.filter(item_sub_category::Column::CategoryId.eq(category_id));
     }
     if let Some(term) = query.term() {
-        q = q.filter(item_sub_category::Column::Name.contains(like_term(&term)));
+        q = q.filter(contains_ci(item_sub_category::Column::Name, &like_term(&term)));
     }
     let total = q.clone().count(conn).await?;
     let rows = q
@@ -2070,6 +2076,25 @@ fn like_term(raw: &str) -> String {
             .replace('%', "\\%")
             .replace('_', "\\_")
     )
+}
+
+/// Case-insensitive `contains`, spelled the same way on every backend.
+///
+/// `ColumnTrait::contains` emits `LIKE`, whose case sensitivity depends on the
+/// engine: SQLite's is ASCII-insensitive, Postgres's is case-**sensitive**, and
+/// MySQL's follows the column collation. So one search box returned different rows
+/// per backend, and on Postgres anything typed in capitals silently matched
+/// nothing — invisible until the suite ran on all three.
+/// Lowering both sides is the one spelling that agrees everywhere.
+///
+/// `term` must already be `%`-wrapped by [`like_term`]; the wildcards are literal
+/// characters and survive `to_lowercase` unchanged.
+fn contains_ci<C: ColumnTrait>(column: C, term: &str) -> SimpleExpr {
+    // Scoped, not module-level: `ExprTrait` also defines `min` and `max`, which
+    // would collide with `Ord`'s at every call site comparing two plain values.
+    use sea_orm::sea_query::ExprTrait;
+
+    Func::lower(Expr::col(column)).like(term.to_lowercase())
 }
 
 /// Marks a row deleted rather than removing it, so historical references stay valid.
@@ -2500,7 +2525,7 @@ pub(crate) async fn list_stock_movements_in<C: ConnectionTrait>(
     let mut q = stock_movement::Entity::find().filter(stock_movement::Column::ItemId.eq(item_id));
 
     if let Some(term) = query.term() {
-        q = q.filter(stock_movement::Column::Reference.contains(like_term(&term)));
+        q = q.filter(contains_ci(stock_movement::Column::Reference, &like_term(&term)));
     }
 
     let total = q.clone().count(conn).await?;
@@ -5303,7 +5328,7 @@ pub async fn list_promotions_in<C: ConnectionTrait>(
 ) -> CmdResult<Page<promotion::Model>> {
     let mut q = promotion::Entity::find().filter(promotion::Column::DelStatus.eq(LIVE));
     if let Some(term) = query.term() {
-        q = q.filter(promotion::Column::Title.contains(like_term(&term)));
+        q = q.filter(contains_ci(promotion::Column::Title, &like_term(&term)));
     }
     let total = q.clone().count(conn).await?;
     let rows = q
