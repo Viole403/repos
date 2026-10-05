@@ -472,6 +472,7 @@ mod tests {
                 order_type: None,
                 payments,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await
@@ -487,6 +488,7 @@ mod tests {
                 tax_total: Some(Decimal::ZERO),
                 paid_total: None,
                 payment_method: Some("Cash".into()),
+                payment_method_id: None,
                 note: None,
                 promote: Some(true),
                 customer_id: None,
@@ -534,6 +536,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: Some(false),
                 customer_id: None,
@@ -583,6 +586,7 @@ mod tests {
                 tax_total: Some(dec(500)),
                 paid_total: Some(dec(13000)),
                 payment_method: Some("Qris".into()),
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -672,6 +676,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -721,6 +726,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -769,6 +775,7 @@ mod tests {
                     tax_total: None,
                     paid_total: None,
                     payment_method: None,
+                    payment_method_id: None,
                     note: None,
                     promote: None,
                     customer_id: None,
@@ -794,6 +801,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -822,6 +830,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -860,6 +869,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: Some(false),
                 customer_id: None,
@@ -902,6 +912,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: Some(false),
                 customer_id: None,
@@ -933,6 +944,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -999,6 +1011,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -1153,6 +1166,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -1198,6 +1212,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -1373,6 +1388,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -1595,6 +1611,7 @@ mod tests {
                 order_type: None,
                 payments: None,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await
@@ -1632,6 +1649,7 @@ mod tests {
                 order_type: None,
                 payments: None,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await
@@ -1670,6 +1688,7 @@ mod tests {
                 order_type: None,
                 payments: None,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await
@@ -1781,6 +1800,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -1810,6 +1830,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -1850,6 +1871,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: Some(false),
                 customer_id: None,
@@ -2149,7 +2171,8 @@ mod tests {
 
     fn gift_tender(card_no: &str, amount: Decimal) -> Vec<commands::PaymentLine> {
         vec![commands::PaymentLine {
-            method: "GiftCard".into(),
+            method: Some("GiftCard".into()),
+            payment_method_id: None,
             amount,
             reference: None,
             gift_card_no: Some(card_no.into()),
@@ -2174,6 +2197,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -2209,6 +2233,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -2253,6 +2278,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -2280,12 +2306,14 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
                 order_type: None,
                 payments: Some(vec![commands::PaymentLine {
-                    method: "GiftCard".into(),
+                    method: Some("GiftCard".into()),
+                    payment_method_id: None,
                     amount: Decimal::new(15_000_000, 3),
                     reference: None,
                     gift_card_no: None,
@@ -2313,6 +2341,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: Some(customer_id),
@@ -2384,6 +2413,7 @@ mod tests {
                 order_type: None,
                 payments: None,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await
@@ -2412,13 +2442,14 @@ mod tests {
                 discount_total: None,
                 tax_total: None,
                 paid_total: None,
-                payment_method: Some("Card".into()),
+                payment_method: Some("Debit/Credit Card".into()),
                 note: None,
                 promote: None,
                 customer_id: None,
                 order_type: None,
                 payments: None,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await
@@ -2443,6 +2474,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: Some(false),
                 customer_id: Some(customer),
@@ -2473,7 +2505,8 @@ mod tests {
 
         // 10 points off a 30000 sale: 29990 cash-equivalent paid, 10 in points.
         let tender = vec![commands::PaymentLine {
-            method: "Loyalty".into(),
+            method: Some("Loyalty".into()),
+            payment_method_id: None,
             amount: Decimal::new(10_000, 3),
             reference: None,
             gift_card_no: None,
@@ -2483,7 +2516,8 @@ mod tests {
         // one for one, so the sale below pays 29990 in cash and 10 in points.
         let cash = vec![
             commands::PaymentLine {
-                method: "Cash".into(),
+                method: Some("Cash".into()),
+                payment_method_id: None,
                 amount: Decimal::new(29_990_000, 3),
                 reference: None,
                 gift_card_no: None,
@@ -2529,7 +2563,8 @@ mod tests {
         seed_stock(&db, mug, dec(5)).await;
 
         let tender = vec![commands::PaymentLine {
-            method: "Loyalty".into(),
+            method: Some("Loyalty".into()),
+            payment_method_id: None,
             amount: Decimal::new(10_500, 3),
             reference: None,
             gift_card_no: None,
@@ -2543,6 +2578,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: Some(customer),
@@ -2690,6 +2726,7 @@ mod tests {
             tax_total: None,
             paid_total: None,
             payment_method: Some("Cash".into()),
+            payment_method_id: None,
             note: None,
             promote: None,
             customer_id: None,
@@ -2816,7 +2853,8 @@ mod tests {
         seed_stock(&db, mug, dec(5)).await;
 
         let tender = vec![commands::PaymentLine {
-            method: "Loyalty".into(),
+            method: Some("Loyalty".into()),
+            payment_method_id: None,
             amount: Decimal::new(10_000, 0),
             reference: None,
             gift_card_no: None,
@@ -2830,6 +2868,7 @@ mod tests {
                 tax_total: None,
                 paid_total: None,
                 payment_method: None,
+                payment_method_id: None,
                 note: None,
                 promote: None,
                 customer_id: None,
@@ -2917,6 +2956,7 @@ mod tests {
                 order_type: None,
                 payments: None,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await
@@ -2952,6 +2992,108 @@ mod tests {
         ));
     }
 
+    /// The id of a seeded tender, so a test can send what the till sends.
+    async fn tender_id(db: &DatabaseConnection, name: &str) -> i32 {
+        payment_method::Entity::find()
+            .filter(payment_method::Column::Name.eq(name))
+            .one(db)
+            .await
+            .expect("read tenders")
+            .unwrap_or_else(|| panic!("{name:?} is seeded"))
+            .id
+    }
+
+    #[tokio::test]
+    async fn a_tender_row_names_the_account_the_money_moved_through() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let qris = tender_id(&db, "QRIS").await;
+
+        let view = sell_one_item(
+            &db,
+            item,
+            Decimal::new(25_000, 3),
+            None,
+            Some(vec![commands::PaymentLine {
+                method: None,
+                payment_method_id: Some(qris),
+                amount: Decimal::new(25_000, 3),
+                reference: None,
+                gift_card_no: None,
+                gift_card_pin: None,
+            }]),
+        )
+        .await
+        .expect("checkout naming a tender id");
+
+        let row = view.payments.first().expect("the tender is recorded");
+        assert_eq!(row.payment_method_id, Some(qris), "the account is not on the row");
+        assert_eq!(
+            row.method, "QRIS",
+            "the name written is the account's own, not what the till typed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tender_name_matching_no_account_is_refused() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+
+        let err = sell_one_item(
+            &db,
+            item,
+            Decimal::new(25_000, 3),
+            None,
+            Some(vec![commands::PaymentLine {
+                method: Some("Gold ingot".into()),
+                payment_method_id: None,
+                amount: Decimal::new(25_000, 3),
+                reference: None,
+                gift_card_no: None,
+                gift_card_pin: None,
+            }]),
+        )
+        .await
+        .expect_err("a tender nobody can group");
+
+        assert!(
+            matches!(&err, commands::CmdError::Validation(m) if m.contains("Gold ingot")),
+            "expected a validation naming the tender, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gift_card_tender_may_not_be_recorded_against_an_account() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let cash = tender_id(&db, "Cash").await;
+
+        let err = sell_one_item(
+            &db,
+            item,
+            Decimal::new(25_000, 3),
+            None,
+            Some(vec![commands::PaymentLine {
+                method: Some("GiftCard".into()),
+                payment_method_id: Some(cash),
+                amount: Decimal::new(25_000, 3),
+                reference: None,
+                gift_card_no: Some("GC-1".into()),
+                gift_card_pin: None,
+            }]),
+        )
+        .await
+        .expect_err("a redemption is not money entering an account");
+
+        assert!(
+            matches!(&err, commands::CmdError::Validation(_)),
+            "expected a validation, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_split_payment_writes_one_row_per_tender() {
         let db = db::init_for_tests().await;
@@ -2965,14 +3107,16 @@ mod tests {
             None,
             Some(vec![
                 commands::PaymentLine {
-                    method: "Cash".into(),
+                    method: Some("Cash".into()),
+                    payment_method_id: None,
                     amount: Decimal::new(60_000, 3),
                     reference: None,
                     gift_card_no: None,
                     gift_card_pin: None,
                 },
                 commands::PaymentLine {
-                    method: "Card".into(),
+                    method: Some("Debit/Credit Card".into()),
+                    payment_method_id: None,
                     amount: Decimal::new(40_000, 3),
                     reference: Some("AUTH-9911".into()),
                     gift_card_no: None,
@@ -3015,7 +3159,8 @@ mod tests {
             Decimal::new(100_000, 3),
             None,
             Some(vec![commands::PaymentLine {
-                method: "Cash".into(),
+                method: Some("Cash".into()),
+                payment_method_id: None,
                 amount: Decimal::new(120_000, 3),
                 reference: None,
                 gift_card_no: None,
@@ -3048,7 +3193,8 @@ mod tests {
             Decimal::new(100_000, 3),
             None,
             Some(vec![commands::PaymentLine {
-                method: "Cash".into(),
+                method: Some("Cash".into()),
+                payment_method_id: None,
                 amount: Decimal::ZERO,
                 reference: None,
                 gift_card_no: None,
@@ -3078,7 +3224,8 @@ mod tests {
             Decimal::new(100_000, 3),
             None,
             Some(vec![commands::PaymentLine {
-                method: "Cash".into(),
+                method: Some("Cash".into()),
+                payment_method_id: None,
                 amount: Decimal::new(40_000, 3),
                 reference: None,
                 gift_card_no: None,
@@ -3211,6 +3358,7 @@ mod tests {
                 order_type: None,
                 payments: None,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await
@@ -3933,8 +4081,8 @@ mod tests {
             Decimal::new(100_000, 3),
             None,
             Some(vec![
-                commands::PaymentLine { method: "Cash".into(), amount: Decimal::new(30_000, 3), reference: None, gift_card_no: None, gift_card_pin: None },
-                commands::PaymentLine { method: "Card".into(), amount: Decimal::new(70_000, 3), reference: None, gift_card_no: None, gift_card_pin: None },
+                commands::PaymentLine { method: Some("Cash".into()), payment_method_id: None, amount: Decimal::new(30_000, 3), reference: None, gift_card_no: None, gift_card_pin: None },
+                commands::PaymentLine { method: Some("Debit/Credit Card".into()), payment_method_id: None, amount: Decimal::new(70_000, 3), reference: None, gift_card_no: None, gift_card_pin: None },
             ]),
         )
         .await
@@ -4540,6 +4688,7 @@ mod tests {
                 order_type: None,
                 payments: None,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await
@@ -4658,6 +4807,7 @@ mod tests {
                 order_type: None,
                 payments: None,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await
@@ -4692,6 +4842,7 @@ mod tests {
                 order_type: None,
                 payments: None,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await
@@ -4851,6 +5002,7 @@ mod tests {
                 order_type: None,
                 payments: None,
                 approved_by: None,
+                payment_method_id: None,
             },
         )
         .await

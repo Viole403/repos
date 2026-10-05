@@ -31,7 +31,7 @@ use crate::entities::sales::stock_movement::MovementType;
 use crate::entities::sales::{booking, combo_item, combo_sale, credit_note, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, loyalty_entry, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, service_rating, servicing, stock_movement, warranty};
 use crate::entities::trade::{customer, customer_receive, payment_method, purchase, purchase_detail, purchase_return, purchase_return_detail, supplier, supplier_payment};
 
-const LIVE: &str = "Live";
+pub(crate) const LIVE: &str = "Live";
 const DELETED: &str = "Deleted";
 
 /// Money and quantities are stored at scale 3 (`migration::DECIMAL_SCALE`). SQLite
@@ -39,7 +39,7 @@ const DELETED: &str = "Deleted";
 /// `SUM()` can therefore come back as `0.30000000000000004` rather than `0.300`.
 /// Re-rounding to the declared scale undoes that and is a no-op on Postgres, whose
 /// `NUMERIC` sum is already exact.
-const MONEY_SCALE: u32 = 3;
+pub(crate) const MONEY_SCALE: u32 = 3;
 
 
 // ---------------------------------------------------------------------------
@@ -94,20 +94,20 @@ pub struct PageQuery {
 
 impl PageQuery {
     /// Page numbers are 1-based from the UI; guard against 0.
-    fn page(&self) -> u64 {
+    pub(crate) fn page(&self) -> u64 {
         self.page.max(1)
     }
 
-    fn per_page(&self) -> u64 {
+    pub(crate) fn per_page(&self) -> u64 {
         self.per_page.clamp(1, 500)
     }
 
-    fn offset(&self) -> u64 {
+    pub(crate) fn offset(&self) -> u64 {
         (self.page() - 1) * self.per_page()
     }
 
     /// Lowercased search term, or `None` when blank.
-    fn term(&self) -> Option<String> {
+    pub(crate) fn term(&self) -> Option<String> {
         self.search
             .as_deref()
             .map(str::trim)
@@ -126,7 +126,7 @@ pub struct Page<T> {
 }
 
 impl<T> Page<T> {
-    fn new(rows: Vec<T>, total: u64, q: &PageQuery) -> Self {
+    pub(crate) fn new(rows: Vec<T>, total: u64, q: &PageQuery) -> Self {
         Self {
             rows,
             total,
@@ -165,7 +165,7 @@ fn validate_customer(input: &CustomerInput) -> CmdResult<()> {
 }
 
 /// Blank text becomes null rather than an empty string the server re-trims on write.
-fn text(raw: Option<String>) -> Option<String> {
+pub(crate) fn text(raw: Option<String>) -> Option<String> {
     raw.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
@@ -2096,7 +2096,7 @@ async fn guard_variation_parent<C: ConnectionTrait>(
 }
 
 /// Escapes LIKE wildcards so a search for `100%` is a literal match.
-fn like_term(raw: &str) -> String {
+pub(crate) fn like_term(raw: &str) -> String {
     format!(
         "%{}%",
         raw.replace('\\', "\\\\")
@@ -2116,7 +2116,7 @@ fn like_term(raw: &str) -> String {
 ///
 /// `term` must already be `%`-wrapped by [`like_term`]; the wildcards are literal
 /// characters and survive `to_lowercase` unchanged.
-fn contains_ci<C: ColumnTrait>(column: C, term: &str) -> SimpleExpr {
+pub(crate) fn contains_ci<C: ColumnTrait>(column: C, term: &str) -> SimpleExpr {
     // Scoped, not module-level: `ExprTrait` also defines `min` and `max`, which
     // would collide with `Ord`'s at every call site comparing two plain values.
     use sea_orm::sea_query::ExprTrait;
@@ -3039,6 +3039,11 @@ pub struct CheckoutInput {
     /// part-paid / credit sale.
     pub paid_total: Option<Decimal>,
     pub payment_method: Option<String>,
+    /// The account the money moved through, for the single-tender path. Preferred over
+    /// `payment_method`: the cash book reads this, and a name the till typed cannot
+    /// be grouped reliably. Omit both and the default tender is used.
+    #[serde(default)]
+    pub payment_method_id: Option<i32>,
     pub note: Option<String>,
     /// `false` leaves the sale as a `Draft` and writes no stock movements: an
     /// unpaid draft must not shrink the shelf. Defaults to `true`.
@@ -3066,7 +3071,15 @@ pub struct CheckoutInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaymentLine {
-    pub method: String,
+    /// Only for the two stored-value tenders, which are a way to spend rather than an
+    /// account: a gift card redemption puts nothing in a drawer and loyalty points are
+    /// not money. Every other tender must send `payment_method_id` instead.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// The account this tender moved through. Present for every account tender; absent
+    /// for the stored-value ones, which is why the column is nullable.
+    #[serde(default)]
+    pub payment_method_id: Option<i32>,
     /// Must be greater than zero. A zero "tender" is not a tender.
     pub amount: Decimal,
     /// Gateway reference, receipt number, or whatever the tender produces.
@@ -3105,12 +3118,101 @@ pub struct SaleView {
 
 /// One word for a split sale: `"Cash + Card"` beats `"Split"` because a receipt or a
 /// report then names what actually happened.
-fn summarise_methods(lines: &[PaymentLine]) -> String {
+/// The two tenders that are a way to spend rather than an account. A gift card
+/// redemption puts nothing in a drawer and loyalty points are not money, so neither
+/// has a `payment_methods` row to point at — which is exactly why that column is
+/// nullable rather than every tender being forced to name an account.
+fn is_stored_value(method: &str) -> bool {
+    let m = method.trim();
+    m == GIFT_CARD_METHOD || m == LOYALTY_METHOD
+}
+
+/// Turns one thing the till sent into a tender the books can group.
+///
+/// An id is authoritative. Without one the typed name is matched case-insensitively
+/// against the live tenders, because that is what an un-updated till sends; an
+/// unmatched name is refused rather than stored with no account, since a tender
+/// nobody can group is money missing from the cash book and a clear error at the
+/// counter is cheaper than finding it at month end.
+async fn resolve_tender_in<C: ConnectionTrait>(
+    conn: &C,
+    id: Option<i32>,
+    typed: Option<&str>,
+    default: Option<&str>,
+    where_: &str,
+) -> CmdResult<(String, Option<i32>)> {
+    if let Some(id) = id {
+        let found = payment_method::Entity::find_by_id(id)
+            .filter(payment_method::Column::DelStatus.eq(LIVE))
+            .one(conn)
+            .await?
+            .ok_or_else(|| CmdError::NotFound(format!("{where_}: payment method {id}")))?;
+        if is_stored_value(&found.name) {
+            return Err(CmdError::Validation(format!(
+                "{where_}: a gift card or loyalty tender is not an account — send its name, not an id"
+            )));
+        }
+        return Ok((found.name, Some(id)));
+    }
+
+    let raw = typed.unwrap_or_default();
+    let raw = if raw.trim().is_empty() { default.unwrap_or(raw) } else { raw };
+    let wanted = required(raw, &format!("{where_} method"))?;
+    if is_stored_value(&wanted) {
+        return Ok((wanted, None));
+    }
+
+    let lower = wanted.trim().to_lowercase();
+    let hit = payment_method::Entity::find()
+        .filter(payment_method::Column::DelStatus.eq(LIVE))
+        .all(conn)
+        .await?
+        .into_iter()
+        .find(|m| m.name.trim().to_lowercase() == lower)
+        .ok_or_else(|| {
+            CmdError::Validation(format!(
+                "{wanted:?} is not a payment method — add it under Settings, or send paymentMethodId"
+            ))
+        })?;
+    Ok((hit.name, Some(hit.id)))
+}
+
+/// A tender after the server has decided what it is. `method` is the account's own
+/// name, so the till's text never reaches the books.
+#[derive(Debug, Clone)]
+struct ResolvedTender {
+    line: PaymentLine,
+    method: String,
+    payment_method_id: Option<i32>,
+}
+
+async fn resolve_tenders_in<C: ConnectionTrait>(
+    conn: &C,
+    lines: &[PaymentLine],
+) -> CmdResult<Vec<ResolvedTender>> {
+    let mut out = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let (method, payment_method_id) =
+            resolve_tender_in(conn, line.payment_method_id, line.method.as_deref(), None, &format!("payment {}", i + 1))
+                .await?;
+        out.push(ResolvedTender { line: line.clone(), method, payment_method_id });
+    }
+    Ok(out)
+}
+
+async fn resolve_single_tender_in<C: ConnectionTrait>(
+    conn: &C,
+    id: Option<i32>,
+    typed: Option<&str>,
+) -> CmdResult<(String, Option<i32>)> {
+    resolve_tender_in(conn, id, typed, Some(SALE_PAYMENT_DEFAULT), "payment method").await
+}
+
+fn summarise_methods(lines: &[ResolvedTender]) -> String {
     let mut seen: Vec<&str> = Vec::new();
-    for line in lines {
-        let method = line.method.trim();
-        if !seen.contains(&method) {
-            seen.push(method);
+    for tender in lines {
+        if !seen.contains(&tender.method.as_str()) {
+            seen.push(&tender.method);
         }
     }
     seen.join(" + ")
@@ -3119,13 +3221,16 @@ fn summarise_methods(lines: &[PaymentLine]) -> String {
 async fn write_payment<C: ConnectionTrait>(
     conn: &C,
     sale_id: i32,
-    line: &PaymentLine,
+    tender: &ResolvedTender,
 ) -> CmdResult<()> {
     sale_payment::ActiveModel {
         sale_id: Set(sale_id),
-        method: Set(line.method.trim().to_owned()),
-        amount: Set(line.amount),
-        reference: Set(text(line.reference.clone())),
+        // The account's own name, so the receipt and a rename of an unrelated account
+        // cannot disagree with each other.
+        method: Set(tender.method.clone()),
+        payment_method_id: Set(tender.payment_method_id),
+        amount: Set(tender.line.amount),
+        reference: Set(text(tender.line.reference.clone())),
         created_at: Set(crate::migration::now()),
         ..Default::default()
     }
@@ -3197,32 +3302,33 @@ fn validate_checkout(input: &CheckoutInput) -> CmdResult<()> {
     if let Some(method) = input.payment_method.as_deref() {
         required(method, "payment method")?;
     }
-    if let Some(lines) = input.payments.as_ref() {
-        validate_payments(lines)?;
-    }
-
     Ok(())
 }
 
 /// Every tender must name a method and carry a positive amount. The total is checked
 /// against the sale once the grand total is known, not here.
-fn validate_payments(lines: &[PaymentLine]) -> CmdResult<()> {
+fn validate_payments(lines: &[ResolvedTender]) -> CmdResult<()> {
     if lines.is_empty() {
         return Err(CmdError::Validation(
             "no payment lines given — omit the field entirely for a single tender".into(),
         ));
     }
-    for (i, line) in lines.iter().enumerate() {
+    for (i, tender) in lines.iter().enumerate() {
         let where_ = format!("payment {}", i + 1);
-        required(&line.method, &format!("{where_} method"))?;
-        if line.amount <= Decimal::ZERO {
+        if tender.line.amount <= Decimal::ZERO {
             return Err(CmdError::Validation(format!(
                 "{where_}: amount must be greater than zero"
             )));
         }
         // A stored-value tender without a card number has nothing to debit.
-        let cardless = line.method.trim() == GIFT_CARD_METHOD
-            && line.gift_card_no.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_none();
+        let cardless = tender.method == GIFT_CARD_METHOD
+            && tender
+                .line
+                .gift_card_no
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none();
         if cardless {
             return Err(CmdError::Validation(format!(
                 "{where_}: a gift card tender needs a card number"
@@ -3230,7 +3336,7 @@ fn validate_payments(lines: &[PaymentLine]) -> CmdResult<()> {
         }
         // Points are whole: one point spends as one rupiah, and there is no
         // fractional rupiah for a fraction of a point to mean.
-        if line.method.trim() == LOYALTY_METHOD && line.amount.fract() != Decimal::ZERO {
+        if tender.method == LOYALTY_METHOD && tender.line.amount.fract() != Decimal::ZERO {
             return Err(CmdError::Validation(format!(
                 "{where_}: a loyalty tender must be whole points"
             )));
@@ -3425,12 +3531,11 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     let txn = conn.begin().await?;
 
     // Blank means "use the default" rather than an error here — the till sends the
-    // field whether or not the cashier touched it.
-    let payment_method = match input.payment_method.as_deref() {
-        None => SALE_PAYMENT_DEFAULT.to_owned(),
-        Some(raw) if raw.trim().is_empty() => SALE_PAYMENT_DEFAULT.to_owned(),
-        Some(raw) => required(raw, "payment method")?,
-    };
+    // field whether or not the cashier touched it. Resolved against the tender table
+    // so the name that reaches the books is the account's own, and so this sale is
+    // countable in the cash book.
+    let (payment_method, _single_tender_id) =
+        resolve_single_tender_in(&txn, input.payment_method_id, input.payment_method.as_deref()).await?;
     let order_type = resolve_order_type(input.order_type.as_deref())?;
 
     // Resolved inside the transaction so a customer deleted between the check and the
@@ -3450,12 +3555,23 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
 
     // Insert first with a provisional invoice number, because the real one is
     // derived from the primary key this insert produces.
+    // Resolved before anything reads a tender name: the walk-in guard below is the
+    // first such reader, and a redemption against points needs a named customer.
+    let payments = input.payments.filter(|lines| !lines.is_empty());
+    let tenders = match payments.as_ref() {
+        Some(lines) => Some(resolve_tenders_in(&txn, lines).await?),
+        None => None,
+    };
+    if let Some(resolved) = tenders.as_ref() {
+        validate_payments(resolved)?;
+    }
+
     // A walk-in has no account to earn from or redeem against, so a stored-value
     // or points tender without a named customer is refused up front rather than
     // halfway through the payment loop below.
     if customer_id.is_none() {
-        if let Some(lines) = input.payments.as_ref() {
-            if lines.iter().any(|l| l.method.trim() == LOYALTY_METHOD) {
+        if let Some(resolved) = tenders.as_ref() {
+            if resolved.iter().any(|t| t.method == LOYALTY_METHOD) {
                 return Err(CmdError::Validation(
                     "a loyalty tender needs a named customer".into(),
                 ));
@@ -3599,26 +3715,25 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     // Taken from the tenders when they are given, so the figure has one source. A
     // tender list summing above the total is change the cashier holds, not a payment,
     // so that is refused rather than recorded as a negative sale.
-    let payments = input.payments.filter(|lines| !lines.is_empty());
     // Round-off applies to cash only: coins are physical, card and QRIS totals are
     // exact to the rupiah. A split sale rounds only when every tender is cash.
-    let cash_only = match payments.as_ref() {
-        Some(lines) => lines.iter().all(|l| l.method.trim() == "Cash"),
+    let cash_only = match tenders.as_ref() {
+        Some(resolved) => resolved.iter().all(|t| t.method.trim() == "Cash"),
         None => payment_method.trim() == "Cash",
     };
     let rounding = cash_rounding(grand_total, cash_only);
     let rounded_total = grand_total + rounding;
     header.rounding = Set(rounding);
     header.approved_by = Set(input.approved_by);
-    if let Some(lines) = payments.as_ref() {
-        let tendered: Decimal = lines.iter().map(|l| l.amount).sum();
+    if let Some(resolved) = tenders.as_ref() {
+        let tendered: Decimal = resolved.iter().map(|t| t.line.amount).sum();
         if tendered > rounded_total {
             return Err(CmdError::Validation(format!(
                 "payments total {tendered}, which is more than the sale total {rounded_total}"
             )));
         }
         header.paid_total = Set(tendered);
-        header.payment_method = Set(summarise_methods(lines));
+        header.payment_method = Set(summarise_methods(resolved));
     } else {
         header.paid_total = Set(input.paid_total.unwrap_or(rounded_total));
     }
@@ -3636,19 +3751,25 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
         }
     }
 
-    if let Some(lines) = payments.as_ref() {
-        for line in lines {
-            write_payment(&txn, sale_id, line).await?;
+    if let Some(resolved) = tenders.as_ref() {
+        for tender in resolved {
+            write_payment(&txn, sale_id, tender).await?;
             // The debit lands in the same transaction as the sale: a retried
             // checkout writes a new sale, never a second debit for this one.
-            if line.method.trim() == GIFT_CARD_METHOD {
-                let card_no = line.gift_card_no.as_deref().expect("validated above");
-                redeem_gift_card(&txn, card_no, line.gift_card_pin.as_deref(), line.amount, sale_id)
-                    .await?;
+            if tender.method == GIFT_CARD_METHOD {
+                let card_no = tender.line.gift_card_no.as_deref().expect("validated above");
+                redeem_gift_card(
+                    &txn,
+                    card_no,
+                    tender.line.gift_card_pin.as_deref(),
+                    tender.line.amount,
+                    sale_id,
+                )
+                .await?;
             }
-            if line.method.trim() == LOYALTY_METHOD {
+            if tender.method == LOYALTY_METHOD {
                 let customer_id = customer_id.expect("refused for walk-ins above");
-                redeem_loyalty(&txn, customer_id, line.amount, sale_id).await?;
+                redeem_loyalty(&txn, customer_id, tender.line.amount, sale_id).await?;
             }
         }
     }
@@ -3836,6 +3957,7 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
         tax_total: Some(tax_total),
         paid_total,
         payment_method: Some(method.clone()),
+        payment_method_id: None,
         note: header.note.clone(),
         promote: None,
         customer_id: None,
