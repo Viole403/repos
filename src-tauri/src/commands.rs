@@ -3534,7 +3534,7 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
     // field whether or not the cashier touched it. Resolved against the tender table
     // so the name that reaches the books is the account's own, and so this sale is
     // countable in the cash book.
-    let (payment_method, _single_tender_id) =
+    let (payment_method, single_tender_id) =
         resolve_single_tender_in(&txn, input.payment_method_id, input.payment_method.as_deref()).await?;
     let order_type = resolve_order_type(input.order_type.as_deref())?;
 
@@ -3736,6 +3736,10 @@ pub(crate) async fn checkout_in<C: ConnectionTrait + TransactionTrait>(
         header.payment_method = Set(summarise_methods(resolved));
     } else {
         header.paid_total = Set(input.paid_total.unwrap_or(rounded_total));
+        // The account goes on the header only for the single-tender path: a split
+        // sale's accounts are one-per-row on `sale_payments`, and a header that named
+        // one of them would be a second source for the same figure.
+        header.payment_method_id = Set(single_tender_id);
     }
     // Only the `Set` fields above reach the SET clause — the rest came in as
     // `Unchanged` from the `Model -> ActiveModel` conversion — so this is a
@@ -3873,12 +3877,13 @@ pub async fn promote_draft(
     sale_id: i32,
     paid_total: Option<Decimal>,
     payment_method: Option<String>,
+    payment_method_id: Option<i32>,
 ) -> CmdResult<SaleView> {
     // Guarded like the reference's `middleware('permission:…')`: check the
     // session before anything else, so an unauthorised caller cannot use
     // validation messages to probe the command.
     crate::commands_auth::require_permission(db(), "sale-create").await?;
-    promote_draft_in(db(), sale_id, paid_total, payment_method).await
+    promote_draft_in(db(), sale_id, paid_total, payment_method, payment_method_id).await
 }
 
 pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
@@ -3886,6 +3891,7 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
     sale_id: i32,
     paid_total: Option<Decimal>,
     payment_method: Option<String>,
+    payment_method_id: Option<i32>,
 ) -> CmdResult<SaleView> {
     let now = crate::migration::now();
     let txn = conn.begin().await?;
@@ -3917,11 +3923,16 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
 
     // Blank means "keep what the draft already had", matching checkout's tolerance of
     // the till sending the field whether or not the cashier touched it.
-    let method = match payment_method.as_deref() {
-        Some(raw) if !raw.trim().is_empty() => required(raw, "payment method")?,
-        _ if !header.payment_method.trim().is_empty() => header.payment_method.clone(),
-        _ => SALE_PAYMENT_DEFAULT.to_owned(),
+    // Whatever the draft already carried is the fallback, so promoting a basket that
+    // was parked with a tender does not make the cashier pick one again.
+    let typed = match payment_method.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => Some(raw),
+        _ if !header.payment_method.trim().is_empty() => Some(header.payment_method.as_str()),
+        _ => None,
     };
+    let (method, tender_account) =
+        resolve_tender_in(&txn, payment_method_id.or(header.payment_method_id), typed, Some(SALE_PAYMENT_DEFAULT), "payment method")
+            .await?;
 
     // The lines are the record; the header's totals are a cache of them, so every
     // figure is rebuilt from the lines rather than read back.
@@ -4071,6 +4082,7 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
             grand_total: Set(grand_total),
             paid_total: Set(paid),
             payment_method: Set(method.clone()),
+            payment_method_id: Set(tender_account),
             rounding: Set(cash_rounding(grand_total, method.trim() == "Cash")),
             updated_at: Set(now),
             ..Default::default()
@@ -4085,6 +4097,22 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
             "sale {sale_id} is no longer a draft"
         )));
     }
+
+    // A direct checkout writes a tender row; a promote wrote none, so money taken on
+    // a parked basket reached the sale header and nowhere else. Same row, same
+    // transaction as the flip above, so a sale is either promoted with its tender or
+    // not promoted at all.
+    sale_payment::ActiveModel {
+        sale_id: Set(sale_id),
+        method: Set(method.clone()),
+        payment_method_id: Set(tender_account),
+        amount: Set(paid),
+        reference: Set(None),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
 
     // Completing the draft is the spend: a parked basket earns nothing until the
     // money is real, exactly like a direct checkout.

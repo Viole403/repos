@@ -29,7 +29,14 @@ pub struct Model {
     /// Below `grand_total` is a part-paid / credit sale; above it is change given
     /// back. Both legal, negative is not.
     pub paid_total: Decimal,
+    /// The account tenders moved through, joined for display — "Cash + QRIS" on a
+    /// split sale, so it matches no single account and the real ones live on the
+    /// tender rows. Set for a single-tender sale, which writes none of those.
     pub payment_method: String,
+    /// The account for a single-tender sale. Null on a split sale, whose accounts
+    /// are one-per-row on `sale_payments`. A sale always has one or the other, which
+    /// is what lets a reader union them without counting a tender twice.
+    pub payment_method_id: Option<i32>,
     /// `rounded_total - grand_total` for cash sales, so `SUM(rounding)` is what
     /// round-off gained or cost the till. Zero otherwise.
     pub rounding: Decimal,

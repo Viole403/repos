@@ -16,7 +16,7 @@ use sea_orm::sea_query::{ColumnDef, ForeignKey, ForeignKeyAction, Index, Table, 
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbBackend, EntityTrait, QueryFilter};
 
 use crate::entities::auth::permissions;
-use crate::entities::sales::sale_payment;
+use crate::entities::sales::{sale, sale_payment};
 use crate::entities::trade::payment_method;
 
 /// The migration registry. `db::init` runs this before the window opens.
@@ -241,6 +241,14 @@ impl MigrationTrait for Migrations {
             Migrations::TenderReferences => {
                 // One statement per change: SQLite cannot apply several alter
                 // options in a single `ALTER`.
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(Sales::Table)
+                            .drop_column(Sales::PaymentMethodId)
+                            .to_owned(),
+                    )
+                    .await?;
                 manager
                     .alter_table(
                         Table::alter()
@@ -2766,6 +2774,19 @@ async fn tender_references(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         )
         .await?;
 
+    // A single-tender sale writes no tender rows — the header carries the method and
+    // the figure, and register close falls back to the header for exactly that case.
+    // The header therefore needs the account too, or those sales are the ones the
+    // cash book cannot see.
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Sales::Table)
+                .add_column(ColumnDef::new(Sales::PaymentMethodId).integer().null().to_owned())
+                .to_owned(),
+        )
+        .await?;
+
     // The cash book reads per tender, so that is the index an account statement uses.
     manager
         .create_index(
@@ -2798,6 +2819,15 @@ async fn tender_references(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     for row in sale_payment::Entity::find().all(conn).await? {
         let Some(id) = resolve(&row.method) else { continue };
         let mut am: sale_payment::ActiveModel = row.into();
+        am.payment_method_id = Set(Some(id));
+        am.update(conn).await?;
+    }
+
+    for row in sale::Entity::find().all(conn).await? {
+        // A split sale's header reads "Cash + Debit/Credit Card", which matches no
+        // one account — correctly so, because the accounts are on its tender rows.
+        let Some(id) = resolve(&row.payment_method) else { continue };
+        let mut am: sale::ActiveModel = row.into();
         am.payment_method_id = Set(Some(id));
         am.update(conn).await?;
     }
@@ -4492,6 +4522,7 @@ enum Sales {
     GrandTotal,
     PaidTotal,
     PaymentMethod,
+    PaymentMethodId,
     CustomerId,
     OrderType,
     Rounding,

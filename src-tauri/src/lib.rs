@@ -1055,7 +1055,7 @@ mod tests {
         )
         .await;
 
-        let view = commands::promote_draft_in(&db, sale_id, Some(dec(13000)), Some("Qris".into()))
+        let view = commands::promote_draft_in(&db, sale_id, Some(dec(13000)), Some("Qris".into()), None)
             .await
             .expect("promotion succeeds");
 
@@ -1104,7 +1104,7 @@ mod tests {
 
         let sale_id = draft(&db, vec![line(soap, dec(2), dec(3000))]).await;
 
-        let view = commands::promote_draft_in(&db, sale_id, None, None)
+        let view = commands::promote_draft_in(&db, sale_id, None, None, None)
             .await
             .expect("promotion succeeds");
 
@@ -1124,14 +1124,14 @@ mod tests {
 
         let sale_id = draft(&db, vec![line(tv, dec(2), dec(500000))]).await;
 
-        commands::promote_draft_in(&db, sale_id, None, None)
+        commands::promote_draft_in(&db, sale_id, None, None, None)
             .await
             .expect("the first promotion succeeds");
         assert_eq!(commands::stock_on_hand_in(&db, tv).await.unwrap(), dec(3));
         assert_eq!(movements_for_sale(&db, sale_id).await.len(), 1);
 
         // The second attempt is refused, not silently accepted.
-        let err = commands::promote_draft_in(&db, sale_id, None, None)
+        let err = commands::promote_draft_in(&db, sale_id, None, None, None)
             .await
             .expect_err("a completed sale cannot be promoted again");
         assert!(
@@ -1180,7 +1180,7 @@ mod tests {
         .sale
         .id;
 
-        let err = commands::promote_draft_in(&db, done, None, None)
+        let err = commands::promote_draft_in(&db, done, None, None, None)
             .await
             .expect_err("a completed sale cannot be promoted");
         assert!(
@@ -1224,7 +1224,7 @@ mod tests {
         .await
         .expect("the other till sells");
 
-        let err = commands::promote_draft_in(&db, sale_id, None, None)
+        let err = commands::promote_draft_in(&db, sale_id, None, None, None)
             .await
             .expect_err("1 left cannot cover a held line of 3");
         assert!(format!("{err}").contains("in stock but"), "got: {err}");
@@ -1264,7 +1264,7 @@ mod tests {
         am.quantity = Set(Decimal::ZERO);
         am.update(&db).await.unwrap();
 
-        let err = commands::promote_draft_in(&db, sale_id, None, None)
+        let err = commands::promote_draft_in(&db, sale_id, None, None, None)
             .await
             .expect_err("a zero quantity cannot be promoted");
         assert!(
@@ -1278,7 +1278,7 @@ mod tests {
         am.unit_price = Set(dec(-1));
         am.update(&db).await.unwrap();
 
-        let err = commands::promote_draft_in(&db, sale_id, None, None)
+        let err = commands::promote_draft_in(&db, sale_id, None, None, None)
             .await
             .expect_err("a negative price cannot be promoted");
         assert!(
@@ -1297,7 +1297,7 @@ mod tests {
     async fn promote_draft_rejects_a_missing_or_empty_sale() {
         let db = db::init_for_tests().await;
 
-        let err = commands::promote_draft_in(&db, 9999, None, None)
+        let err = commands::promote_draft_in(&db, 9999, None, None, None)
             .await
             .expect_err("no such sale");
         assert!(
@@ -1329,7 +1329,7 @@ mod tests {
         // Omitted from the resume list, so it can never be reached from the UI either.
         assert!(commands::list_draft_sales_in(&db).await.unwrap().is_empty());
 
-        let err = commands::promote_draft_in(&db, empty, None, None)
+        let err = commands::promote_draft_in(&db, empty, None, None, None)
             .await
             .expect_err("a draft with no lines cannot be promoted");
         assert!(
@@ -1883,7 +1883,7 @@ mod tests {
         .await
         .expect("parking succeeds");
 
-        let view = commands::promote_draft_in(&db, parked.sale.id, None, None)
+        let view = commands::promote_draft_in(&db, parked.sale.id, None, None, None)
             .await
             .expect("promotion succeeds");
         assert_eq!(view.sale.order_type, "Online", "promoting must not reset the channel");
@@ -2487,7 +2487,7 @@ mod tests {
         .expect("parking succeeds");
         assert_eq!(loyalty_of(&db, customer).await, 0, "a draft is not a spend");
 
-        commands::promote_draft_in(&db, parked.sale.id, None, None)
+        commands::promote_draft_in(&db, parked.sale.id, None, None, None)
             .await
             .expect("promotion succeeds");
         assert_eq!(loyalty_of(&db, customer).await, 30);
@@ -3001,6 +3001,35 @@ mod tests {
             .expect("read tenders")
             .unwrap_or_else(|| panic!("{name:?} is seeded"))
             .id
+    }
+
+    #[tokio::test]
+    async fn a_promoted_draft_records_the_tender_its_money_went_through() {
+        let db = db::init_for_tests().await;
+        let item = seed_item(&db, "Widget").await;
+        seed_stock(&db, item, Decimal::new(10_000, 3)).await;
+        let qris = tender_id(&db, "QRIS").await;
+
+        let view = sell_one_item(&db, item, Decimal::new(25_000, 3), None, None)
+            .await
+            .expect("draft is parked");
+        commands::promote_draft_in(&db, view.sale.id, Some(Decimal::new(25_000, 3)), None, Some(qris))
+            .await
+            .expect("promotion succeeds");
+
+        let reloaded = commands::get_sale_in(&db, view.sale.id)
+            .await
+            .expect("read the promoted sale");
+        assert_eq!(
+            reloaded.payments.len(),
+            1,
+            "a promoted sale records no tender, so the money is in the books nowhere"
+        );
+        assert_eq!(
+            reloaded.payments[0].payment_method_id,
+            Some(qris),
+            "the tender does not name the account it moved through"
+        );
     }
 
     #[tokio::test]
@@ -4850,7 +4879,7 @@ mod tests {
         assert_eq!(draft.lines[0].discount, Decimal::ZERO);
 
         commands::create_promotion_in(&db, percent_promo(cola, 10)).await.expect("promo");
-        let view = commands::promote_draft_in(&db, draft.sale.id, None, None)
+        let view = commands::promote_draft_in(&db, draft.sale.id, None, None, None)
             .await
             .expect("promote");
         assert_eq!(view.lines[0].discount, Decimal::new(10_000, 3));
@@ -5009,7 +5038,7 @@ mod tests {
         .expect("park");
         assert_eq!(commands::stock_on_hand_in(&db, cola).await.unwrap(), dec(10));
 
-        commands::promote_draft_in(&db, draft.sale.id, None, None).await.expect("promote");
+        commands::promote_draft_in(&db, draft.sale.id, None, None, None).await.expect("promote");
         assert_eq!(commands::stock_on_hand_in(&db, cola).await.unwrap(), dec(8));
         assert_eq!(commands::stock_on_hand_in(&db, chips).await.unwrap(), dec(9));
         assert_eq!(
