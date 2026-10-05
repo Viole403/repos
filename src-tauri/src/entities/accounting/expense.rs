@@ -25,6 +25,9 @@ pub struct Model {
     /// A calendar day, not a moment. Matching `purchased_at`.
     pub occurred_at: chrono::NaiveDate,
     pub note: Option<String>,
+    /// The schedule this was posted from, when it came from one. SetNull: a schedule
+    /// can be stopped, and stopping it must not take posted history with it.
+    pub recurring_expense_id: Option<i32>,
     pub created_by: Option<i32>,
     pub del_status: String,
     pub created_at: chrono::NaiveDateTime,
@@ -39,6 +42,12 @@ pub enum Relation {
         to = "super::expense_category::Column::Id"
     )]
     ExpenseCategory,
+    #[sea_orm(
+        belongs_to = "super::expense_recurring::Entity",
+        from = "Column::RecurringExpenseId",
+        to = "super::expense_recurring::Column::Id"
+    )]
+    RecurringExpense,
     #[sea_orm(
         belongs_to = "crate::entities::trade::payment_method::Entity",
         from = "Column::PaymentMethodId",
@@ -56,6 +65,12 @@ pub enum Relation {
 impl Related<super::expense_category::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::ExpenseCategory.def()
+    }
+}
+
+impl Related<super::expense_recurring::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::RecurringExpense.def()
     }
 }
 

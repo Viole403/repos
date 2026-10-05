@@ -60,6 +60,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::Purchases),
             Box::new(Migrations::Accounting),
             Box::new(Migrations::TenderReferences),
+            Box::new(Migrations::RecurringExpenses),
         ]
     }
 }
@@ -99,6 +100,7 @@ pub enum Migrations {
     Purchases,
     Accounting,
     TenderReferences,
+    RecurringExpenses,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -190,6 +192,7 @@ impl MigrationName for Migrations {
         Migrations::Purchases => "purchases",
         Migrations::Accounting => "accounting",
         Migrations::TenderReferences => "tender_references",
+        Migrations::RecurringExpenses => "recurring_expenses",
         }
     }
 }
@@ -231,6 +234,7 @@ impl MigrationTrait for Migrations {
             Migrations::Purchases => purchases(manager).await?,
             Migrations::Accounting => accounting(manager).await?,
             Migrations::TenderReferences => tender_references(manager).await?,
+            Migrations::RecurringExpenses => recurring_expenses(manager).await?,
         }
         Ok(())
     }
@@ -238,6 +242,32 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::RecurringExpenses => {
+                let tables: [DynIden; 1] = [ExpenseRecurrings::Table.into_iden()];
+                for table in tables {
+                    manager
+                        .drop_table(Table::drop().table(table).if_exists().to_owned())
+                        .await?;
+                }
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(Expenses::Table)
+                            .drop_column(Expenses::RecurringExpenseId)
+                            .to_owned(),
+                    )
+                    .await?;
+                let conn = manager.get_connection();
+                for name in RECURRING_PERMISSIONS {
+                    let row = permissions::Entity::find()
+                        .filter(permissions::Column::Name.eq(*name))
+                        .one(conn)
+                        .await?;
+                    if let Some(row) = row {
+                        permissions::Entity::delete_by_id(row.id).exec(conn).await?;
+                    }
+                }
+            }
             Migrations::TenderReferences => {
                 // One statement per change: SQLite cannot apply several alter
                 // options in a single `ALTER`.
@@ -2835,6 +2865,130 @@ async fn tender_references(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// A schedule that proposes recurring expenses, and the back-link from a posted expense.
+///
+/// **The schedule proposes; the expense posts.** Nothing here writes to the cash book
+/// directly — posting one writes a real `expenses` row naming this, so the cash book
+/// needs no special case and a posted expense is financial history like any other.
+///
+/// The reference has `payment_method` as free text here too, and `day_of_month`,
+/// `day_of_week` and `billing_cycle` to describe the same schedule three ways. This
+/// keeps the account as a reference and lets the rotation arithmetic derive the date,
+/// because a column that must agree with three others is three places to be wrong.
+async fn recurring_expenses(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let ts = timestamp_type(manager.get_database_backend());
+
+    manager
+        .create_table(
+            Table::create()
+                .table(ExpenseRecurrings::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(ExpenseRecurrings::Id).integer().not_null().auto_increment().primary_key().to_owned())
+                .col(ColumnDef::new(ExpenseRecurrings::ExpenseCategoryId).integer().not_null())
+                .col(ColumnDef::new(ExpenseRecurrings::Name).string().not_null())
+                .col(ColumnDef::new(ExpenseRecurrings::Amount).decimal_len(DECIMAL_PRECISION, DECIMAL_SCALE).not_null())
+                .col(ColumnDef::new(ExpenseRecurrings::PaymentMethodId).integer().not_null())
+                .col(ColumnDef::new(ExpenseRecurrings::Rotation).string().not_null())
+                .col(ColumnDef::new(ExpenseRecurrings::StartsOn).date().not_null())
+                // Always set while live, so null means exactly one thing.
+                .col(ColumnDef::new(ExpenseRecurrings::NextDueOn).date().null())
+                // Null is open-ended: rent has no last month.
+                .col(ColumnDef::new(ExpenseRecurrings::EndsOn).date().null())
+                .col(ColumnDef::new(ExpenseRecurrings::Note).string().null())
+                .col(ColumnDef::new(ExpenseRecurrings::CreatedBy).integer().null())
+                .col(ColumnDef::new(ExpenseRecurrings::DelStatus).string().not_null().default(DEL_LIVE))
+                .col(ColumnDef::new(ExpenseRecurrings::CreatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                .col(ColumnDef::new(ExpenseRecurrings::UpdatedAt).custom(ts).not_null().default(Expr::current_timestamp()))
+                // Restrict on the category, like an expense itself: a schedule with a
+                // category that can be deleted would post into nothing.
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_expense_recurrings_category")
+                        .from(ExpenseRecurrings::Table, ExpenseRecurrings::ExpenseCategoryId)
+                        .to(ExpenseCategories::Table, ExpenseCategories::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .foreign_key(
+                    &mut ForeignKey::create()
+                        .name("fk_expense_recurrings_payment_method")
+                        .from(ExpenseRecurrings::Table, ExpenseRecurrings::PaymentMethodId)
+                        .to(PaymentMethods::Table, PaymentMethods::Id)
+                        .on_delete(ForeignKeyAction::Restrict)
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_expense_recurrings_next_due_on")
+                .table(ExpenseRecurrings::Table)
+                .col(ExpenseRecurrings::NextDueOn)
+                .to_owned(),
+        )
+        .await?;
+
+    // SetNull, not Cascade: stopping a schedule must not take posted history with it,
+    // and a soft delete is what stopping a schedule does.
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Expenses::Table)
+                .add_column(ColumnDef::new(Expenses::RecurringExpenseId).integer().null().to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    if manager.get_database_backend() != DbBackend::Sqlite {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Expenses::Table)
+                    .add_foreign_key(
+                        &mut TableForeignKey::new()
+                            .name("fk_expenses_recurring")
+                            .from_tbl(Expenses::Table)
+                            .from_col(Expenses::RecurringExpenseId)
+                            .to_tbl(ExpenseRecurrings::Table)
+                            .to_col(ExpenseRecurrings::Id)
+                            .on_delete(ForeignKeyAction::SetNull)
+                            .to_owned(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+    }
+
+    let conn = manager.get_connection();
+    let now = now();
+    for name in RECURRING_PERMISSIONS {
+        let exists = permissions::Entity::find()
+            .filter(permissions::Column::Name.eq(*name))
+            .one(conn)
+            .await?;
+        if exists.is_some() {
+            continue;
+        }
+        permissions::ActiveModel {
+            name: Set((*name).to_owned()),
+            group_name: Set("recurring-expense".to_owned()),
+            guard_name: Set("web".to_owned()),
+            del_status: Set(DEL_LIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await?;
+    }
+
+    Ok(())
+}
+
 async fn fixed_assets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let ts = timestamp_type(manager.get_database_backend());
 
@@ -3918,6 +4072,14 @@ const PURCHASE_PERMISSIONS: &[&str] = &[
 ];
 
 /// Permissions this migration owns, for the down arm above.
+const RECURRING_PERMISSIONS: &[&str] = &[
+    "recurring-expense-list",
+    "recurring-expense-create",
+    "recurring-expense-edit",
+    "recurring-expense-delete",
+    "recurring-expense-post",
+];
+
 const ACCOUNTING_PERMISSIONS: &[&str] = &[
     "income-list",
     "income-create",
@@ -3980,10 +4142,30 @@ enum Expenses {
     Id,
     ReferenceNo,
     ExpenseCategoryId,
+    RecurringExpenseId,
     PaymentMethodId,
     EmployeeId,
     Amount,
     OccurredAt,
+    Note,
+    CreatedBy,
+    DelStatus,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum ExpenseRecurrings {
+    Table,
+    Id,
+    ExpenseCategoryId,
+    Name,
+    Amount,
+    PaymentMethodId,
+    Rotation,
+    StartsOn,
+    NextDueOn,
+    EndsOn,
     Note,
     CreatedBy,
     DelStatus,

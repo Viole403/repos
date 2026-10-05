@@ -8,5 +8,6 @@
 pub mod deposit_withdraw;
 pub mod expense;
 pub mod expense_category;
+pub mod expense_recurring;
 pub mod income;
 pub mod income_category;
