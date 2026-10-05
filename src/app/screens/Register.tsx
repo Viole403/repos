@@ -13,8 +13,16 @@ import { CartProvider, cartLineFromItem, cartLineTotal, useCart } from "@/app/ca
 import type { CartLine } from "@/app/cart";
 import { decAdd, decCompare, decIsPositive, decStep, decSub } from "@/app/decimal";
 import { formatMoney, formatQuantity, toDecimal } from "@/app/format";
-import type { CheckoutInput, Decimal, PaymentLine, SaleView } from "@/app/ipc";
-import { checkout, listCustomers, openCustomerDisplay, resolveScan, stockOnHand, verifyApprovalPin } from "@/app/ipc";
+import type { CheckoutInput, Decimal, PaymentLine, PaymentMethod, SaleView } from "@/app/ipc";
+import {
+    checkout,
+    listCustomers,
+    listPaymentMethods,
+    openCustomerDisplay,
+    resolveScan,
+    stockOnHand,
+    verifyApprovalPin,
+} from "@/app/ipc";
 import { useAuth } from "@/app/auth";
 import {
     emitDisplay,
@@ -23,6 +31,7 @@ import {
 } from "@/app/display-channel";
 
 interface Tender {
+    /** A `TenderOption` id, not a name. */
     method: string;
     /** Kept as typed text so the exact digits reach the wire, not a parsed float. */
     amount: string;
@@ -31,18 +40,39 @@ interface Tender {
     pin: string;
 }
 
-const DEFAULT_TENDERS: Tender[] = [
-    { method: "Cash", amount: "", cardNo: "", pin: "" },
-    { method: "Card", amount: "", cardNo: "", pin: "" },
+const GIFT_CARD_OPTION = "sv:GiftCard";
+const LOYALTY_OPTION = "sv:Loyalty";
+
+/** Accounts come from Settings, so the two stored-value tenders are the only entries
+ *  that can be named here. The `acct:` / `sv:` prefixes keep a stored value from
+ *  colliding with an account an operator happened to call "Gift card". */
+interface TenderOption extends SelectItemType {
+    id: string;
+}
+
+const tenderOptions = (accounts: PaymentMethod[]): TenderOption[] => [
+    ...accounts.map((account) => ({ id: `acct:${account.id}`, label: account.name })),
+    { id: GIFT_CARD_OPTION, label: "Gift card" },
+    { id: LOYALTY_OPTION, label: "Loyalty points" },
 ];
 
-const PAYMENT_METHODS: SelectItemType[] = [
-    { id: "Cash", label: "Cash" },
-    { id: "Card", label: "Card" },
-    { id: "Qris", label: "QRIS" },
-    { id: "GiftCard", label: "Gift card" },
-    { id: "Loyalty", label: "Loyalty points" },
-];
+const accountIdOf = (option: string): number | null =>
+    option.startsWith("acct:") ? Number(option.slice("acct:".length)) : null;
+
+/** The stored-value tenders name themselves; every account names its row. */
+const storedValueNameOf = (option: string): string | null =>
+    option.startsWith("sv:") ? option.slice("sv:".length) : null;
+
+const defaultTenders = (options: TenderOption[]): Tender[] => {
+    // Cash is the tender that goes through the drawer, so it is the one a two-line
+    // split should offer first — matched on the name because `kind` is not on screen.
+    const cash = options.find((o) => /cash/i.test(o.label ?? "")) ?? options[0];
+    const other = options.find((o) => o.id !== cash?.id && !o.id.startsWith("sv:")) ?? options[1];
+    return [
+        { method: cash?.id ?? "", amount: "", cardNo: "", pin: "" },
+        { method: other?.id ?? "", amount: "", cardNo: "", pin: "" },
+    ];
+};
 
 const ORDER_TYPES: SelectItemType[] = [
     { id: "InStore", label: "In-store" },
@@ -96,14 +126,19 @@ const RegisterScreen = () => {
     const [code, setCode] = useState("");
     const [lookup, setLookup] = useState<Lookup>({ kind: "idle" });
     const [sale, setSale] = useState<SaleState>({ kind: "idle" });
-    const [paymentMethod, setPaymentMethod] = useState("Cash");
+    const [accounts, setAccounts] = useState<PaymentMethod[]>([]);
+    const [paymentMethod, setPaymentMethod] = useState("");
     // Counter sale until the cashier says otherwise — and back to it after every
     // sale, so a delivery does not silently re-tag the next walk-in.
     const [orderType, setOrderType] = useState("InStore");
     // Split is opt-in. The single-tender path is one field and one keypress, and
     // should not become two rows to fill in for the common case.
     const [split, setSplit] = useState(false);
-    const [tenders, setTenders] = useState<Tender[]>(DEFAULT_TENDERS);
+    const tenderChoices = useMemo(() => tenderOptions(accounts), [accounts]);
+    const [tenders, setTenders] = useState<Tender[]>([]);
+    // Module-level defaults cannot know the account ids, so the first accounts that
+    // arrive pick them. `paymentMethod` starting empty is what marks "not yet".
+    const seeded = useRef(false);
     // "" is a walk-in, which is what most of a counter's sales are.
     const [customerKey, setCustomerKey] = useState("");
     const [customers, setCustomers] = useState<SelectItemType[]>([]);
@@ -151,6 +186,28 @@ const RegisterScreen = () => {
     }, []);
 
     useEffect(() => focusCode(), [focusCode]);
+
+    // The tender pickers are the accounts that exist, not a hard-coded list, so an
+    // operator adding one in Settings finds it at the till without a rebuild.
+    useEffect(() => {
+        let live = true;
+        void listPaymentMethods()
+            .then((rows) => {
+                if (!live) return;
+                setAccounts(rows);
+            })
+            .catch(() => {});
+        return () => {
+            live = false;
+        };
+    }, []);
+
+    useEffect(() => {
+        if (seeded.current || tenderChoices.length === 0) return;
+        seeded.current = true;
+        setPaymentMethod(tenderChoices[0].id);
+        setTenders(defaultTenders(tenderChoices));
+    }, [tenderChoices]);
 
     const runLookup = useCallback(
         async (raw: string) => {
@@ -261,11 +318,12 @@ const RegisterScreen = () => {
         tenders
             .filter((t) => t.amount.trim() !== "")
             .map((t) => ({
-                method: t.method,
+                method: storedValueNameOf(t.method),
+                paymentMethodId: accountIdOf(t.method),
                 amount: toDecimal(t.amount),
                 reference: null,
-                giftCardNo: t.method === "GiftCard" && t.cardNo.trim() !== "" ? t.cardNo.trim() : null,
-                giftCardPin: t.method === "GiftCard" && t.pin.trim() !== "" ? t.pin.trim() : null,
+                giftCardNo: t.method === GIFT_CARD_OPTION && t.cardNo.trim() !== "" ? t.cardNo.trim() : null,
+                giftCardPin: t.method === GIFT_CARD_OPTION && t.pin.trim() !== "" ? t.pin.trim() : null,
             }));
 
     const tenderSum = tenderLines().reduce((total, t) => decAdd(total, t.amount), "0");
@@ -359,7 +417,8 @@ const RegisterScreen = () => {
             // Split tenders replace the single paid/method pair — the server takes
             // the total from their sum, so the two cannot disagree.
             paidTotal: paidDigits === "" ? null : toDecimal(paidDigits),
-            paymentMethod,
+            paymentMethod: storedValueNameOf(paymentMethod),
+            paymentMethodId: accountIdOf(paymentMethod),
             payments: split ? tenderLines() : null,
             note: note.trim() === "" ? null : note.trim(),
             // Always promote. A draft that moves no stock is a separate flow.
@@ -376,7 +435,7 @@ const RegisterScreen = () => {
             setPaid("");
             setNote("");
             setOrderType("InStore");
-            setTenders(DEFAULT_TENDERS);
+            setTenders(defaultTenders(tenderChoices));
             setApproval(null);
             // The backend returns the balances it committed, so take those over
             // what was cached, then forget them so the next scan refetches.
@@ -727,12 +786,14 @@ const RegisterScreen = () => {
                                     <Select
                                         label="Method"
                                         aria-label={`Method for tender ${index + 1}`}
-                                        items={PAYMENT_METHODS}
+                                        items={tenderChoices}
                                         selectedKey={tender.method}
                                         onSelectionChange={(key) =>
                                             setTenders((current) =>
                                                 current.map((t, i) =>
-                                                    i === index ? { ...t, method: String(key ?? "Cash") } : t,
+                                                    i === index && key !== null && key !== undefined
+                                                        ? { ...t, method: String(key) }
+                                                        : t,
                                                 ),
                                             )
                                         }
@@ -812,9 +873,11 @@ const RegisterScreen = () => {
                             </Select>
                             <Select
                                 label="Payment method"
-                                items={PAYMENT_METHODS}
+                                items={tenderChoices}
                                 selectedKey={paymentMethod}
-                                onSelectionChange={(key) => setPaymentMethod(String(key ?? "Cash"))}
+                                onSelectionChange={(key) => {
+                                    if (key !== null && key !== undefined) setPaymentMethod(String(key));
+                                }}
                             >
                                 {(row) => (
                                     <Select.Item id={row.id} textValue={row.label}>

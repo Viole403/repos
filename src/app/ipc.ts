@@ -292,8 +292,11 @@ export interface CheckoutInput {
     taxTotal?: Decimal | null;
     /** Omit to pay in full. A smaller figure is a part-paid / credit sale. */
     paidTotal?: Decimal | null;
-    /** `"Cash" | "Card" | "Qris"` in the register; any non-blank string server-side. */
+    /** Fallback name, for a till that has not been updated. Prefer `paymentMethodId`. */
     paymentMethod?: string | null;
+    /** The account the money moved through. The register picks this from
+     *  `listPaymentMethods`; the server writes the account's own name. */
+    paymentMethodId?: number | null;
     note?: string | null;
     /** `false` leaves the sale as a `Draft` and writes no stock movements. Defaults `true`. */
     promote?: boolean | null;
@@ -309,7 +312,11 @@ export interface CheckoutInput {
 }
 
 export interface PaymentLine {
-    method: string;
+    /** Only for a stored-value tender (gift card, loyalty), which is a way to spend
+     *  rather than an account. Every other tender sends `paymentMethodId`. */
+    method?: string | null;
+    /** The account this tender moved through. Null only for a stored-value tender. */
+    paymentMethodId?: number | null;
     /** Must be greater than zero. */
     amount: Decimal;
     /** Gateway reference, receipt number, or whatever the tender produces. */
@@ -323,7 +330,10 @@ export interface PaymentLine {
 export interface SalePayment {
     id: number;
     saleId: number;
+    /** The account's own name, written by the server. */
     method: string;
+    /** Null on a row written before tenders were references. */
+    paymentMethodId?: number | null;
     amount: Decimal;
     reference: string | null;
     createdAt: Timestamp;
@@ -801,6 +811,9 @@ export interface PaymentInput {
     amount: Decimal;
     reference?: string | null;
     paidAt?: string | null;
+    /** The account the money arrived in. Omitted when a debt is only being written
+     *  down, which is not money moving. */
+    paymentMethodId?: number | null;
 }
 
 export interface CustomerReceipt {
@@ -997,8 +1010,18 @@ export const deleteItem = (id: number) => call<void>("delete_item", { id });
 export const listDraftSales = () => call<DraftSale[]>("list_draft_sales");
 
 /** Completes a draft. Omitting `paidTotal` means paid in full. */
-export const promoteDraft = (saleId: number, paidTotal?: Decimal, paymentMethod?: string) =>
-    call<SaleView>("promote_draft", { saleId, paidTotal: paidTotal ?? null, paymentMethod: paymentMethod ?? null });
+export const promoteDraft = (
+    saleId: number,
+    paidTotal?: Decimal,
+    paymentMethod?: string,
+    paymentMethodId?: number,
+) =>
+    call<SaleView>("promote_draft", {
+        saleId,
+        paidTotal: paidTotal ?? null,
+        paymentMethod: paymentMethod ?? null,
+        paymentMethodId: paymentMethodId ?? null,
+    });
 
 /** A credit sale: one item handed over now, the balance split into dated dues. */
 export interface CreateInstallmentInput {
