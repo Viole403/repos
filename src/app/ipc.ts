@@ -843,6 +843,140 @@ export const recordSupplierPayment = (supplierId: number, input: PaymentInput) =
 export const listSupplierPayments = (supplierId: number) =>
     call<SupplierPayment[]>("list_supplier_payments", { supplierId });
 
+/** A tender. `kind` says whether it moves through the drawer, which a register
+    close needs; only `Cash` does. */
+export interface PaymentMethod {
+    id: number;
+    name: string;
+    kind: string;
+    delStatus: string;
+    createdAt: string;
+}
+
+export interface PurchaseLine {
+    id: number;
+    itemId: number;
+    itemName: string;
+    itemCode: string;
+    batchId?: number | null;
+    batchNo?: string | null;
+    expiryDate?: string | null;
+    quantity: Decimal;
+    unitPrice: Decimal;
+    total: Decimal;
+    /** Already sent back to the supplier. Derived server-side from the returns. */
+    returnedQuantity: Decimal;
+}
+
+export interface PurchasePayment {
+    id: number;
+    paymentMethodId?: number | null;
+    paymentMethodName?: string | null;
+    amount: Decimal;
+    reference: string | null;
+    paidAt: string;
+}
+
+export interface PurchaseView {
+    id: number;
+    referenceNo: string;
+    supplierId: number;
+    supplierName: string;
+    supplierInvoiceNo: string | null;
+    /** `YYYY-MM-DD`. */
+    purchasedAt: string;
+    subtotal: Decimal;
+    /** Always an amount, never a percentage — the server resolves `"10%"` first. */
+    discount: Decimal;
+    grandTotal: Decimal;
+    paidTotal: Decimal;
+    dueTotal: Decimal;
+    /** `Paid` | `Partial` | `Unpaid`, derived from `paidTotal`. */
+    status: string;
+    note: string | null;
+    createdAt: string;
+    lines: PurchaseLine[];
+    payments: PurchasePayment[];
+}
+
+export interface PurchaseLineInput {
+    itemId: number;
+    quantity: Decimal;
+    unitPrice: Decimal;
+    batchId?: number | null;
+    batchNo?: string | null;
+    /** `YYYY-MM-DD`. */
+    expiryDate?: string | null;
+}
+
+export interface PurchasePaymentInput {
+    paymentMethodId: number;
+    amount: Decimal;
+    reference?: string | null;
+}
+
+export interface PurchaseInput {
+    supplierId: number;
+    supplierInvoiceNo?: string | null;
+    purchasedAt: string;
+    lines: PurchaseLineInput[];
+    /** An amount (`"25000"`) or a percentage (`"10%"`), as typed. */
+    discount?: string | null;
+    note?: string | null;
+    payments?: PurchasePaymentInput[];
+}
+
+export interface PurchaseReturnLine {
+    id: number;
+    itemId: number;
+    itemName: string;
+    itemCode: string;
+    quantity: Decimal;
+    unitPrice: Decimal;
+    total: Decimal;
+}
+
+export interface PurchaseReturnView {
+    id: number;
+    referenceNo: string;
+    purchaseId: number;
+    purchaseReferenceNo: string;
+    supplierId: number;
+    supplierName: string;
+    returnedAt: string;
+    totalAmount: Decimal;
+    note: string | null;
+    createdAt: string;
+    lines: PurchaseReturnLine[];
+}
+
+export interface PurchaseReturnLineInput {
+    /** Names the purchase line being corrected, so the right delivery is drawn
+        down when the same item was bought more than once. */
+    purchaseDetailId: number;
+    quantity: Decimal;
+}
+
+export interface PurchaseReturnInput {
+    purchaseId: number;
+    returnedAt: string;
+    lines: PurchaseReturnLineInput[];
+    note?: string | null;
+}
+
+export const listPaymentMethods = () => call<PaymentMethod[]>("list_payment_methods");
+export const listPurchases = (query: PageQuery = {}) => call<Page<PurchaseView>>("list_purchases", { query });
+export const getPurchase = (id: number) => call<PurchaseView>("get_purchase", { id });
+export const createPurchase = (input: PurchaseInput) => call<PurchaseView>("create_purchase", { input });
+export const recordPurchasePayment = (purchaseId: number, input: PurchasePaymentInput) =>
+    call<PurchaseView>("record_purchase_payment", { purchaseId, input });
+
+export const listPurchaseReturns = (query: PageQuery = {}) =>
+    call<Page<PurchaseReturnView>>("list_purchase_returns", { query });
+export const getPurchaseReturn = (id: number) => call<PurchaseReturnView>("get_purchase_return", { id });
+export const createPurchaseReturn = (input: PurchaseReturnInput) =>
+    call<PurchaseReturnView>("create_purchase_return", { input });
+
 export const listUnits = (query: PageQuery = {}) => call<Page<Unit>>("list_units", { query });
 export const createUnit = (input: UnitInput) => call<Unit>("create_unit", { input });
 export const deleteUnit = (id: number) => call<void>("delete_unit", { id });

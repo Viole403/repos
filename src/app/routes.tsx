@@ -18,6 +18,7 @@ import { SaleDetail } from "./screens/SaleDetail";
 import { Returns } from "./screens/Returns";
 import { Customers } from "./screens/Customers";
 import { Suppliers } from "./screens/Suppliers";
+import { Purchases } from "./screens/Purchases";
 import { Register } from "./screens/Register";
 import { Drafts } from "./screens/Drafts";
 import { Registers } from "./screens/Registers";
@@ -67,6 +68,7 @@ const screens: Record<string, ReactNode> = {
     "/sales/:id": <SaleDetail />,
     "/sales/:id/returns": <Returns />,
     "/customers": <Customers />,
+    "/purchase": <Purchases />,
     "/purchase/suppliers": <Suppliers />,
     "/settings/accounts": <Accounts />,
     "/settings/roles": <Roles />,
