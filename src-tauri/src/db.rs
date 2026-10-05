@@ -273,15 +273,21 @@ async fn sweep_postgres_schemas(admin: &DatabaseConnection) -> () {
 /// for the same reason as the Postgres sweep above.
 #[cfg(test)]
 async fn sweep_mysql_databases(admin: &DatabaseConnection) -> () {
+    // Aliased deliberately: MySQL reports `information_schema.schemata`'s column as
+    // `SCHEMA_NAME`, and a raw-statement column lookup in sqlx is case-sensitive.
+    // Reading `"schema_name"` therefore panicked, which meant the sweep only
+    // succeeded while there was nothing to sweep — so a second run against the
+    // same server died before its first test. Postgres folds identifiers to
+    // lowercase, which is why its sweep never showed this.
     let rows = admin
         .query_all_raw(Statement::from_string(
             DbBackend::MySql,
-            "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'repos\\_test\\_%'",
+            "SELECT schema_name AS name FROM information_schema.schemata WHERE schema_name LIKE 'repos\\_test\\_%'",
         ))
         .await
         .expect("list scratch databases");
     for row in rows {
-        let name: String = row.try_get("", "schema_name").expect("database name");
+        let name: String = row.try_get("", "name").expect("database name");
         let _ = admin
             .execute_unprepared(&format!("DROP DATABASE IF EXISTS `{name}`"))
             .await;
