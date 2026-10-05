@@ -60,6 +60,10 @@ pub enum Relation {
     Expense,
     #[sea_orm(has_many = "crate::entities::accounting::deposit_withdraw::Entity")]
     DepositWithdraw,
+    #[sea_orm(has_many = "crate::entities::sales::sale_payment::Entity")]
+    SalePayment,
+    #[sea_orm(has_many = "crate::entities::trade::customer_receive::Entity")]
+    CustomerReceive,
 }
 
 impl Related<crate::entities::trade::supplier_payment::Entity> for Entity {
@@ -83,6 +87,18 @@ impl Related<crate::entities::accounting::expense::Entity> for Entity {
 impl Related<crate::entities::accounting::deposit_withdraw::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DepositWithdraw.def()
+    }
+}
+
+impl Related<crate::entities::sales::sale_payment::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SalePayment.def()
+    }
+}
+
+impl Related<crate::entities::trade::customer_receive::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::CustomerReceive.def()
     }
 }
 

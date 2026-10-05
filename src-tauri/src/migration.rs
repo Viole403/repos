@@ -16,6 +16,8 @@ use sea_orm::sea_query::{ColumnDef, ForeignKey, ForeignKeyAction, Index, Table, 
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbBackend, EntityTrait, QueryFilter};
 
 use crate::entities::auth::permissions;
+use crate::entities::sales::sale_payment;
+use crate::entities::trade::payment_method;
 
 /// The migration registry. `db::init` runs this before the window opens.
 #[derive(Debug)]
@@ -57,6 +59,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migrations::LoyaltyPointsWidth),
             Box::new(Migrations::Purchases),
             Box::new(Migrations::Accounting),
+            Box::new(Migrations::TenderReferences),
         ]
     }
 }
@@ -95,6 +98,7 @@ pub enum Migrations {
     LoyaltyPointsWidth,
     Purchases,
     Accounting,
+    TenderReferences,
 }
 
 /// Soft-delete marker used across the reference's tables.
@@ -185,6 +189,7 @@ impl MigrationName for Migrations {
         Migrations::LoyaltyPointsWidth => "loyalty_points_width",
         Migrations::Purchases => "purchases",
         Migrations::Accounting => "accounting",
+        Migrations::TenderReferences => "tender_references",
         }
     }
 }
@@ -225,6 +230,7 @@ impl MigrationTrait for Migrations {
             Migrations::LoyaltyPointsWidth => loyalty_points_width(manager).await?,
             Migrations::Purchases => purchases(manager).await?,
             Migrations::Accounting => accounting(manager).await?,
+            Migrations::TenderReferences => tender_references(manager).await?,
         }
         Ok(())
     }
@@ -232,6 +238,26 @@ impl MigrationTrait for Migrations {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Reverse order so drops never violate foreign keys.
         match self {
+            Migrations::TenderReferences => {
+                // One statement per change: SQLite cannot apply several alter
+                // options in a single `ALTER`.
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(CustomerReceives::Table)
+                            .drop_column(CustomerReceives::PaymentMethodId)
+                            .to_owned(),
+                    )
+                    .await?;
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(SalePayments::Table)
+                            .drop_column(SalePayments::PaymentMethodId)
+                            .to_owned(),
+                    )
+                    .await?;
+            }
             Migrations::Accounting => {
                 let tables: [DynIden; 5] = [
                     DepositWithdraws::Table.into_iden(),
@@ -2698,6 +2724,87 @@ async fn accounting(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// Give the other two ways money enters the shop the tender Stage 6 gave the third.
+///
+/// `supplier_payments` already names a `payment_methods` row. `sale_payments` held
+/// whatever the operator typed at the till and `customer_receives` held no tender at
+/// all — three schemas for one concept, which is how a cash book ends up unable to
+/// answer "how much is in the drawer".
+///
+/// `sale_payments.method` is **kept**. It is what the till displayed and what an old
+/// receipt names, and the new column is nullable precisely so an existing row whose
+/// text matches no live tender survives with its text intact rather than being
+/// rewritten or dropped. The text stops being the source; the id is.
+///
+/// `customer_receives` is **not** backfilled, because nothing recorded the tender to
+/// backfill from. A historical receipt's method is unknown, and null says that while a
+/// guess would not.
+async fn tender_references(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    // One statement per change: SQLite cannot apply several alter options in a
+    // single `ALTER` — sea-query panics with `Sqlite doesn't support multiple alter
+    // options` — so a combined statement would fail every test in the suite.
+    manager
+        .alter_table(
+            Table::alter()
+                .table(SalePayments::Table)
+                .add_column(ColumnDef::new(SalePayments::PaymentMethodId).integer().null().to_owned())
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .alter_table(
+            Table::alter()
+                .table(CustomerReceives::Table)
+                .add_column(
+                    ColumnDef::new(CustomerReceives::PaymentMethodId)
+                        .integer()
+                        .null()
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    // The cash book reads per tender, so that is the index an account statement uses.
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_sale_payments_payment_method_id")
+                .table(SalePayments::Table)
+                .col(SalePayments::PaymentMethodId)
+                .to_owned(),
+        )
+        .await?;
+
+    // Match case-insensitively, because the text came from a keyboard and "cash" and
+    // "Cash" are the same tender. First live match wins, so a method duplicated
+    // across spellings resolves to one row rather than arbitrarily.
+    let conn = manager.get_connection();
+    let methods = payment_method::Entity::find()
+        .filter(payment_method::Column::DelStatus.eq(DEL_LIVE))
+        .all(conn)
+        .await?;
+
+    let resolve = |text: &str| -> Option<i32> {
+        let wanted = text.trim().to_lowercase();
+        methods
+            .iter()
+            .find(|m| m.name.trim().to_lowercase() == wanted)
+            .map(|m| m.id)
+    };
+
+    for row in sale_payment::Entity::find().all(conn).await? {
+        let Some(id) = resolve(&row.method) else { continue };
+        let mut am: sale_payment::ActiveModel = row.into();
+        am.payment_method_id = Set(Some(id));
+        am.update(conn).await?;
+    }
+
+    Ok(())
+}
+
 async fn fixed_assets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let ts = timestamp_type(manager.get_database_backend());
 
@@ -4094,6 +4201,7 @@ enum SalePayments {
     Id,
     SaleId,
     Method,
+    PaymentMethodId,
     Amount,
     Reference,
     CreatedAt,
@@ -4105,6 +4213,7 @@ enum CustomerReceives {
     Id,
     CustomerId,
     Amount,
+    PaymentMethodId,
     Reference,
     PaidAt,
     CreatedAt,
