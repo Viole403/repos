@@ -3165,6 +3165,25 @@ async fn resolve_tender_in<C: ConnectionTrait>(
     default: Option<&str>,
     where_: &str,
 ) -> CmdResult<(String, Option<i32>)> {
+    // A typed stored-value name is answered before the id is even looked at.
+    //
+    // The old order asked the id for the *name* and kept it, so a till that sent
+    // `method: "GiftCard"` alongside an account id got the account's name back: the
+    // gift-card guard never fired, the redemption never ran, and the sale quietly took
+    // real money for a card that was not charged. Stored value is not an account, so it
+    // cannot be resolved to one — and an id sent with it is a contradiction the server
+    // refuses rather than guesses at.
+    if let Some(typed) = typed {
+        if is_stored_value(typed) {
+            if id.is_some() {
+                return Err(CmdError::Validation(format!(
+                    "{where_}: a gift card or loyalty tender is not an account — send its name, not an id"
+                )));
+            }
+            return Ok((typed.trim().to_owned(), None));
+        }
+    }
+
     if let Some(id) = id {
         let found = payment_method::Entity::find_by_id(id)
             .filter(payment_method::Column::DelStatus.eq(LIVE))
@@ -3947,15 +3966,27 @@ pub(crate) async fn promote_draft_in<C: ConnectionTrait + TransactionTrait>(
 
     // Blank means "keep what the draft already had", matching checkout's tolerance of
     // the till sending the field whether or not the cashier touched it.
-    // Whatever the draft already carried is the fallback, so promoting a basket that
-    // was parked with a tender does not make the cashier pick one again.
-    let typed = match payment_method.as_deref() {
-        Some(raw) if !raw.trim().is_empty() => Some(raw),
-        _ if !header.payment_method.trim().is_empty() => Some(header.payment_method.as_str()),
-        _ => None,
+    //
+    // The name and the id are taken **as a pair**, and anything the caller sends wins
+    // over what the draft was parked with — in both directions. Pairing a chosen name
+    // with the draft's id is how a promote silently charged the drawer: an
+    // `or(header.payment_method_id)` let the parked id outrank the tender just picked.
+    // Ignoring an id the caller *did* send is the same bug wearing the other hat.
+    let (typed, chosen_id) = match payment_method
+        .as_deref()
+        .filter(|raw| !raw.trim().is_empty())
+    {
+        Some(raw) => (Some(raw), payment_method_id),
+        None => match payment_method_id {
+            Some(id) => (None, Some(id)),
+            None => (
+                Some(header.payment_method.as_str()),
+                header.payment_method_id,
+            ),
+        },
     };
     let (method, tender_account) =
-        resolve_tender_in(&txn, payment_method_id.or(header.payment_method_id), typed, Some(SALE_PAYMENT_DEFAULT), "payment method")
+        resolve_tender_in(&txn, chosen_id, typed, Some(SALE_PAYMENT_DEFAULT), "payment method")
             .await?;
 
     // The lines are the record; the header's totals are a cache of them, so every
