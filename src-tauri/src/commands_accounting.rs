@@ -819,7 +819,10 @@ async fn lines_in<C: ConnectionTrait>(
         q = q.filter(deposit_withdraw::Column::OccurredAt.lte(d));
     }
     for r in q.all(conn).await? {
-        let sign = DepositKind::Deposit.sign();
+        // The row's own kind, never an assumed one. Hardcoding `Deposit` here read
+        // every withdrawal as an inflow, so a float top-up and cash taken to the bank
+        // both added — the balance said 70 where the drawer held 30.
+        let sign = DepositKind::parse(&r.kind)?.sign();
         push(
             &mut out,
             &mut account_ids,
@@ -1287,10 +1290,18 @@ pub(crate) async fn create_recurring_expense_in<C: ConnectionTrait + Transaction
         payment_method_id: Set(input.payment_method_id),
         rotation: Set(rotation.as_str().to_owned()),
         starts_on: Set(input.starts_on),
-        // Clamped to today. A schedule created with a start date in the past must not
-        // post a year of rent on its first run — a run catches up a schedule that was
-        // *missed*, which is different from one that was created late.
-        next_due_on: Set(Some(crate::migration::now().date().max(input.starts_on))),
+        // The first due date is the start date, full stop — **not** clamped to today.
+        //
+        // The clamp looked right and was wrong: setting `next_due_on` to today throws
+        // away the gap, so a schedule created with a start date in the past can never
+        // catch up, because there is nothing left to catch up on. It also made
+        // `as_at` useless for a backdated run, since the schedule was already future-dated.
+        //
+        // What actually prevents a year of rent on first run is that *creation posts
+        // nothing*: a run is a deliberate act, it takes the date it runs as at, and it
+        // reports what it posted. "Never retro-post" is a property of creating a
+        // schedule, not a property of the due date.
+        next_due_on: Set(Some(input.starts_on)),
         ends_on: Set(input.ends_on),
         note: Set(text(input.note)),
         created_by: Set(crate::auth::current_user_id()),
@@ -1556,6 +1567,30 @@ pub enum LedgerGroup {
     Expenses,
 }
 
+impl LedgerGroup {
+    /// Which side this account's balance sits on when it is positive.
+    ///
+    /// A trial balance only means anything if each line lands on the side its account
+    /// normally lives on. One global rule — positive means debit — is right for assets
+    /// and exactly wrong for revenue, payables and the owner's position, and it makes
+    /// the two columns unable to agree, which is the entire point of the report.
+    fn normal_side(&self) -> NormalSide {
+        match self {
+            // Assets and expenses grow on the debit side.
+            Self::Cash | Self::Receivables | Self::Expenses => NormalSide::Debit,
+            // Liabilities, revenue and the owner's own money grow on the credit side.
+            Self::Payables | Self::OwnerEquity | Self::Revenue => NormalSide::Credit,
+        }
+    }
+}
+
+/// The side an account normally sits on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NormalSide {
+    Debit,
+    Credit,
+}
+
 /// One line: a group, and how much sits on each side of it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1658,20 +1693,29 @@ pub(crate) async fn trial_balance_in<C: ConnectionTrait>(
         TrialLine { group: LedgerGroup::Payables, debit: Decimal::ZERO, credit: Decimal::ZERO, net: supplier_net },
         TrialLine { group: LedgerGroup::OwnerEquity, debit: Decimal::ZERO, credit: Decimal::ZERO, net: owner },
         TrialLine { group: LedgerGroup::Revenue, debit: Decimal::ZERO, credit: Decimal::ZERO, net: revenue },
-        TrialLine { group: LedgerGroup::Expenses, debit: Decimal::ZERO, credit: Decimal::ZERO, net: -expenses },
+        TrialLine { group: LedgerGroup::Expenses, debit: Decimal::ZERO, credit: Decimal::ZERO, net: expenses },
     ];
 
-    // A positive net is a debit balance, a negative one a credit balance. Splitting here
-    // rather than at the reader is what lets the two columns be added up at all.
+    // `net` is `debit − credit`, so it carries the opposite sign to the balance on a
+    // credit-natured account: a liability of 150 is a credit balance and reads −150.
+    // Splitting against the account's own normal side is what lets the two columns be
+    // added up at all.
     for line in &mut lines_out {
-        if line.net >= Decimal::ZERO {
-            line.debit = line.net;
+        let balance = match line.group.normal_side() {
+            NormalSide::Debit => line.net,
+            NormalSide::Credit => -line.net,
+        };
+        if balance >= Decimal::ZERO {
+            line.debit = balance;
         } else {
-            line.credit = -line.net;
+            line.credit = -balance;
         }
-        line.net = line.net.round_dp(MONEY_SCALE);
+        // Recomputed rather than kept, so `net` is *always* `debit − credit` as
+        // documented. Leaving it as the natural balance made a liability read
+        // positive, and every total built on it was wrong by that much.
         line.debit = line.debit.round_dp(MONEY_SCALE);
         line.credit = line.credit.round_dp(MONEY_SCALE);
+        line.net = (line.debit - line.credit).round_dp(MONEY_SCALE);
     }
 
     let total_debit = lines_out.iter().map(|l| l.debit).sum::<Decimal>().round_dp(MONEY_SCALE);
@@ -1719,13 +1763,15 @@ async fn net_customer_balances_in<C: ConnectionTrait>(conn: &C) -> CmdResult<Dec
 /// Net owed across every supplier, matching `supplier_balance_in`'s four terms:
 /// opening + purchases − returns − payments.
 async fn net_supplier_balances_in<C: ConnectionTrait>(conn: &C) -> CmdResult<Decimal> {
-    let opening: Option<Decimal> = supplier::Entity::find()
+    let opening = supplier::Entity::find()
         .select_only()
         .column_as(supplier::Column::OpeningBalance.sum(), "total")
         .filter(supplier::Column::DelStatus.eq(LIVE))
-        .into_tuple()
+        .into_tuple::<Option<Decimal>>()
         .one(conn)
-        .await?;
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
     let purchased = purchase::Entity::find()
         .select_only()
         .column_as(purchase::Column::GrandTotal.sum(), "total")
@@ -1753,7 +1799,7 @@ async fn net_supplier_balances_in<C: ConnectionTrait>(conn: &C) -> CmdResult<Dec
         .flatten()
         .unwrap_or(Decimal::ZERO);
 
-    Ok((opening.unwrap_or(Decimal::ZERO) + purchased - returned - paid).round_dp(MONEY_SCALE))
+    Ok((opening + purchased - returned - paid).round_dp(MONEY_SCALE))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1810,7 +1856,12 @@ pub(crate) async fn balance_sheet_in<C: ConnectionTrait>(
     let total_equity = total(&equity);
 
     Ok(BalanceSheet {
-        difference: (total_assets - total_liabilities - total_equity).round_dp(MONEY_SCALE),
+        // The signed sum, not `assets − liabilities − equity`. Every `net` already
+        // carries its own accounting sign — a liability and revenue are negative —
+        // so subtracting liabilities and equity again counted them twice, and a
+        // perfectly balanced book reported a difference equal to twice its own
+        // earnings.
+        difference: (total_assets + total_liabilities + total_equity).round_dp(MONEY_SCALE),
         assets,
         liabilities,
         equity,

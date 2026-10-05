@@ -10,6 +10,8 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::commands::{CmdError, CmdResult};
+
 /// Which way the money moved. A closed vocabulary, so a report can group on it
 /// without matching strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -36,6 +38,19 @@ impl DepositKind {
         match self {
             DepositKind::Deposit => Decimal::ONE,
             DepositKind::Withdraw => Decimal::NEGATIVE_ONE,
+        }
+    }
+
+    /// Read the column value back, so a reader signs a row by *its own* kind rather
+    /// than by an assumed one.
+    pub fn parse(raw: &str) -> CmdResult<Self> {
+        match raw {
+            "Deposit" => Ok(DepositKind::Deposit),
+            "Withdraw" => Ok(DepositKind::Withdraw),
+            other => Err(CmdError::Validation(format!(
+                "unknown deposit kind {}",
+                other
+            ))),
         }
     }
 }
