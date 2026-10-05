@@ -29,7 +29,7 @@ use crate::entities::catalog::{brand, fixed_asset_item, fixed_asset_movement, it
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
 use crate::entities::sales::{booking, combo_item, combo_sale, credit_note, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, loyalty_entry, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, service_rating, servicing, stock_movement, warranty};
-use crate::entities::trade::{customer, customer_receive, supplier, supplier_payment};
+use crate::entities::trade::{customer, customer_receive, payment_method, purchase, purchase_detail, purchase_return, purchase_return_detail, supplier, supplier_payment};
 
 const LIVE: &str = "Live";
 const DELETED: &str = "Deleted";
@@ -662,8 +662,13 @@ impl SupplierView {
     }
 }
 
-/// What we owe: the opening balance less payments. Purchases are Stage 6, so nothing
-/// else moves this number yet — adding them later is one more term in the sum.
+/// What we owe: what was already owed, plus everything received, less everything
+/// sent back and everything paid.
+///
+/// Four terms and no stored column, which is the point — a `balance` column would
+/// be a read-modify-write that two concurrent payments interleave. A negative
+/// result is a supplier who has been paid ahead, and is left negative rather than
+/// clamped, so the next invoice does not look like the one that caused it.
 pub async fn supplier_balance_in<C: ConnectionTrait>(conn: &C, supplier_id: i32) -> CmdResult<Decimal> {
     let opening = supplier::Entity::find_by_id(supplier_id)
         .select_only()
@@ -671,6 +676,28 @@ pub async fn supplier_balance_in<C: ConnectionTrait>(conn: &C, supplier_id: i32)
         .into_tuple::<Decimal>()
         .one(conn)
         .await?
+        .unwrap_or(Decimal::ZERO);
+
+    let purchased = purchase::Entity::find()
+        .select_only()
+        .column_as(purchase::Column::GrandTotal.sum(), "total")
+        .filter(purchase::Column::SupplierId.eq(supplier_id))
+        .filter(purchase::Column::DelStatus.eq(LIVE))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
+
+    let returned = purchase_return::Entity::find()
+        .select_only()
+        .column_as(purchase_return::Column::TotalAmount.sum(), "total")
+        .filter(purchase_return::Column::SupplierId.eq(supplier_id))
+        .filter(purchase_return::Column::DelStatus.eq(LIVE))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
         .unwrap_or(Decimal::ZERO);
 
     let paid = supplier_payment::Entity::find()
@@ -683,7 +710,7 @@ pub async fn supplier_balance_in<C: ConnectionTrait>(conn: &C, supplier_id: i32)
         .flatten()
         .unwrap_or(Decimal::ZERO);
 
-    Ok((opening - paid).round_dp(MONEY_SCALE))
+    Ok((opening + purchased - returned - paid).round_dp(MONEY_SCALE))
 }
 
 #[tauri::command]
@@ -2082,9 +2109,9 @@ fn like_term(raw: &str) -> String {
 ///
 /// `ColumnTrait::contains` emits `LIKE`, whose case sensitivity depends on the
 /// engine: SQLite's is ASCII-insensitive, Postgres's is case-**sensitive**, and
-/// MySQL's follows the column collation. So one search box returned different rows
-/// per backend, and on Postgres anything typed in capitals silently matched
-/// nothing — invisible until the suite ran on all three.
+/// MySQL's follows the column collation. So the same search box returned
+/// different rows per backend, and a Postgres install silently stopped finding
+/// anything typed in capitals — invisible until the suite ran on all three.
 /// Lowering both sides is the one spelling that agrees everywhere.
 ///
 /// `term` must already be `%`-wrapped by [`like_term`]; the wildcards are literal
@@ -2459,7 +2486,7 @@ const MOVEMENT_SALE: MovementType = MovementType::Sale;
 /// step with it, so this is the only definition of the number and every reader
 /// agrees on it by construction. Returns zero for an item that has never moved,
 /// because `SUM` over no rows is `NULL`.
-async fn on_hand_in<C: ConnectionTrait>(conn: &C, item_id: i32) -> Result<Decimal, DbErr> {
+pub(crate) async fn on_hand_in<C: ConnectionTrait>(conn: &C, item_id: i32) -> Result<Decimal, DbErr> {
     let sum = stock_movement::Entity::find()
         .select_only()
         .column_as(stock_movement::Column::Quantity.sum(), "total")
@@ -7389,4 +7416,931 @@ pub async fn health_check() -> CmdResult<i64> {
     let db = db();
     let units = unit::Entity::find().count(db).await?;
     Ok(units as i64)
+}
+
+// ---------------------------------------------------------------------------
+// Purchases
+// ---------------------------------------------------------------------------
+
+/// One line as typed, before the server has decided anything.
+///
+/// `batch_no` / `expiry_date` name a lot to receive into; a lot that already
+/// exists is matched rather than duplicated, because receiving a second delivery
+/// of the same production run is ordinary and refusing it would be wrong.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseLineInput {
+    pub item_id: i32,
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    #[serde(default)]
+    pub batch_id: Option<i32>,
+    #[serde(default)]
+    pub batch_no: Option<String>,
+    #[serde(default)]
+    pub expiry_date: Option<chrono::NaiveDate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchasePaymentInput {
+    /// Must name a live `payment_methods` row. A free-text tender would split
+    /// one method across spellings in every report.
+    pub payment_method_id: i32,
+    pub amount: Decimal,
+    #[serde(default)]
+    pub reference: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseInput {
+    pub supplier_id: i32,
+    /// The supplier's own invoice number. Null is normal.
+    #[serde(default)]
+    pub supplier_invoice_no: Option<String>,
+    pub purchased_at: chrono::NaiveDate,
+    pub lines: Vec<PurchaseLineInput>,
+    /// Either an amount (`"25000"`) or a percentage (`"10%"`), as typed. Resolved
+    /// to an amount before it is stored, so the column never means two things.
+    #[serde(default)]
+    pub discount: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Tenders made while receiving. Each becomes a `supplier_payments` row
+    /// naming this purchase. Partial or absent is normal; overpaying is allowed
+    /// and leaves the supplier's balance negative, which is what being owed money
+    /// by a supplier looks like.
+    #[serde(default)]
+    pub payments: Option<Vec<PurchasePaymentInput>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseLineView {
+    pub id: i32,
+    pub item_id: i32,
+    pub item_name: String,
+    pub item_code: String,
+    pub batch_id: Option<i32>,
+    pub batch_no: Option<String>,
+    pub expiry_date: Option<chrono::NaiveDate>,
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    pub total: Decimal,
+    /// How much of this line has already been sent back, summed over the return
+    /// rows. Derived rather than stored so two partial returns cannot overstate
+    /// what is left.
+    pub returned_quantity: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseView {
+    pub id: i32,
+    pub reference_no: String,
+    pub supplier_id: i32,
+    pub supplier_name: String,
+    pub supplier_invoice_no: Option<String>,
+    pub purchased_at: chrono::NaiveDate,
+    pub subtotal: Decimal,
+    pub discount: Decimal,
+    pub grand_total: Decimal,
+    pub paid_total: Decimal,
+    pub due_total: Decimal,
+    /// `Paid` / `Partial` / `Unpaid`, derived from `paid_total`.
+    pub status: String,
+    pub note: Option<String>,
+    pub created_at: chrono::NaiveDateTime,
+    pub lines: Vec<PurchaseLineView>,
+    pub payments: Vec<PurchasePaymentView>,
+}
+
+/// A tender against a purchase. The same row as a payment on account — what
+/// changes is that it names the purchase it settles.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchasePaymentView {
+    pub id: i32,
+    pub payment_method_id: Option<i32>,
+    pub payment_method_name: Option<String>,
+    pub amount: Decimal,
+    pub reference: Option<String>,
+    pub paid_at: chrono::NaiveDateTime,
+}
+
+/// `Paid` / `Partial` / `Unpaid`, from what was actually paid. Not stored: the
+/// reference keeps a `due_amount` column that has to be recomputed on every
+/// payment, and this is the figure that recomputation is for.
+fn purchase_status(grand_total: Decimal, paid: Decimal) -> &'static str {
+    if paid >= grand_total {
+        "Paid"
+    } else if paid > Decimal::ZERO {
+        "Partial"
+    } else {
+        "Unpaid"
+    }
+}
+
+/// What has been paid against one purchase: `SUM` over the supplier payments
+/// naming it.
+async fn purchase_paid_in<C: ConnectionTrait>(conn: &C, purchase_id: i32) -> CmdResult<Decimal> {
+    let paid = supplier_payment::Entity::find()
+        .select_only()
+        .column_as(supplier_payment::Column::Amount.sum(), "total")
+        .filter(supplier_payment::Column::PurchaseId.eq(purchase_id))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
+
+    Ok(paid.round_dp(MONEY_SCALE))
+}
+
+/// `"10%"` against a subtotal is 10% of it; `"25000"` is 25000 whatever the
+/// subtotal. Capped at the subtotal so a discount cannot make goods free — or,
+/// as a percentage above 100, make the shop owe the supplier for stock it has
+/// received.
+fn resolve_purchase_discount(raw: Option<&str>, subtotal: Decimal) -> CmdResult<Decimal> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(Decimal::ZERO);
+    };
+
+    let is_percent = raw.ends_with('%');
+    let digits = raw.trim_end_matches('%').trim();
+    let value: Decimal = digits.parse().map_err(|_| {
+        CmdError::Validation("discount must be an amount or a percentage".into())
+    })?;
+
+    if value < Decimal::ZERO {
+        return Err(CmdError::Validation("discount cannot be negative".into()));
+    }
+
+    let amount = if is_percent {
+        subtotal * value / Decimal::from(100)
+    } else {
+        value
+    };
+
+    Ok(amount
+        .min(subtotal)
+        .round_dp(MONEY_SCALE))
+}
+
+fn validate_purchase(input: &PurchaseInput) -> CmdResult<()> {
+    if input.lines.is_empty() {
+        return Err(CmdError::Validation(
+            "a purchase needs at least one line".into(),
+        ));
+    }
+    for line in &input.lines {
+        if line.quantity <= Decimal::ZERO {
+            return Err(CmdError::Validation(
+                "purchased quantity must be greater than zero".into(),
+            ));
+        }
+        if line.unit_price < Decimal::ZERO {
+            return Err(CmdError::Validation(
+                "unit price cannot be negative".into(),
+            ));
+        }
+    }
+    for payment in input.payments.iter().flatten() {
+        if payment.amount <= Decimal::ZERO {
+            return Err(CmdError::Validation(
+                "payment amount must be greater than zero".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The lot a line is received into, creating it when the operator named a new
+/// `batch_no`. Matching on `batch_no` rather than only on `batch_id` is what lets
+/// a second delivery of the same production run land in the lot it belongs to.
+async fn resolve_batch_in<C: ConnectionTrait>(
+    conn: &C,
+    line: &PurchaseLineInput,
+) -> CmdResult<Option<i32>> {
+    if let Some(batch_id) = line.batch_id {
+        let live = item_batch::Entity::find_by_id(batch_id)
+            .filter(item_batch::Column::ItemId.eq(line.item_id))
+            .filter(item_batch::Column::DelStatus.eq(LIVE))
+            .one(conn)
+            .await?;
+        if live.is_none() {
+            return Err(CmdError::NotFound("batch".into()));
+        }
+        return Ok(Some(batch_id));
+    }
+
+    let Some(batch_no) = line.batch_no.as_deref().map(str::trim).filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    let batch_no = required(batch_no, "batch number")?;
+
+    let existing = item_batch::Entity::find()
+        .filter(item_batch::Column::ItemId.eq(line.item_id))
+        .filter(item_batch::Column::BatchNo.eq(&batch_no))
+        .filter(item_batch::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?;
+    if let Some(existing) = existing {
+        return Ok(Some(existing.id));
+    }
+
+    let created = create_item_batch_in(
+        conn,
+        BatchInput {
+            item_id: line.item_id,
+            batch_no,
+            expiry_date: line.expiry_date,
+        },
+    )
+    .await?;
+    Ok(Some(created.id))
+}
+
+#[tauri::command]
+pub async fn list_payment_methods() -> CmdResult<Vec<payment_method::Model>> {
+    crate::commands_auth::require_permission(db(), "purchase-list").await?;
+    let db = db();
+    payment_method::Entity::find()
+        .filter(payment_method::Column::DelStatus.eq(LIVE))
+        .order_by_asc(payment_method::Column::Id)
+        .all(db)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn list_purchases(query: PageQuery) -> CmdResult<Page<PurchaseView>> {
+    crate::commands_auth::require_permission(db(), "purchase-list").await?;
+    list_purchases_in(db(), query).await
+}
+
+pub(crate) async fn list_purchases_in<C: ConnectionTrait>(
+    conn: &C,
+    query: PageQuery,
+) -> CmdResult<Page<PurchaseView>> {
+    let mut q = purchase::Entity::find().filter(purchase::Column::DelStatus.eq(LIVE));
+
+    if let Some(term) = query.term() {
+        let like = like_term(&term);
+        // Searching the supplier's name means resolving the matching suppliers
+        // first: SeaORM has no correlated subquery to hang off the outer filter.
+        let supplier_ids: Vec<i32> = supplier::Entity::find()
+            .select_only()
+            .column(supplier::Column::Id)
+            .filter(contains_ci(supplier::Column::Name, &like))
+            .into_tuple()
+            .all(conn)
+            .await?;
+
+        let mut any = Condition::any()
+            .add(contains_ci(purchase::Column::ReferenceNo, &like))
+            .add(contains_ci(purchase::Column::SupplierInvoiceNo, &like));
+        if !supplier_ids.is_empty() {
+            any = any.add(purchase::Column::SupplierId.is_in(supplier_ids));
+        }
+        q = q.filter(any);
+    }
+
+    let total = q.clone().count(conn).await?;
+    let rows = q
+        .order_by_desc(purchase::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(conn)
+        .await?;
+
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let paid = purchase_paid_in(conn, row.id).await?;
+        views.push(purchase_view(row, paid, Vec::new(), Vec::new()));
+    }
+    Ok(Page::new(views, total, &query))
+}
+
+#[tauri::command]
+pub async fn get_purchase(id: i32) -> CmdResult<PurchaseView> {
+    crate::commands_auth::require_permission(db(), "purchase-show").await?;
+    get_purchase_in(db(), id).await
+}
+
+pub(crate) async fn get_purchase_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+) -> CmdResult<PurchaseView> {
+    let row = purchase::Entity::find_by_id(id)
+        .filter(purchase::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("purchase".into()))?;
+
+    let supplier_name = supplier::Entity::find_by_id(row.supplier_id)
+        .one(conn)
+        .await?
+        .map(|s| s.name)
+        .unwrap_or_default();
+
+    let lines = purchase_lines_in(conn, id).await?;
+    let payments = purchase_payments_in(conn, id).await?;
+    let paid = payments.iter().map(|p| p.amount).sum::<Decimal>().round_dp(MONEY_SCALE);
+
+    let mut view = purchase_view(row, paid, lines, payments);
+    view.supplier_name = supplier_name;
+    Ok(view)
+}
+
+fn purchase_view(
+    row: purchase::Model,
+    paid: Decimal,
+    lines: Vec<PurchaseLineView>,
+    payments: Vec<PurchasePaymentView>,
+) -> PurchaseView {
+    PurchaseView {
+        reference_no: row.reference_no,
+        supplier_invoice_no: row.supplier_invoice_no,
+        purchased_at: row.purchased_at,
+        subtotal: row.subtotal,
+        discount: row.discount,
+        grand_total: row.grand_total,
+        due_total: (row.grand_total - paid).round_dp(MONEY_SCALE),
+        status: purchase_status(row.grand_total, paid).to_owned(),
+        note: row.note,
+        created_at: row.created_at,
+        id: row.id,
+        supplier_id: row.supplier_id,
+        supplier_name: String::new(),
+        lines,
+        payments,
+        paid_total: paid,
+    }
+}
+
+/// The payments naming one purchase, each with its tender's name resolved.
+async fn purchase_payments_in<C: ConnectionTrait>(
+    conn: &C,
+    purchase_id: i32,
+) -> CmdResult<Vec<PurchasePaymentView>> {
+    let rows = supplier_payment::Entity::find()
+        .filter(supplier_payment::Column::PurchaseId.eq(purchase_id))
+        .order_by_asc(supplier_payment::Column::Id)
+        .all(conn)
+        .await?;
+
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name = match row.payment_method_id {
+            Some(id) => payment_method::Entity::find_by_id(id)
+                .one(conn)
+                .await?
+                .map(|m| m.name),
+            None => None,
+        };
+        views.push(PurchasePaymentView {
+            payment_method_id: row.payment_method_id,
+            payment_method_name: name,
+            amount: row.amount,
+            reference: row.reference,
+            paid_at: row.paid_at,
+            id: row.id,
+        });
+    }
+    Ok(views)
+}
+
+async fn purchase_lines_in<C: ConnectionTrait>(
+    conn: &C,
+    purchase_id: i32,
+) -> CmdResult<Vec<PurchaseLineView>> {
+    let rows = purchase_detail::Entity::find()
+        .filter(purchase_detail::Column::PurchaseId.eq(purchase_id))
+        .order_by_asc(purchase_detail::Column::Id)
+        .all(conn)
+        .await?;
+
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let found = item::Entity::find_by_id(row.item_id).one(conn).await?;
+        let (batch_no, expiry_date) = match row.batch_id {
+            Some(id) => {
+                let batch = item_batch::Entity::find_by_id(id).one(conn).await?;
+                match batch {
+                    Some(b) => (Some(b.batch_no), b.expiry_date),
+                    None => (None, None),
+                }
+            }
+            None => (None, None),
+        };
+
+        views.push(PurchaseLineView {
+            quantity: row.quantity,
+            unit_price: row.unit_price,
+            total: row.total,
+            returned_quantity: returned_quantity_in(conn, row.id).await?,
+            batch_no,
+            expiry_date,
+            id: row.id,
+            item_id: row.item_id,
+            item_name: found.as_ref().map(|i| i.name.clone()).unwrap_or_default(),
+            item_code: found.map(|i| i.code).unwrap_or_default(),
+            batch_id: row.batch_id,
+        });
+    }
+    Ok(views)
+}
+
+/// How much of one purchase line has already gone back to the supplier, summed
+/// over the return rows naming it.
+async fn returned_quantity_in<C: ConnectionTrait>(
+    conn: &C,
+    purchase_detail_id: i32,
+) -> CmdResult<Decimal> {
+    let returned = purchase_return_detail::Entity::find()
+        .inner_join(purchase_return::Entity)
+        .select_only()
+        .column_as(purchase_return_detail::Column::Quantity.sum(), "total")
+        .filter(purchase_return::Column::DelStatus.eq(LIVE))
+        .filter(purchase_return_detail::Column::PurchaseDetailId.eq(purchase_detail_id))
+        .into_tuple::<Option<Decimal>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(Decimal::ZERO);
+
+    Ok(returned.round_dp(MONEY_SCALE))
+}
+
+#[tauri::command]
+pub async fn create_purchase(input: PurchaseInput) -> CmdResult<PurchaseView> {
+    crate::commands_auth::require_permission(db(), "purchase-create").await?;
+    create_purchase_in(db(), input).await
+}
+
+/// Receive goods from a supplier.
+///
+/// **One transaction, and one ledger row per line.** The reference writes no stock
+/// movement when a purchase is recorded, so in the reference goods received
+/// through a purchase never reach its stock views. Here on-hand is
+/// `SUM(quantity)` over `stock_movements`, so a purchase that wrote nothing would
+/// be a purchase that never reaches the shelf — and the whole point of receiving
+/// goods is that they arrive.
+pub(crate) async fn create_purchase_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    input: PurchaseInput,
+) -> CmdResult<PurchaseView> {
+    validate_purchase(&input)?;
+
+    // Every read below goes through `txn`, never `conn`. SQLite is opened with
+    // `max_connections(1)`, so a query on the pool while the transaction holds
+    // the only connection waits for itself and fails with `ConnectionAcquire
+    // (Timeout)`. The transaction is opened first so nothing needs the pool again.
+    let txn = conn.begin().await?;
+    let now = crate::migration::now();
+
+    supplier::Entity::find_by_id(input.supplier_id)
+        .filter(supplier::Column::DelStatus.eq(LIVE))
+        .one(&txn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("supplier".into()))?;
+
+    for payment in input.payments.iter().flatten() {
+        let live = payment_method::Entity::find_by_id(payment.payment_method_id)
+            .filter(payment_method::Column::DelStatus.eq(LIVE))
+            .one(&txn)
+            .await?;
+        if live.is_none() {
+            return Err(CmdError::NotFound("payment method".into()));
+        }
+    }
+
+    let mut lines = Vec::with_capacity(input.lines.len());
+    let mut subtotal = Decimal::ZERO;
+    for line in &input.lines {
+        guard_stock_item(&txn, line.item_id).await?;
+        let batch_id = resolve_batch_in(&txn, line).await?;
+        let total = (line.quantity * line.unit_price).round_dp(MONEY_SCALE);
+        subtotal += total;
+        lines.push((line, batch_id, total));
+    }
+    subtotal = subtotal.round_dp(MONEY_SCALE);
+
+    let discount = resolve_purchase_discount(input.discount.as_deref(), subtotal)?;
+    let grand_total = (subtotal - discount).round_dp(MONEY_SCALE);
+
+    let inserted = purchase::ActiveModel {
+        reference_no: Set(String::new()),
+        supplier_id: Set(input.supplier_id),
+        supplier_invoice_no: Set(text(input.supplier_invoice_no.clone())),
+        purchased_at: Set(input.purchased_at),
+        subtotal: Set(subtotal),
+        discount: Set(discount),
+        grand_total: Set(grand_total),
+        note: Set(text(input.note.clone())),
+        created_by: Set(crate::auth::current_user_id()),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
+
+    // From the primary key, not MAX(reference_no) + 1: two purchases committed at
+    // once read the same MAX.
+    let reference_no = format!("PUR-{:06}", inserted.id);
+    let mut header: purchase::ActiveModel = inserted.into();
+    header.reference_no = Set(reference_no.clone());
+    let row = header.update(&txn).await?;
+
+    for (line, batch_id, total) in &lines {
+        purchase_detail::ActiveModel {
+            purchase_id: Set(row.id),
+            item_id: Set(line.item_id),
+            batch_id: Set(*batch_id),
+            quantity: Set(line.quantity),
+            unit_price: Set(line.unit_price),
+            total: Set(*total),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+
+        append_batch_stock_row(
+            &txn,
+            line.item_id,
+            *batch_id,
+            MovementType::GoodsReceipt,
+            line.quantity,
+            Some(reference_no.clone()),
+        )
+        .await?;
+    }
+
+    for payment in input.payments.iter().flatten() {
+        supplier_payment::ActiveModel {
+            supplier_id: Set(row.supplier_id),
+            purchase_id: Set(Some(row.id)),
+            payment_method_id: Set(Some(payment.payment_method_id)),
+            amount: Set(payment.amount),
+            reference: Set(text(payment.reference.clone())),
+            paid_at: Set(now),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+    }
+
+    txn.commit().await?;
+
+    get_purchase_in(conn, row.id).await
+}
+
+/// Settle a purchase after the fact, for the common case of receiving goods on
+/// credit and settling the invoice at the end of the week.
+#[tauri::command]
+pub async fn record_purchase_payment(
+    purchase_id: i32,
+    input: PurchasePaymentInput,
+) -> CmdResult<PurchaseView> {
+    crate::commands_auth::require_permission(db(), "purchase-payment").await?;
+    record_purchase_payment_in(db(), purchase_id, input).await
+}
+
+pub(crate) async fn record_purchase_payment_in<C: ConnectionTrait>(
+    conn: &C,
+    purchase_id: i32,
+    input: PurchasePaymentInput,
+) -> CmdResult<PurchaseView> {
+    if input.amount <= Decimal::ZERO {
+        return Err(CmdError::Validation(
+            "payment amount must be greater than zero".into(),
+        ));
+    }
+    let purchase_row = purchase::Entity::find_by_id(purchase_id)
+        .filter(purchase::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("purchase".into()))?;
+
+    payment_method::Entity::find_by_id(input.payment_method_id)
+        .filter(payment_method::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("payment method".into()))?;
+
+    // Overpaying is allowed and leaves the balance negative: that is what a
+    // supplier who has been paid ahead looks like, and clamping it to zero would
+    // make the next invoice look like the one that caused it.
+    let now = crate::migration::now();
+    supplier_payment::ActiveModel {
+        supplier_id: Set(purchase_row.supplier_id),
+        purchase_id: Set(Some(purchase_id)),
+        payment_method_id: Set(Some(input.payment_method_id)),
+        amount: Set(input.amount),
+        reference: Set(text(input.reference)),
+        paid_at: Set(now),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(conn)
+    .await?;
+
+    get_purchase_in(conn, purchase_id).await
+}
+
+// ---------------------------------------------------------------------------
+// Purchase returns
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseReturnLineInput {
+    /// Which purchase line is being corrected. Named rather than just the item,
+    /// so a purchase of the same item twice cannot be drawn down against the
+    /// wrong line.
+    pub purchase_detail_id: i32,
+    pub quantity: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseReturnInput {
+    pub purchase_id: i32,
+    pub returned_at: chrono::NaiveDate,
+    pub lines: Vec<PurchaseReturnLineInput>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseReturnLineView {
+    pub id: i32,
+    pub item_id: i32,
+    pub item_name: String,
+    pub item_code: String,
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    pub total: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseReturnView {
+    pub id: i32,
+    pub reference_no: String,
+    pub purchase_id: i32,
+    pub purchase_reference_no: String,
+    pub supplier_id: i32,
+    pub supplier_name: String,
+    pub returned_at: chrono::NaiveDate,
+    pub total_amount: Decimal,
+    pub note: Option<String>,
+    pub created_at: chrono::NaiveDateTime,
+    pub lines: Vec<PurchaseReturnLineView>,
+}
+
+#[tauri::command]
+pub async fn list_purchase_returns(query: PageQuery) -> CmdResult<Page<PurchaseReturnView>> {
+    crate::commands_auth::require_permission(db(), "purchase-return-list").await?;
+    list_purchase_returns_in(db(), query).await
+}
+
+pub(crate) async fn list_purchase_returns_in<C: ConnectionTrait>(
+    conn: &C,
+    query: PageQuery,
+) -> CmdResult<Page<PurchaseReturnView>> {
+    let db = conn;
+    let mut q = purchase_return::Entity::find().filter(purchase_return::Column::DelStatus.eq(LIVE));
+
+    if let Some(term) = query.term() {
+        let like = like_term(&term);
+        let supplier_ids: Vec<i32> = supplier::Entity::find()
+            .select_only()
+            .column(supplier::Column::Id)
+            .filter(contains_ci(supplier::Column::Name, &like))
+            .into_tuple()
+            .all(db)
+            .await?;
+
+        let mut any =
+            Condition::any().add(contains_ci(purchase_return::Column::ReferenceNo, &like));
+        if !supplier_ids.is_empty() {
+            any = any.add(purchase_return::Column::SupplierId.is_in(supplier_ids));
+        }
+        q = q.filter(any);
+    }
+
+    let total = q.clone().count(db).await?;
+    let rows = q
+        .order_by_desc(purchase_return::Column::Id)
+        .offset(query.offset())
+        .limit(query.per_page())
+        .all(db)
+        .await?;
+
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        views.push(purchase_return_view(row, Vec::new(), String::new(), String::new()));
+    }
+    Ok(Page::new(views, total, &query))
+}
+
+#[tauri::command]
+pub async fn get_purchase_return(id: i32) -> CmdResult<PurchaseReturnView> {
+    crate::commands_auth::require_permission(db(), "purchase-return-show").await?;
+    get_purchase_return_in(db(), id).await
+}
+
+pub(crate) async fn get_purchase_return_in<C: ConnectionTrait>(
+    conn: &C,
+    id: i32,
+) -> CmdResult<PurchaseReturnView> {
+    let row = purchase_return::Entity::find_by_id(id)
+        .filter(purchase_return::Column::DelStatus.eq(LIVE))
+        .one(conn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("purchase return".into()))?;
+
+    let purchase_row = purchase::Entity::find_by_id(row.purchase_id).one(conn).await?;
+    let supplier_name = supplier::Entity::find_by_id(row.supplier_id)
+        .one(conn)
+        .await?
+        .map(|s| s.name)
+        .unwrap_or_default();
+
+    let detail_rows = purchase_return_detail::Entity::find()
+        .filter(purchase_return_detail::Column::PurchaseReturnId.eq(id))
+        .order_by_asc(purchase_return_detail::Column::Id)
+        .all(conn)
+        .await?;
+
+    let mut lines = Vec::with_capacity(detail_rows.len());
+    for detail in detail_rows {
+        let found = item::Entity::find_by_id(detail.item_id).one(conn).await?;
+        lines.push(PurchaseReturnLineView {
+            quantity: detail.quantity,
+            unit_price: detail.unit_price,
+            total: detail.total,
+            id: detail.id,
+            item_id: detail.item_id,
+            item_name: found.as_ref().map(|i| i.name.clone()).unwrap_or_default(),
+            item_code: found.map(|i| i.code).unwrap_or_default(),
+        });
+    }
+
+    Ok(purchase_return_view(
+        row,
+        lines,
+        purchase_row.map(|p| p.reference_no).unwrap_or_default(),
+        supplier_name,
+    ))
+}
+
+fn purchase_return_view(
+    row: purchase_return::Model,
+    lines: Vec<PurchaseReturnLineView>,
+    purchase_reference_no: String,
+    supplier_name: String,
+) -> PurchaseReturnView {
+    PurchaseReturnView {
+        reference_no: row.reference_no,
+        purchase_id: row.purchase_id,
+        supplier_id: row.supplier_id,
+        returned_at: row.returned_at,
+        total_amount: row.total_amount,
+        note: row.note,
+        created_at: row.created_at,
+        id: row.id,
+        supplier_name,
+        purchase_reference_no,
+        lines,
+    }
+}
+
+/// Send goods back to a supplier.
+///
+/// The correction path for a purchase, which is why a purchase cannot itself be
+/// edited: the ledger already recorded the receipt and the supplier balance
+/// already moved. Each line takes its price from the purchase line, so the credit
+/// is the figure that was originally invoiced rather than one re-agreed now.
+#[tauri::command]
+pub async fn create_purchase_return(
+    input: PurchaseReturnInput,
+) -> CmdResult<PurchaseReturnView> {
+    crate::commands_auth::require_permission(db(), "purchase-return-create").await?;
+    create_purchase_return_in(db(), input).await
+}
+
+pub(crate) async fn create_purchase_return_in<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    input: PurchaseReturnInput,
+) -> CmdResult<PurchaseReturnView> {
+    if input.lines.is_empty() {
+        return Err(CmdError::Validation(
+            "a purchase return needs at least one line".into(),
+        ));
+    }
+
+    let txn = conn.begin().await?;
+    let now = crate::migration::now();
+
+    // `txn` throughout, for the one-connection reason above.
+    let purchase_row = purchase::Entity::find_by_id(input.purchase_id)
+        .filter(purchase::Column::DelStatus.eq(LIVE))
+        .one(&txn)
+        .await?
+        .ok_or_else(|| CmdError::NotFound("purchase".into()))?;
+
+    let mut total_amount = Decimal::ZERO;
+
+    // Resolved before the header is written so a bad line leaves nothing behind.
+    let mut lines = Vec::with_capacity(input.lines.len());
+    for line in &input.lines {
+        if line.quantity <= Decimal::ZERO {
+            return Err(CmdError::Validation(
+                "returned quantity must be greater than zero".into(),
+            ));
+        }
+        let detail = purchase_detail::Entity::find_by_id(line.purchase_detail_id)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| CmdError::NotFound("purchase line".into()))?;
+        if detail.purchase_id != purchase_row.id {
+            return Err(CmdError::Validation(
+                "that line belongs to a different purchase".into(),
+            ));
+        }
+
+        let already = returned_quantity_in(&txn, detail.id).await?;
+        if already + line.quantity > detail.quantity {
+            return Err(CmdError::Validation(format!(
+                "only {} of this line is left to return",
+                detail.quantity - already
+            )));
+        }
+
+        let total = (line.quantity * detail.unit_price).round_dp(MONEY_SCALE);
+        total_amount += total;
+        lines.push((detail, line.quantity, total));
+    }
+    total_amount = total_amount.round_dp(MONEY_SCALE);
+
+    let inserted = purchase_return::ActiveModel {
+        reference_no: Set(String::new()),
+        purchase_id: Set(purchase_row.id),
+        supplier_id: Set(purchase_row.supplier_id),
+        returned_at: Set(input.returned_at),
+        total_amount: Set(total_amount),
+        note: Set(text(input.note.clone())),
+        created_by: Set(crate::auth::current_user_id()),
+        del_status: Set(LIVE.to_owned()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
+
+    let reference_no = format!("PRT-{:06}", inserted.id);
+    let mut header: purchase_return::ActiveModel = inserted.into();
+    header.reference_no = Set(reference_no.clone());
+    let row = header.update(&txn).await?;
+
+    for (detail, quantity, total) in &lines {
+        purchase_return_detail::ActiveModel {
+            purchase_return_id: Set(row.id),
+            purchase_detail_id: Set(detail.id),
+            item_id: Set(detail.item_id),
+            quantity: Set(*quantity),
+            unit_price: Set(detail.unit_price),
+            total: Set(*total),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+
+        // Negative, because these goods leave the shelf. FEFO is a sale-time
+        // concern; returning goods against the lot they arrived in is what makes
+        // the lot's balance add up.
+        append_batch_stock_row(
+            &txn,
+            detail.item_id,
+            detail.batch_id,
+            MovementType::PurchaseReturn,
+            -*quantity,
+            Some(reference_no.clone()),
+        )
+        .await?;
+    }
+
+    txn.commit().await?;
+
+    get_purchase_return_in(conn, row.id).await
 }

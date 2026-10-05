@@ -188,7 +188,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
     use crate::entities::sales::stock_movement::MovementType;
     use crate::entities::sales::{booking, combo_sale, quotation, quotation_detail, sale, sale_detail, stock_movement};
-    use crate::entities::trade::{customer, supplier, supplier_payment};
+    use crate::entities::trade::{customer, payment_method, supplier, supplier_payment};
 
     fn days_ago(n: i64) -> chrono::NaiveDateTime {
         crate::migration::now() - chrono::Duration::days(n)
@@ -3262,6 +3262,516 @@ mod tests {
         let refunded: Decimal = listed.iter().map(|r| r.refunded_total).sum();
         assert_eq!(refunded, Decimal::new(15_000, 3));
     }
+
+    // -----------------------------------------------------------------------
+        // Purchases
+        //
+        // The two claims worth a test are the ones the reference gets wrong: a
+        // purchase must move stock (it writes a ledger row), and what is owed must be
+        // derived from the payments rather than stored beside them.
+        // -----------------------------------------------------------------------
+
+        async fn seed_supplier(db: &DatabaseConnection, opening: Decimal) -> i32 {
+            let now = migration::now();
+            supplier::ActiveModel {
+                name: Set("Wholesale".into()),
+                opening_balance: Set(opening),
+                del_status: Set("Live".into()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("seed supplier")
+            .id
+        }
+
+        /// The seeded tenders, so a payment names a real row rather than a magic id.
+        async fn cash_method(db: &DatabaseConnection) -> i32 {
+            payment_method::Entity::find()
+                .filter(payment_method::Column::Name.eq("Cash"))
+                .one(db)
+                .await
+                .expect("cash method lookup")
+                .expect("cash method is seeded by the migration")
+                .id
+        }
+
+        fn purchase_line(item_id: i32, quantity: Decimal, unit_price: Decimal) -> commands::PurchaseLineInput {
+            commands::PurchaseLineInput {
+                item_id,
+                quantity,
+                unit_price,
+                batch_id: None,
+                batch_no: None,
+                expiry_date: None,
+            }
+        }
+
+        fn purchase_input(supplier_id: i32, lines: Vec<commands::PurchaseLineInput>) -> commands::PurchaseInput {
+            commands::PurchaseInput {
+                supplier_id,
+                supplier_invoice_no: None,
+                purchased_at: chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
+                lines,
+                discount: None,
+                note: None,
+                payments: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn receiving_goods_puts_them_on_the_shelf() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+
+            let view = commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(5_000, 3), Decimal::new(2_000, 3))]),
+            )
+            .await
+            .expect("receive goods");
+
+            // On-hand is `SUM(quantity)` over the ledger, so a purchase that wrote no
+            // movement would leave the item at zero — goods received but not on the
+            // shelf, which is the reference's behaviour.
+            assert_eq!(view.lines.len(), 1);
+            assert_eq!(view.lines[0].returned_quantity, Decimal::ZERO);
+
+            let on_hand = commands::on_hand_in(&db, item_id).await.unwrap();
+            assert_eq!(on_hand, Decimal::new(5_000, 3), "received goods are on the shelf");
+        }
+
+        #[tokio::test]
+        async fn a_purchase_is_worth_the_sum_of_its_lines_less_the_discount() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+
+            let mut input = purchase_input(
+                supplier_id,
+                vec![purchase_line(item_id, Decimal::new(4_000, 3), Decimal::new(2_500, 3))],
+            );
+            input.discount = Some("10%".into());
+
+            let view = commands::create_purchase_in(&db, input).await.expect("receive goods");
+
+            assert_eq!(view.subtotal, Decimal::new(10_000, 3));
+            // Resolved to an amount before storage, so the column never means
+            // "percentage" or "amount" depending on its text.
+            assert_eq!(view.discount, Decimal::new(1_000, 3));
+            assert_eq!(view.grand_total, Decimal::new(9_000, 3));
+        }
+
+        #[tokio::test]
+        async fn a_discount_larger_than_the_goods_leaves_the_total_at_zero() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+
+            let mut input = purchase_input(
+                supplier_id,
+                vec![purchase_line(item_id, Decimal::new(1_000, 3), Decimal::new(5_000, 3))],
+            );
+            input.discount = Some("500%".into());
+
+            let view = commands::create_purchase_in(&db, input).await.expect("receive goods");
+
+            assert_eq!(view.discount, Decimal::new(5_000, 3));
+            assert_eq!(view.grand_total, Decimal::ZERO, "a discount cannot make the shop owe credit for goods it received");
+        }
+
+        #[tokio::test]
+        async fn what_a_purchase_owes_follows_the_payments() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+            let cash = cash_method(&db).await;
+
+            let view = commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(10_000, 3), Decimal::new(1_000, 3))]),
+            )
+            .await
+            .expect("receive goods");
+
+            assert_eq!(view.status, "Unpaid");
+            assert_eq!(view.due_total, Decimal::new(10_000, 3));
+
+            let partial = commands::record_purchase_payment_in(
+                &db,
+                view.id,
+                commands::PurchasePaymentInput {
+                    payment_method_id: cash,
+                    amount: Decimal::new(4_000, 3),
+                    reference: None,
+                },
+            )
+            .await
+            .expect("part payment");
+
+            assert_eq!(partial.paid_total, Decimal::new(4_000, 3));
+            assert_eq!(partial.due_total, Decimal::new(6_000, 3));
+            assert_eq!(partial.status, "Partial");
+
+            let settled = commands::record_purchase_payment_in(
+                &db,
+                view.id,
+                commands::PurchasePaymentInput {
+                    payment_method_id: cash,
+                    amount: Decimal::new(6_000, 3),
+                    reference: None,
+                },
+            )
+            .await
+            .expect("settle");
+
+            assert_eq!(settled.status, "Paid");
+            assert_eq!(settled.due_total, Decimal::ZERO);
+        }
+
+        #[tokio::test]
+        async fn a_payment_above_the_total_leaves_the_supplier_owed_the_change() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+            let cash = cash_method(&db).await;
+
+            let view = commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(1_000, 3), Decimal::new(5_000, 3))]),
+            )
+            .await
+            .expect("receive goods");
+
+            commands::record_purchase_payment_in(
+                &db,
+                view.id,
+                commands::PurchasePaymentInput {
+                    payment_method_id: cash,
+                    amount: Decimal::new(8_000, 3),
+                    reference: None,
+                },
+            )
+            .await
+            .expect("overpay");
+
+            // Being owed money by a supplier is a real state. Clamping it to zero
+            // would make the next invoice look like the one that caused it.
+            assert_eq!(commands::supplier_balance_in(&db, supplier_id).await.unwrap(), Decimal::new(-3_000, 3));
+        }
+
+        #[tokio::test]
+        async fn what_we_owe_a_supplier_is_derived_from_purchases_and_payments() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::new(1_000_000, 3)).await;
+            let item_id = seed_item(&db, "Widget").await;
+            let cash = cash_method(&db).await;
+
+            // Opening 1000.00, then receive 300.00 of goods (300 at 1.00 each)
+            // and pay 120.00 of it.
+            commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(300_000, 3), Decimal::new(1_000, 3))]),
+            )
+            .await
+            .expect("receive goods");
+            commands::record_purchase_payment_in(
+                &db,
+                commands::list_purchases_in(&db, Default::default()).await.unwrap().rows[0].id,
+                commands::PurchasePaymentInput {
+                    payment_method_id: cash,
+                    amount: Decimal::new(120_000, 3),
+                    reference: None,
+                },
+            )
+            .await
+            .expect("pay");
+
+            // 1000.00 owed + 300.00 received - 120.00 paid.
+            assert_eq!(
+                commands::supplier_balance_in(&db, supplier_id).await.unwrap(),
+                Decimal::new(1_180_000, 3)
+            );
+        }
+
+        #[tokio::test]
+        async fn goods_going_back_to_a_supplier_leave_the_shelf() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+
+            let purchase = commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(6_000, 3), Decimal::new(1_000, 3))]),
+            )
+            .await
+            .expect("receive goods");
+
+            commands::create_purchase_return_in(
+                &db,
+                commands::PurchaseReturnInput {
+                    purchase_id: purchase.id,
+                    returned_at: purchase.purchased_at,
+                    lines: vec![commands::PurchaseReturnLineInput {
+                        purchase_detail_id: purchase.lines[0].id,
+                        quantity: Decimal::new(2_000, 3),
+                    }],
+                    note: None,
+                },
+            )
+            .await
+            .expect("send goods back");
+
+            assert_eq!(
+                commands::on_hand_in(&db, item_id).await.unwrap(),
+                Decimal::new(4_000, 3),
+                "returned goods leave the shelf"
+            );
+            assert_eq!(
+                commands::supplier_balance_in(&db, supplier_id).await.unwrap(),
+                Decimal::new(4_000, 3),
+                "what we owe drops by the value sent back"
+            );
+        }
+
+        #[tokio::test]
+        async fn two_returns_of_one_line_cannot_exceed_what_was_received() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+
+            let purchase = commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(5_000, 3), Decimal::new(1_000, 3))]),
+            )
+            .await
+            .expect("receive goods");
+            let line_id = purchase.lines[0].id;
+
+            for quantity in [Decimal::new(3_000, 3), Decimal::new(2_000, 3)] {
+                commands::create_purchase_return_in(
+                    &db,
+                    commands::PurchaseReturnInput {
+                        purchase_id: purchase.id,
+                        returned_at: purchase.purchased_at,
+                        lines: vec![commands::PurchaseReturnLineInput { purchase_detail_id: line_id, quantity }],
+                        note: None,
+                    },
+                )
+                .await
+                .expect("partial return");
+            }
+
+            let too_much = commands::create_purchase_return_in(
+                &db,
+                commands::PurchaseReturnInput {
+                    purchase_id: purchase.id,
+                    returned_at: purchase.purchased_at,
+                    lines: vec![commands::PurchaseReturnLineInput {
+                        purchase_detail_id: line_id,
+                        quantity: Decimal::new(1, 3),
+                    }],
+                    note: None,
+                },
+            )
+            .await;
+
+            assert!(too_much.is_err(), "5.000 received and 5.000 returned leaves nothing to return");
+            assert_eq!(
+                commands::on_hand_in(&db, item_id).await.unwrap(),
+                Decimal::ZERO
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refused_return_leaves_the_purchase_intact() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+
+            let purchase = commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(2_000, 3), Decimal::new(1_000, 3))]),
+            )
+            .await
+            .expect("receive goods");
+
+            let refused = commands::create_purchase_return_in(
+                &db,
+                commands::PurchaseReturnInput {
+                    purchase_id: purchase.id,
+                    returned_at: purchase.purchased_at,
+                    lines: vec![commands::PurchaseReturnLineInput {
+                        purchase_detail_id: purchase.lines[0].id,
+                        quantity: Decimal::new(9_000, 3),
+                    }],
+                    note: None,
+                },
+            )
+            .await;
+
+            assert!(refused.is_err());
+            assert_eq!(commands::on_hand_in(&db, item_id).await.unwrap(), Decimal::new(2_000, 3));
+            assert_eq!(
+                commands::list_purchase_returns_in(&db, Default::default()).await.unwrap().rows.len(),
+                0,
+                "a refused return writes no header"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_return_cannot_name_a_line_from_another_purchase() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+
+            let first = commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(5_000, 3), Decimal::new(1_000, 3))]),
+            )
+            .await
+            .expect("first purchase");
+            let second = commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(5_000, 3), Decimal::new(1_000, 3))]),
+            )
+            .await
+            .expect("second purchase");
+
+            let crossed = commands::create_purchase_return_in(
+                &db,
+                commands::PurchaseReturnInput {
+                    purchase_id: second.id,
+                    returned_at: second.purchased_at,
+                    lines: vec![commands::PurchaseReturnLineInput {
+                        purchase_detail_id: first.lines[0].id,
+                        quantity: Decimal::new(1_000, 3),
+                    }],
+                    note: None,
+                },
+            )
+            .await;
+
+            assert!(crossed.is_err(), "a return must name a line of the purchase it corrects");
+        }
+
+        #[tokio::test]
+        async fn receiving_the_same_lot_twice_lands_in_one_lot() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+
+            let with_lot = |quantity: Decimal| {
+                let mut line = purchase_line(item_id, quantity, Decimal::new(1_000, 3));
+                line.batch_no = Some("LOT-A".into());
+                line.expiry_date = chrono::NaiveDate::from_ymd_opt(2027, 1, 31);
+                purchase_input(supplier_id, vec![line])
+            };
+
+            let first = commands::create_purchase_in(&db, with_lot(Decimal::new(5_000, 3)))
+                .await
+                .expect("first delivery");
+            let second = commands::create_purchase_in(&db, with_lot(Decimal::new(2_000, 3)))
+                .await
+                .expect("second delivery");
+
+            // A second delivery of the same production run is ordinary; refusing it
+            // because the batch number already exists would be wrong.
+            assert_eq!(first.lines[0].batch_id, second.lines[0].batch_id);
+            assert_eq!(
+                commands::batch_on_hand_in(&db, first.lines[0].batch_id.unwrap()).await.unwrap(),
+                Decimal::new(7_000, 3),
+                "both deliveries are in the one lot"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_purchase_needs_at_least_one_line() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+
+            let refused = commands::create_purchase_in(&db, purchase_input(supplier_id, vec![])).await;
+            assert!(refused.is_err());
+        }
+
+        #[tokio::test]
+        async fn a_purchase_reference_cannot_be_claimed_twice() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+
+            let first = commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(1_000, 3), Decimal::new(1_000, 3))]),
+            )
+            .await
+            .expect("first");
+            let second = commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(1_000, 3), Decimal::new(1_000, 3))]),
+            )
+            .await
+            .expect("second");
+
+            // Derived from the primary key, so two purchases committed together cannot
+            // read the same MAX.
+            assert_ne!(first.reference_no, second.reference_no);
+            assert_eq!(first.reference_no, "PUR-000001");
+            assert_eq!(second.reference_no, "PUR-000002");
+        }
+
+        #[tokio::test]
+        async fn a_payment_naming_an_unknown_tender_is_refused() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+
+            let purchase = commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(1_000, 3), Decimal::new(1_000, 3))]),
+            )
+            .await
+            .expect("receive goods");
+
+            let refused = commands::record_purchase_payment_in(
+                &db,
+                purchase.id,
+                commands::PurchasePaymentInput {
+                    payment_method_id: 999_999,
+                    amount: Decimal::new(1_000, 3),
+                    reference: None,
+                },
+            )
+            .await;
+
+            assert!(refused.is_err(), "a tender must name a real payment method");
+            assert_eq!(
+                commands::get_purchase_in(&db, purchase.id).await.unwrap().paid_total,
+                Decimal::ZERO
+            );
+        }
+
+        #[tokio::test]
+        async fn the_purchase_list_finds_one_by_supplier_name() {
+            let db = db::init_for_tests().await;
+            let supplier_id = seed_supplier(&db, Decimal::ZERO).await;
+            let item_id = seed_item(&db, "Widget").await;
+            commands::create_purchase_in(
+                &db,
+                purchase_input(supplier_id, vec![purchase_line(item_id, Decimal::new(1_000, 3), Decimal::new(1_000, 3))]),
+            )
+            .await
+            .expect("receive goods");
+
+            let mut query = commands::PageQuery::default();
+            query.search = Some("whole".into());
+            let found = commands::list_purchases_in(&db, query).await.unwrap();
+
+            assert_eq!(found.total, 1, "the supplier's name finds the purchase");
+        }
 
         #[tokio::test]
         async fn a_search_matches_whatever_case_it_was_typed_in() {
