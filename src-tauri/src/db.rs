@@ -3,19 +3,24 @@
 //! Backend-agnostic on purpose: the URL determines the driver, so the same
 //! build runs against SQLite, Postgres, or MySQL.
 //!
-//! **Postgres is the default backend.** SQLite remains fully supported and is
-//! selected by giving a `sqlite://` URL — it is the right choice when the app has
-//! to run on a shop counter with no database server installed.
+//! **No backend is assumed.** The operator picks one in the first-run wizard and it
+//! is persisted; an install with no recorded choice is `Unconfigured` rather than
+//! silently falling back to something, because a wrong silent default on a shop
+//! counter is how a till ends up writing its sales to a database nobody chose.
 //!
-//! Resolution order for the connection URL:
+//! Resolution order for the connection URL, via [`resolve_url`]:
 //!
-//!   1. `REPOS_DATABASE_URL` — always wins, whatever it contains.
-//!   2. [`DEFAULT_POSTGRES_URL`] — the default backend.
-//!   3. A `sqlite://` URL to opt into the embedded file database.
+//!   1. `REPOS_DATABASE_URL` — always wins, so a packaged build can be pointed at
+//!      a scratch database without editing the saved choice.
+//!   2. `<app data>/database.json` — what the wizard recorded.
+//!   3. Nothing. The window opens and asks.
 //!
 //!   postgres://user:pass@host:5432/repos
 //!   mysql://user:pass@host:3306/repos
 //!   sqlite://<path>/repos.db?mode=rwc
+//!
+//! [`DEFAULT_POSTGRES_URL`] survives only as the value `init` falls back to when a
+//! caller passes no URL at all, which the app path no longer does.
 
 use std::path::PathBuf;
 use std::time::Duration;
