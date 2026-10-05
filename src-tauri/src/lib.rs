@@ -1454,7 +1454,7 @@ mod tests {
         commands::record_customer_receipt_in(
             &db,
             id,
-            commands::ReceiveInput { amount: Decimal::new(50_500, 3), reference: None, paid_at: None },
+            commands::ReceiveInput { amount: Decimal::new(50_500, 3), reference: None, paid_at: None, payment_method_id: None },
         )
         .await
         .expect("record a receipt");
@@ -1474,7 +1474,7 @@ mod tests {
         commands::record_customer_receipt_in(
             &db,
             id,
-            commands::ReceiveInput { amount: Decimal::new(150_000, 3), reference: None, paid_at: None },
+            commands::ReceiveInput { amount: Decimal::new(150_000, 3), reference: None, paid_at: None, payment_method_id: None },
         )
         .await
         .expect("record an overpayment");
@@ -1493,7 +1493,7 @@ mod tests {
         commands::record_customer_receipt_in(
             &db,
             id,
-            commands::ReceiveInput { amount: Decimal::new(10_000, 3), reference: None, paid_at: None },
+            commands::ReceiveInput { amount: Decimal::new(10_000, 3), reference: None, paid_at: None, payment_method_id: None },
         )
         .await
         .expect("record a receipt");
@@ -1512,7 +1512,7 @@ mod tests {
             commands::record_customer_receipt_in(
                 &db,
                 id,
-                commands::ReceiveInput { amount: Decimal::ZERO, reference: None, paid_at: None },
+                commands::ReceiveInput { amount: Decimal::ZERO, reference: None, paid_at: None, payment_method_id: None },
             )
             .await
             .is_err(),
@@ -4124,6 +4124,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renaming_a_tender_does_not_change_what_counts_as_in_the_drawer() {
+        let db = db::init_for_tests().await;
+        let user = seed_user(&db).await;
+        let cola = seed_item(&db, "Cola").await;
+        seed_stock(&db, cola, dec(10)).await;
+        open_for(&db, user, Decimal::ZERO).await;
+
+        sell_one_item(
+            &db,
+            cola,
+            Decimal::new(100_000, 3),
+            None,
+            Some(vec![
+                commands::PaymentLine { method: Some("Cash".into()), payment_method_id: None, amount: Decimal::new(30_000, 3), reference: None, gift_card_no: None, gift_card_pin: None },
+                commands::PaymentLine { method: Some("Debit/Credit Card".into()), payment_method_id: None, amount: Decimal::new(70_000, 3), reference: None, gift_card_no: None, gift_card_pin: None },
+            ]),
+        )
+        .await
+        .expect("split sale");
+
+        let cash = tender_id(&db, "Cash").await;
+        let mut row: payment_method::ActiveModel =
+            payment_method::Entity::find_by_id(cash).one(&db).await.unwrap().unwrap().into();
+        row.name = Set("Physical Cash".into());
+        row.update(&db).await.expect("rename the tender");
+
+        let summary = commands::register_summary_in(&db, user).await.expect("summary").expect("open");
+        assert_eq!(
+            summary.cash_total,
+            Decimal::new(30_000, 3),
+            "renaming the cash tender emptied the drawer figure"
+        );
+        assert_eq!(
+            summary.other_total,
+            Decimal::new(70_000, 3),
+            "renaming the cash tender pushed the card tender into it"
+        );
+    }
+
+    #[tokio::test]
     async fn close_subtracts_refunds_and_adds_receipts() {
         let db = db::init_for_tests().await;
         let user = seed_user(&db).await;
@@ -4140,7 +4180,7 @@ mod tests {
         commands::record_customer_receipt_in(
             &db,
             customer,
-            commands::ReceiveInput { amount: Decimal::new(10_000, 3), reference: None, paid_at: None },
+            commands::ReceiveInput { amount: Decimal::new(10_000, 3), reference: None, paid_at: None, payment_method_id: None },
         )
         .await
         .expect("receipt");

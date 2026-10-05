@@ -29,6 +29,7 @@ use crate::entities::catalog::{brand, fixed_asset_item, fixed_asset_movement, it
 use crate::entities::catalog::item::ItemView;
 use crate::entities::sales::stock_movement::MovementType;
 use crate::entities::sales::{booking, combo_item, combo_sale, credit_note, gift_card, gift_card_transaction, installment_sale, installment_sale_detail, loyalty_entry, promotion, quotation, quotation_detail, register, sale, sale_detail, sale_payment, sale_return, sale_return_detail, service_rating, servicing, stock_movement, warranty};
+use crate::entities::trade::payment_method::PaymentKind;
 use crate::entities::trade::{customer, customer_receive, payment_method, purchase, purchase_detail, purchase_return, purchase_return_detail, supplier, supplier_payment};
 
 pub(crate) const LIVE: &str = "Live";
@@ -421,6 +422,11 @@ pub struct ReceiveInput {
     pub reference: Option<String>,
     /// Optional so the caller can leave it out; defaults to now.
     pub paid_at: Option<NaiveDateTime>,
+    /// The account the money arrived in. Optional, because a receipt on an account
+    /// is the usual case but a debt being written down is not money moving — and a
+    /// null here says so rather than guessing Cash.
+    #[serde(default)]
+    pub payment_method_id: Option<i32>,
 }
 
 #[tauri::command]
@@ -443,9 +449,18 @@ pub async fn record_customer_receipt_in<C: ConnectionTrait>(
         .await?
         .ok_or_else(|| CmdError::NotFound("customer".into()))?;
 
+    if let Some(id) = input.payment_method_id {
+        payment_method::Entity::find_by_id(id)
+            .filter(payment_method::Column::DelStatus.eq(LIVE))
+            .one(conn)
+            .await?
+            .ok_or_else(|| CmdError::NotFound(format!("payment method {id}")))?;
+    }
+
     Ok(customer_receive::ActiveModel {
         customer_id: Set(customer_id),
         amount: Set(input.amount),
+        payment_method_id: Set(input.payment_method_id),
         reference: Set(text(input.reference)),
         paid_at: Set(input.paid_at.unwrap_or_else(crate::migration::now)),
         created_at: Set(crate::migration::now()),
@@ -3122,6 +3137,15 @@ pub struct SaleView {
 /// redemption puts nothing in a drawer and loyalty points are not money, so neither
 /// has a `payment_methods` row to point at — which is exactly why that column is
 /// nullable rather than every tender being forced to name an account.
+/// Whether a tender moved through the drawer. `kind` answers it; the name is the
+/// fallback for a row whose text matched no live tender.
+fn is_cash_tender(method_id: Option<i32>, method: &str, kinds: &HashMap<i32, String>) -> bool {
+    match method_id.and_then(|id| kinds.get(&id)) {
+        Some(kind) => kind == PaymentKind::Cash.as_str(),
+        None => method.trim() == PaymentKind::Cash.as_str(),
+    }
+}
+
 fn is_stored_value(method: &str) -> bool {
     let m = method.trim();
     m == GIFT_CARD_METHOD || m == LOYALTY_METHOD
@@ -4439,21 +4463,44 @@ async fn summarise_register<C: ConnectionTrait>(
         .into_tuple()
         .all(conn)
         .await?;
+    // What is in the drawer is a property of the *tender*, not of its name. Keying on
+    // the name meant an operator who renamed "Cash" to "Physical Cash" got a drawer
+    // figure of zero and every card tender counted as "outside the drawer" — with no
+    // error anywhere. `kind` is the closed vocabulary that answers it.
+    let mut kinds: HashMap<i32, String> = payment_method::Entity::find()
+        .select_only()
+        .column(payment_method::Column::Id)
+        .column(payment_method::Column::Kind)
+        .into_tuple()
+        .all(conn)
+        .await?
+        .into_iter()
+        .collect();
+
     let mut by_method: HashMap<String, Decimal> = HashMap::new();
     let mut tendered_sale_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    // Accumulated alongside `by_method` because a name-keyed map cannot answer "is
+    // this cash" once the name is the operator's to choose.
+    let mut cash_taken = Decimal::ZERO;
     if !sale_ids.is_empty() {
-        let tenders: Vec<(i32, String, Decimal)> = sale_payment::Entity::find()
+        let tenders: Vec<(i32, String, Decimal, Option<i32>)> = sale_payment::Entity::find()
             .select_only()
             .column(sale_payment::Column::SaleId)
             .column(sale_payment::Column::Method)
             .column(sale_payment::Column::Amount)
+            .column(sale_payment::Column::PaymentMethodId)
             .filter(sale_payment::Column::SaleId.is_in(sale_ids))
             .into_tuple()
             .all(conn)
             .await?;
-        for (sale_id, method, amount) in tenders {
+        for (sale_id, method, amount, method_id) in tenders {
             tendered_sale_ids.insert(sale_id);
-            *by_method.entry(method).or_insert(Decimal::ZERO) += amount;
+            *by_method.entry(method.clone()).or_insert(Decimal::ZERO) += amount;
+            // A null id is a pre-existing row whose text matched no live tender, or a
+            // stored-value redemption. The name is all there is, so it is used.
+            if is_cash_tender(method_id, &method, &kinds) {
+                cash_taken += amount;
+            }
         }
     }
     // A single-tender sale writes no tender rows — the header carries the method and
@@ -4463,6 +4510,7 @@ async fn summarise_register<C: ConnectionTrait>(
         .select_only()
         .column(sale::Column::PaidTotal)
         .column(sale::Column::PaymentMethod)
+        .column(sale::Column::PaymentMethodId)
         .filter(sale::Column::Status.eq(SALE_STATUS_COMPLETED))
         .filter(sale::Column::CreatedAt.gte(row.opened_at))
         .filter(sale::Column::CreatedAt.lt(to));
@@ -4472,20 +4520,19 @@ async fn summarise_register<C: ConnectionTrait>(
         untendered_q = untendered_q
             .filter(sale::Column::Id.is_not_in(tendered_sale_ids.into_iter().collect::<Vec<_>>()));
     }
-    let untendered: Vec<(Decimal, String)> = untendered_q.into_tuple().all(conn).await?;
-    for (paid, method) in untendered {
-        *by_method.entry(method).or_insert(Decimal::ZERO) += paid;
+    let untendered: Vec<(Decimal, String, Option<i32>)> = untendered_q.into_tuple().all(conn).await?;
+    for (paid, method, method_id) in untendered {
+        *by_method.entry(method.clone()).or_insert(Decimal::ZERO) += paid;
+        if is_cash_tender(method_id, &method, &kinds) {
+            cash_taken += paid;
+        }
     }
     let mut methods: Vec<MethodTotal> = by_method
         .into_iter()
         .map(|(method, amount)| MethodTotal { method, amount: amount.round_dp(MONEY_SCALE) })
         .collect();
     methods.sort_by(|a, b| a.method.cmp(&b.method));
-    let cash_total = methods
-        .iter()
-        .filter(|m| m.method == "Cash")
-        .map(|m| m.amount)
-        .sum::<Decimal>();
+    let cash_total = cash_taken.round_dp(MONEY_SCALE);
     let other_total = (collected_total - cash_total).round_dp(MONEY_SCALE);
 
     let refunded_total: Option<Decimal> = sale_return::Entity::find()
